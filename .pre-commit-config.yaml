@@ -14,3 +14,11 @@ repos:
   hooks:
   -   id: flake8
       additional_dependencies: [flake8-no-print]
+- repo: local
+  hooks:
+  - id: gen-arch-map
+    name: regenerate arch-map.json from conversion/__init__.py
+    entry: python3 scripts/gen_arch_map.py
+    language: system
+    files: ^conversion/__init__\.py$
+    pass_filenames: false
