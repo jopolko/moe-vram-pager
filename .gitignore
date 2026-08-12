@@ -25,6 +25,7 @@
 # IDE / OS
 
 /.cache/
+/scripts/.cache/
 /.ccls-cache/
 /.direnv/
 /.envrc

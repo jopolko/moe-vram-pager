@@ -1,0 +1,19 @@
+{
+  "_comment": "Fetched by scripts/model_picker.py on every run (cached ~1 day). Add new abliteration-tool brand names, tag keywords, or specific repo ids here and every client (WSL, Windows) picks it up automatically, no rebuild or resync needed. 'terms' are lowercase substrings matched against a model's name and HF tags. 'known_repo_ids' force-flags a specific model regardless of tag/name matching, for cases where it doesn't self-tag accurately.",
+  "terms": [
+    "abliterat",
+    "derestrict",
+    "uncensor",
+    "decensor",
+    "unalign",
+    "unshackl",
+    "unfilter",
+    "unbound",
+    "unrestrict",
+    "heretic",
+    "nsfw",
+    "not-for-all-audiences",
+    "de-alignment"
+  ],
+  "known_repo_ids": []
+}
