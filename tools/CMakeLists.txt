@@ -21,10 +21,15 @@ else()
     add_subdirectory(completion)
     add_subdirectory(perplexity)
     add_subdirectory(quantize)
+    # llama-cli needs server-context (from tools/server) but not the web UI bundle, so
+    # server always builds (server-context itself is gated off LLAMA_BUILD_SERVER inside
+    # tools/server/CMakeLists.txt, only llama-server/llama-server-impl are) while ui stays
+    # gated here: it needs a working npm/prebuilt UI asset pipeline that this fork branch
+    # doesn't reliably produce, and only llama-server links against it.
+    add_subdirectory(server)
+    add_subdirectory(cli)
     if (LLAMA_BUILD_SERVER)
         add_subdirectory(ui)
-        add_subdirectory(cli)
-        add_subdirectory(server)
     endif()
     add_subdirectory(tokenize)
     add_subdirectory(parser)

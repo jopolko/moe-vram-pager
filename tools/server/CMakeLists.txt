@@ -31,6 +31,11 @@ target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
 
+# llama-server-impl / llama-server: needs the embedded web UI (llama-ui), so these stay
+# gated behind LLAMA_BUILD_SERVER. server-context above does not depend on the UI and is
+# always built, since llama-cli needs it too.
+if (LLAMA_BUILD_SERVER)
+
 # llama-server-impl: server logic, reusable by app
 
 set(TARGET llama-server-impl)
@@ -61,3 +66,5 @@ install(TARGETS ${TARGET} RUNTIME)
 
 target_link_libraries(${TARGET} PRIVATE llama-server-impl)
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
+endif() # LLAMA_BUILD_SERVER
