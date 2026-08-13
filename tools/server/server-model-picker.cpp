@@ -12,6 +12,7 @@
 #include <atomic>
 #include <chrono>
 #include <cctype>
+#include <cstring>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -252,6 +253,26 @@ struct hardware_info {
     double ram_free_gb  = 0.0; // ditto
 };
 
+// ggml_backend_cpu_device_get_memory() hardcodes free=total on Linux ("free system
+// memory is ill-defined, for practical purposes assume that all of it is free" -
+// ggml/src/ggml-cpu/ggml-cpu.cpp), so RAM free never differs from RAM total in the
+// hardware cards otherwise. The kernel already computes a real, meaningful number
+// for this - MemAvailable in /proc/meminfo, which (unlike MemFree) accounts for
+// reclaimable page cache/buffers correctly. Returns -1 if unavailable (non-Linux,
+// or the line's missing), so the caller can fall back to ggml's value.
+double linux_ram_available_gb() {
+    std::ifstream f("/proc/meminfo");
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.rfind("MemAvailable:", 0) != 0) continue;
+        std::istringstream iss(line.substr(strlen("MemAvailable:")));
+        double kb;
+        if (iss >> kb) return kb * 1e3 / 1e9; // kB -> GB
+        break;
+    }
+    return -1.0;
+}
+
 hardware_info detect_hardware() {
     hardware_info hw;
 
@@ -262,6 +283,8 @@ hardware_info detect_hardware() {
         hw.ram_gb      = (double) total / 1e9;
         hw.ram_free_gb = (double) free  / 1e9;
     }
+    double linux_free_gb = linux_ram_available_gb();
+    if (linux_free_gb >= 0.0) hw.ram_free_gb = linux_free_gb;
 
     size_t vram_total = 0;
     size_t vram_free  = 0;
@@ -301,6 +324,7 @@ struct model_row {
     double total_gb  = 0.0;
     std::string quant;
     std::string fit_tier;
+    double ram_spillover_gb = 0.0; // only meaningful when fit_tier == "ram-cache"
     bool is_derestricted = false;
     std::string gguf_repo; // empty if not looked up / not found
 };
@@ -654,6 +678,13 @@ void server_model_picker_register_routes(const server_http_context & ctx_http, c
                     m.fit_tier  = "no-disk-space";
                 }
 
+                if (m.fit_tier == "ram-cache") {
+                    // must match classify_fit()'s vram_budget calc (vram_gb * 0.75) - this is the
+                    // slice of the active working set that doesn't fit in that budget and ends up
+                    // cached in host RAM instead.
+                    m.ram_spillover_gb = std::max(0.0, m.active_gb - vram_gb * 0.75);
+                }
+
                 models.push_back(std::move(m));
             }
 
@@ -780,7 +811,7 @@ void server_model_picker_register_routes(const server_http_context & ctx_http, c
                     {"active_b", m.active_b}, {"total_b", m.total_b},
                     {"active_gb", m.active_gb}, {"total_gb", m.total_gb},
                     {"quant", m.quant},
-                    {"hf_arch", m.hf_arch}, {"fit_tier", m.fit_tier},
+                    {"hf_arch", m.hf_arch}, {"fit_tier", m.fit_tier}, {"ram_spillover_gb", m.ram_spillover_gb},
                     {"ugi_score", m.ugi_score}, {"willingness", m.willingness},
                     {"is_derestricted", m.is_derestricted},
                     {"gguf_repo", m.gguf_repo},

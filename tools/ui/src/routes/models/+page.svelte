@@ -32,6 +32,7 @@
 		quant: string;
 		hf_arch: string;
 		fit_tier: string;
+		ram_spillover_gb: number;
 		ugi_score: number;
 		willingness: number;
 		is_derestricted: boolean;
@@ -72,6 +73,7 @@
 	}
 	let routerAvailable = $state(false);
 	let dlState = $state<Record<string, DlState>>({});
+	let loadedDropdownOpen = $state(false);
 	let busyIds = $state<Set<string>>(new Set());
 
 	function modelIdFor(m: ModelRow): string | null {
@@ -149,6 +151,12 @@
 								loadStage: status === 'loading' ? progress?.current : undefined
 							}
 						};
+						// the Loaded dropdown otherwise stays open through the whole load - only a
+						// user gesture (click-away, select) closes a bits-ui dropdown by default, a
+						// background state change like "finished loading" doesn't trigger that
+						if (status === 'loaded') {
+							loadedDropdownOpen = false;
+						}
 					}
 				} else if (envelope.event === 'download_progress') {
 					const progress = envelope.data?.progress as
@@ -474,7 +482,7 @@
 			</Label>
 		</div>
 		{#if routerAvailable}
-			<DropdownMenu.Root>
+			<DropdownMenu.Root bind:open={loadedDropdownOpen}>
 				<DropdownMenu.Trigger>
 					{#snippet child({ props })}
 						<button
@@ -685,7 +693,7 @@
 									<Badge
 										variant="outline"
 										class="ml-2 align-middle border-amber-300 bg-amber-50 text-amber-700 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-300"
-										title="Active experts don't all fit in VRAM alone - the overflow caches in host RAM instead of disk. Still fast, no per-token disk streaming needed for the hot set."
+										title="Active experts don't all fit in VRAM alone - {m.ram_spillover_gb.toFixed(1)} GB of the working set caches in host RAM instead of disk. Still fast, no per-token disk streaming needed for the hot set."
 									>
 										RAM spillover
 									</Badge>
@@ -702,7 +710,7 @@
 									<Badge
 										variant="destructive"
 										class="ml-2 align-middle"
-										title="Fits on this drive, but not in the space free right now - free up some space to download it"
+										title="Fits on this drive, but not in the space free right now - free up {Math.max(0, m.total_gb - hardware.disk_free_gb).toFixed(1)} GB to download it"
 									>
 										Storage +{Math.max(0, m.total_gb - hardware.disk_free_gb).toFixed(0)}GB
 									</Badge>
