@@ -82,9 +82,10 @@ QUANT_BPW = {
 # a red-team eval repo rather than a ready-to-use uncensored finetune).
 DEFAULT_DERESTRICTED_TERMS = [
     "abliterat", "derestrict", "uncensor", "decensor", "unalign",
-    "unshackl", "unfilter", "unbound", "unrestrict", "heretic",
+    "unshackl", "unfilter", "unbound", "unrestrict", "heretic", "heresy",
     "nsfw", "not-for-all-audiences", "de-alignment",
-    "obliterat", "ablated", "unlimited", "refusal-remov", "amoral", "jailbreak",
+    "obliterat", "ablated", "unlimited", "refusal-remov", "refusal-vector",
+    "amoral", "jailbreak", "erotic",
 ]
 # Specific repo ids to always flag regardless of name/tag matching, for
 # cases where a model doesn't self-tag accurately. Add these on GitHub in

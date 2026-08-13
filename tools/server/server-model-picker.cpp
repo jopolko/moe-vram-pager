@@ -12,12 +12,16 @@
 #include <atomic>
 #include <chrono>
 #include <cctype>
+#include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
+#include <condition_variable>
 #include <fstream>
 #include <future>
 #include <map>
+#include <mutex>
 #include <regex>
 #include <sstream>
 #include <string>
@@ -54,12 +58,75 @@ constexpr long HF_TAGS_TTL_SECONDS = 30L * 24 * 3600;
 std::atomic<int> g_tags_progress_done{0};
 std::atomic<int> g_tags_progress_total{0};
 
+// Bounds total concurrent outbound requests to huggingface.co from this process. HF applies a
+// per-IP rate limit ("429: We had to rate limit your IP") that an unbounded burst of parallel
+// std::async tasks blows straight through - the tags batch, the composite-scored search, and the
+// per-candidate real-file-size verification (verify_gguf_row) can together fire hundreds of HTTP
+// calls in the same instant on a cold cache. A blocking counting semaphore serializes that burst
+// down to a sustainable rate without changing any call site's own retry/fallback logic - a
+// rate-limited call still just fails and falls through to "best effort", same as any other network
+// hiccup, it just becomes far less likely to happen in the first place.
+class hf_request_limiter {
+    std::mutex mutex;
+    std::condition_variable cv;
+    int available;
+public:
+    explicit hf_request_limiter(int n) : available(n) {}
+    void acquire() {
+        std::unique_lock<std::mutex> lock(mutex);
+        cv.wait(lock, [this] { return available > 0; });
+        available--;
+    }
+    void release() {
+        std::lock_guard<std::mutex> lock(mutex);
+        available++;
+        cv.notify_one();
+    }
+};
+hf_request_limiter g_hf_request_limiter(4);
+
+struct hf_request_guard {
+    hf_request_guard()  { g_hf_request_limiter.acquire(); }
+    ~hf_request_guard() { g_hf_request_limiter.release(); }
+};
+
 // Ordered best (highest quality/bpw) to worst, so each model can be checked
 // against progressively more aggressive quants until one actually fits.
 const std::vector<std::pair<std::string, double>> QUANT_CANDIDATES = {
     {"Q8_0", 8.50}, {"Q6_K", 6.56}, {"Q5_K_M", 5.67}, {"Q5_K_S", 5.54},
     {"Q4_K_M", 4.83}, {"Q4_K_S", 4.58}, {"IQ4_XS", 4.25}, {"IQ3_M", 3.66},
 };
+
+// How many composite-scored candidate repos the verification step (verify_gguf_row) will actually
+// fetch a real file listing for, per model. Kept small since each candidate costs a real HF tree
+// API round trip (unlike the cheap search query that ranks them) - the top-scored repo is right
+// often enough that a handful of runners-up is enough to recover from the cases (e.g. a repo with
+// no model card, or one that turns out to only host a different quant than expected) where it isn't.
+constexpr int VERIFY_CANDIDATE_REPOS = 3;
+
+// How long a candidate repo's real HF search results / file listing stay cached (gguf_search_candidates,
+// get_repo_files_cached below). Real GGUF uploads and search rankings rarely change minute to minute,
+// and the point of this cache is purely to stop the picker from re-fetching the same ~150-repo
+// candidate pool from scratch on every page load / filter toggle - hf_request_limiter only bounds
+// concurrent connections, not total request volume over time, and that redundant repeat traffic is
+// exactly what was tripping HF's per-IP rate limit.
+constexpr long VERIFY_CACHE_TTL_SECONDS = 6 * 3600;
+
+// Full-response cache for /model-picker/models, keyed by the request params that actually change
+// the result set. Every sub-fetch this handler does (UGI CSV, derestricted terms, per-repo GGUF
+// verification) is already TTL-cached on disk, but the handler still re-parses/re-scores/re-ranks
+// the whole ~150-repo candidate pool from those caches on every single call - a few real seconds
+// of CPU/disk work that a plain page refresh has no reason to redo, since the underlying catalog
+// doesn't change minute to minute. This caches the assembled model list (everything except the
+// live hardware/disk-space readings, which are cheap and always recomputed fresh) in memory for
+// the same TTL as the data it's built from.
+struct models_response_cache_entry {
+    long  cached_at = 0;
+    json  models_arr;
+    size_t count = 0;
+};
+std::mutex g_models_response_cache_mutex;
+std::map<std::string, models_response_cache_entry> g_models_response_cache;
 
 // Offline-only fallback, used solely if both the GitHub fetch and the local
 // disk cache are unavailable (first-ever run with no network). The live
@@ -73,7 +140,7 @@ const std::vector<std::pair<std::string, double>> QUANT_CANDIDATES = {
 // a ready-to-use uncensored finetune.
 const std::vector<std::string> FALLBACK_DERESTRICTED_TERMS = {
     "abliterat", "derestrict", "uncensor", "decensor", "unalign",
-    "unshackl", "unfilter", "unbound", "unrestrict", "heretic",
+    "unshackl", "unfilter", "unbound", "unrestrict", "heretic", "heresy",
     "nsfw", "not-for-all-audiences", "de-alignment",
     "obliterat", "ablated", "unlimited", "refusal-remov", "amoral", "jailbreak",
 };
@@ -273,6 +340,45 @@ double linux_ram_available_gb() {
     return -1.0;
 }
 
+// cudaMemGetInfo() (what ggml_backend_dev_memory() calls for CUDA devices)
+// is unreliable under WSL2's paravirtualized GPU when more than one process
+// holds a CUDA context on the device - e.g. this router process plus a
+// router-mode model child it spawned. Each process's view of "free" doesn't
+// reliably reflect the other's allocations there, so the router can report
+// several GB free while nvidia-smi (and Task Manager, on the Windows host)
+// correctly shows the device nearly full. Query nvidia-smi/NVML directly
+// instead, same fix shape as linux_ram_available_gb() above. Sums across
+// all reported GPUs; returns -1 if nvidia-smi isn't available so the caller
+// falls back to ggml's value (e.g. non-NVIDIA hardware).
+double nvidia_smi_vram_free_gb() {
+#ifdef _WIN32
+    FILE * pipe = _popen("nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>NUL", "r");
+#else
+    FILE * pipe = popen("nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null", "r");
+#endif
+    if (!pipe) return -1.0;
+
+    double total_mib = 0.0;
+    bool   got_any   = false;
+    char   buf[128];
+    while (fgets(buf, sizeof(buf), pipe)) {
+        double mib;
+        if (sscanf(buf, "%lf", &mib) == 1) {
+            total_mib += mib;
+            got_any    = true;
+        }
+    }
+
+#ifdef _WIN32
+    _pclose(pipe);
+#else
+    pclose(pipe);
+#endif
+
+    if (!got_any) return -1.0;
+    return total_mib * 1048576.0 / 1e9; // MiB -> GB
+}
+
 hardware_info detect_hardware() {
     hardware_info hw;
 
@@ -300,6 +406,9 @@ hardware_info detect_hardware() {
     }
     hw.vram_gb      = (double) vram_total / 1e9;
     hw.vram_free_gb = (double) vram_free  / 1e9;
+
+    double smi_vram_free_gb = nvidia_smi_vram_free_gb();
+    if (smi_vram_free_gb >= 0.0) hw.vram_free_gb = smi_vram_free_gb;
 
     return hw;
 }
@@ -423,46 +532,235 @@ double disk_total_gb(const std::string & path) {
     return total_gb;
 }
 
-// run one HF model-search query, returning the first result that actually hosts GGUF files.
-// checked via the "gguf" tag HF attaches to any repo containing .gguf files, not the repo name -
-// plenty of repos (huihui-ai's abliterated models among them) host GGUF quants alongside
-// safetensors in the same repo without "GGUF" anywhere in the name itself.
-std::string gguf_search_query(const std::string & url) {
+// run one HF model-search query, returning every result that actually hosts GGUF files, ranked
+// best-first. checked via the "gguf" tag HF attaches to any repo containing .gguf files, not the
+// repo name - plenty of repos (huihui-ai's abliterated models among them) host GGUF quants
+// alongside safetensors in the same repo without "GGUF" anywhere in the name itself.
+//
+// Ranked by a downloads+likes composite (log-scaled so neither magnitude dominates) rather than
+// whichever HF's search ranks first - plain search relevance skews toward big-name uploaders
+// (bartowski/unsloth) regardless of whether a less prominent but well-used quantizer (e.g.
+// mradermacher) actually has a better, or the only, quant of this particular model.
+std::vector<std::string> gguf_search_query_ranked(const std::string & url) {
     common_remote_params params;
     params.timeout = 8;
+    std::vector<std::pair<double, std::string>> scored;
     try {
+        hf_request_guard guard;
         auto [http_code, body] = common_remote_get_content(url, params);
-        if (http_code != 200 || body.empty()) return "";
-        json results = json::parse(std::string(body.begin(), body.end()));
-        for (const auto & r : results) {
-            if (!r.contains("tags") || !r["tags"].is_array()) continue;
-            for (const auto & t : r["tags"]) {
-                if (t.is_string() && to_lower(t.get<std::string>()) == "gguf") {
-                    return r.value("id", "");
+        if (http_code == 200 && !body.empty()) {
+            json results = json::parse(std::string(body.begin(), body.end()));
+
+            for (const auto & r : results) {
+                if (!r.contains("tags") || !r["tags"].is_array()) continue;
+                bool has_gguf_tag = false;
+                for (const auto & t : r["tags"]) {
+                    if (t.is_string() && to_lower(t.get<std::string>()) == "gguf") {
+                        has_gguf_tag = true;
+                        break;
+                    }
                 }
+                if (!has_gguf_tag) continue;
+
+                double downloads = r.value("downloads", 0.0);
+                double likes      = r.value("likes", 0.0);
+                double score = std::log10(downloads + 1.0) + std::log10(likes + 1.0);
+                scored.emplace_back(score, r.value("id", ""));
             }
         }
     } catch (const std::exception &) {
         // ignore, best-effort only
     }
-    return "";
+
+    std::sort(scored.begin(), scored.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
+    std::vector<std::string> ids;
+    ids.reserve(scored.size());
+    for (auto & [score, id] : scored) {
+        if (!id.empty()) ids.push_back(id);
+    }
+    return ids;
 }
 
-// best-effort search for an existing community GGUF quant, top-N only. falls back to huihui-ai's
-// namespace specifically when nothing turns up under the model's own name: they're a prolific
-// publisher of abliterated (uncensored) derivatives that host their own GGUF quants, covering a
-// lot of ground a plain name search misses since the derivative has a different repo name entirely.
-std::string gguf_search(const std::string & repo_id) {
+// best-effort search for existing community GGUF quants, ranked best-scored-first, top
+// `max_candidates` only. Falls back to huihui-ai's namespace specifically when the name search
+// comes up short: they're a prolific publisher of abliterated (uncensored) derivatives that host
+// their own GGUF quants, covering a lot of ground a plain name search misses since the derivative
+// has a different repo name entirely.
+std::vector<std::string> gguf_search_candidates_uncached(const std::string & repo_id, int max_candidates) {
     std::string base = repo_id;
     auto slash = base.find_last_of('/');
     if (slash != std::string::npos) base = base.substr(slash + 1);
 
-    std::string found = gguf_search_query("https://huggingface.co/api/models?search=" + base + "%20GGUF&limit=15");
-    if (!found.empty()) {
-        return found;
+    std::vector<std::string> ids = gguf_search_query_ranked(
+        "https://huggingface.co/api/models?search=" + base + "%20GGUF&limit=15");
+
+    if ((int) ids.size() < max_candidates) {
+        auto fallback = gguf_search_query_ranked(
+            "https://huggingface.co/api/models?search=" + base + "&author=huihui-ai&limit=5");
+        for (auto & id : fallback) {
+            if (std::find(ids.begin(), ids.end(), id) == ids.end()) {
+                ids.push_back(id);
+            }
+        }
+    }
+    if ((int) ids.size() > max_candidates) {
+        ids.resize(max_candidates);
+    }
+    return ids;
+}
+
+std::mutex g_gguf_search_cache_mutex;
+
+// TTL-disk-cached wrapper, same rationale and TTL as get_repo_files_cached above - the search step
+// costs 1-2 HF API calls per row and gets re-run for largely the same candidate pool on every page
+// load / filter toggle otherwise.
+std::vector<std::string> gguf_search_candidates(const std::string & repo_id, int max_candidates) {
+    std::string cache_key = repo_id + "::" + std::to_string(max_candidates);
+    std::string cache_path = fs_get_cache_file("model-picker-gguf-search.json");
+    long now = (long) std::time(nullptr);
+
+    {
+        std::lock_guard<std::mutex> lock(g_gguf_search_cache_mutex);
+        json cache = json::parse(read_file(cache_path), nullptr, false);
+        if (!cache.is_discarded() && cache.is_object()) {
+            auto it = cache.find(cache_key);
+            if (it != cache.end() && it->contains("t") && it->contains("ids") &&
+                now - (*it)["t"].get<long>() < VERIFY_CACHE_TTL_SECONDS) {
+                return it->at("ids").get<std::vector<std::string>>();
+            }
+        }
     }
 
-    return gguf_search_query("https://huggingface.co/api/models?search=" + base + "&author=huihui-ai&limit=5");
+    std::vector<std::string> ids = gguf_search_candidates_uncached(repo_id, max_candidates);
+
+    {
+        std::lock_guard<std::mutex> lock(g_gguf_search_cache_mutex);
+        json cache = json::parse(read_file(cache_path), nullptr, false);
+        if (cache.is_discarded() || !cache.is_object()) cache = json::object();
+        cache[cache_key] = { {"t", now}, {"ids", ids} };
+        write_file(cache_path, cache.dump());
+    }
+
+    return ids;
+}
+
+json hf_file_to_json(const hf_cache::hf_file & f) {
+    // local_path/final_path deliberately omitted - verification only ever reads path/size, never
+    // downloads, so there's nothing to invalidate if the real cache-dir layout changes later.
+    return { {"path", f.path}, {"url", f.url}, {"oid", f.oid}, {"repo_id", f.repo_id}, {"size", f.size} };
+}
+
+hf_cache::hf_file hf_file_from_json(const json & j) {
+    hf_cache::hf_file f;
+    f.path    = j.value("path", std::string());
+    f.url     = j.value("url", std::string());
+    f.oid     = j.value("oid", std::string());
+    f.repo_id = j.value("repo_id", std::string());
+    f.size    = j.value("size", (uint64_t) 0);
+    return f;
+}
+
+std::mutex g_repo_files_cache_mutex;
+
+// TTL-disk-cached wrapper around hf_cache::get_repo_files, used only by the verification step -
+// the real download path always calls hf_cache::get_repo_files directly for a live, uncached
+// lookup. One combined JSON file keyed by repo_id, same shape as fetch_hf_tags_batch's cache.
+hf_cache::hf_files get_repo_files_cached(const std::string & repo_id) {
+    std::string cache_path = fs_get_cache_file("model-picker-repo-files.json");
+    long now = (long) std::time(nullptr);
+
+    {
+        std::lock_guard<std::mutex> lock(g_repo_files_cache_mutex);
+        json cache = json::parse(read_file(cache_path), nullptr, false);
+        if (!cache.is_discarded() && cache.is_object()) {
+            auto it = cache.find(repo_id);
+            if (it != cache.end() && it->contains("t") && it->contains("files") &&
+                now - (*it)["t"].get<long>() < VERIFY_CACHE_TTL_SECONDS) {
+                hf_cache::hf_files files;
+                for (auto & fj : (*it)["files"]) files.push_back(hf_file_from_json(fj));
+                return files;
+            }
+        }
+    }
+
+    hf_cache::hf_files files;
+    {
+        hf_request_guard guard;
+        files = hf_cache::get_repo_files(repo_id, "");
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_repo_files_cache_mutex);
+        json cache = json::parse(read_file(cache_path), nullptr, false);
+        if (cache.is_discarded() || !cache.is_object()) cache = json::object();
+        json files_json = json::array();
+        for (auto & f : files) files_json.push_back(hf_file_to_json(f));
+        cache[repo_id] = { {"t", now}, {"files", files_json} };
+        write_file(cache_path, cache.dump());
+    }
+
+    return files;
+}
+
+// Verify a candidate row against real HF file listings instead of trusting the CSV-estimate size:
+// try each of the top VERIFY_CANDIDATE_REPOS composite-scored repos, and within each, each quant
+// best-to-worst, until a REAL resolvable file (or split group) is found that actually fits - reusing
+// the exact same matching common_download_get_hf_plan() uses (common_download_resolve_model_files),
+// so a row this returns as "IQ3_M, 7.8 GB" can never turn into an actual bf16 download at click
+// time. On success overwrites gguf_repo/quant/active_gb/total_gb/fit_tier with the real numbers; on
+// failure leaves gguf_repo empty so the row gets dropped downstream, same as an outright search miss.
+void verify_gguf_row(model_row & m, double vram_gb, double ram_gb, double free_gb) {
+    for (auto & repo : gguf_search_candidates(m.repo_id, VERIFY_CANDIDATE_REPOS)) {
+        hf_cache::hf_files files = get_repo_files_cached(repo);
+        if (files.empty()) continue;
+
+        int         best_order = -1;
+        std::string best_quant;
+        std::string best_tier;
+        double      best_active_gb = 0.0;
+        double      best_total_gb  = 0.0;
+
+        for (auto & [qname, qbpw] : QUANT_CANDIDATES) {
+            (void) qbpw;
+            auto plan = common_download_resolve_model_files(files, qname);
+            if (plan.primary.path.empty()) continue;
+
+            uint64_t total_bytes = plan.primary_is_legacy_split ? plan.primary.size : 0;
+            if (!plan.primary_is_legacy_split) {
+                for (auto & f : plan.model_files) total_bytes += f.size;
+            }
+            if (total_bytes == 0) continue; // size unknown - can't trust it
+
+            double total_gb  = (double) total_bytes / 1e9;
+            // same active/total ratio the CSV-estimate math used, now anchored to a real total
+            // size instead of an assumed one - bpw is uniform across tensors for a given quant, so
+            // the active-parameter share of file size scales with active_b/total_b either way.
+            double active_gb = total_gb * (m.active_b / m.total_b);
+            std::string tier = classify_fit(active_gb, total_gb, vram_gb, ram_gb, free_gb);
+            if (!is_usable(tier)) continue;
+
+            int order = fit_order(tier);
+            if (best_order < 0 || order < best_order) {
+                best_order     = order;
+                best_quant     = qname;
+                best_tier      = tier;
+                best_active_gb = active_gb;
+                best_total_gb  = total_gb;
+            }
+        }
+
+        if (best_order >= 0) {
+            m.gguf_repo = repo;
+            m.quant     = best_quant;
+            m.fit_tier  = best_tier;
+            m.active_gb = best_active_gb;
+            m.total_gb  = best_total_gb;
+            m.ram_spillover_gb = m.fit_tier == "ram-cache"
+                                      ? std::max(0.0, m.active_gb - vram_gb * 0.75) : 0.0;
+            return; // first real usable match wins - candidates are already priority ordered
+        }
+    }
+    // nothing real found in any candidate repo - gguf_repo stays empty, dropped downstream
 }
 
 // fetch one model repo's HF tags - the signal that catches abliteration-tool-branded
@@ -473,6 +771,7 @@ std::vector<std::string> fetch_hf_tags(const std::string & repo_id) {
     params.timeout = 6;
     std::vector<std::string> tags;
     try {
+        hf_request_guard guard;
         auto [http_code, body] = common_remote_get_content(
             "https://huggingface.co/api/models/" + repo_id + "?expand[]=tags", params);
         if (http_code != 200 || body.empty()) return tags;
@@ -572,6 +871,56 @@ void server_model_picker_register_routes(const server_http_context & ctx_http, c
                                   ? disk_free_gb(".") : std::stod(req.get_param("disk_free_gb"));
             double total_capacity_gb = req.get_param("disk_total_gb").empty()
                                   ? disk_total_gb(".") : std::stod(req.get_param("disk_total_gb"));
+
+            std::string cache_dir_for_key;
+            try {
+                cache_dir_for_key = hf_cache::get_cache_dir();
+            } catch (const std::exception &) {
+                // fall through with an empty key component - just means this fallback path
+                // never shares a cache entry with a successful lookup, which is fine
+            }
+            // free/total disk space rounded to the nearest GB so trivial fluctuations (a few MB
+            // written/freed between requests) don't force a full recompute, while a real change
+            // (a big download finishing, a drive filling up) still busts the cache and re-buckets
+            // fit tiers correctly.
+            std::string cache_key = derestricted_only ? "d1" : "d0";
+            cache_key += unsupported_only ? "u1" : "u0";
+            cache_key += "|" + rank_by + "|" + std::to_string(top) + "|" + std::to_string(gguf_lookup)
+                       + "|" + std::to_string((long) std::round(vram_gb))
+                       + "|" + std::to_string((long) std::round(ram_gb))
+                       + "|" + std::to_string((long) std::round(free_gb))
+                       + "|" + std::to_string((long) std::round(total_capacity_gb))
+                       + "|" + cache_dir_for_key;
+
+            json cached_arr;
+            size_t cached_count = 0;
+            bool have_cached_list = false;
+            if (!refresh) {
+                std::lock_guard<std::mutex> lk(g_models_response_cache_mutex);
+                auto it = g_models_response_cache.find(cache_key);
+                if (it != g_models_response_cache.end() &&
+                    (long) std::time(nullptr) - it->second.cached_at < VERIFY_CACHE_TTL_SECONDS) {
+                    cached_arr        = it->second.models_arr;
+                    cached_count      = it->second.count;
+                    have_cached_list  = true;
+                }
+            }
+
+            if (have_cached_list) {
+                json out;
+                std::string cache_dir = cache_dir_for_key;
+                out["hardware"] = {
+                    {"vram_gb", vram_gb}, {"ram_gb", ram_gb},
+                    {"vram_free_gb", hw.vram_free_gb}, {"ram_free_gb", hw.ram_free_gb},
+                    {"disk_free_gb", free_gb}, {"disk_total_gb", total_capacity_gb}, {"cache_dir", cache_dir},
+                };
+                out["router_available"] = !models_preset_path.empty();
+                out["count"]  = cached_count;
+                out["models"] = cached_arr;
+                res->status = 200;
+                res->data = out.dump();
+                return res;
+            }
 
             // ---- fetch the three data sources (GitHub primary, cache/fallback if unreachable) ----
 
@@ -678,12 +1027,9 @@ void server_model_picker_register_routes(const server_http_context & ctx_http, c
                     m.fit_tier  = "no-disk-space";
                 }
 
-                if (m.fit_tier == "ram-cache") {
-                    // must match classify_fit()'s vram_budget calc (vram_gb * 0.75) - this is the
-                    // slice of the active working set that doesn't fit in that budget and ends up
-                    // cached in host RAM instead.
-                    m.ram_spillover_gb = std::max(0.0, m.active_gb - vram_gb * 0.75);
-                }
+                // ram_spillover_gb is left unset here (0.0) even for an estimate-time "ram-cache"
+                // tier - verify_gguf_row recomputes it from the real resolved size once the row is
+                // verified below, since the estimate tier can change once real sizes are known.
 
                 models.push_back(std::move(m));
             }
@@ -734,57 +1080,85 @@ void server_model_picker_register_routes(const server_http_context & ctx_http, c
                 return a.ugi_score > b.ugi_score; // "ugi" and any unrecognized value
             });
 
-            // Split before the top-N cut. fit_order groups sort easy/comfortable (0) ahead of
-            // ram-cache/disk-streaming (1-2) ahead of no-disk-space (3), and in real data the
-            // easy/comfortable group alone routinely exceeds `top` on its own (e.g. 99 vs the
-            // default top=30) - a single flat top-N truncation would then *always* cut off
-            // before reaching a single ram-cache or no-disk-space row, no matter how large `top`
-            // reasonably gets, even though the user needs to see both (spillover models to judge
-            // performance, no-disk-space ones to judge what to delete). So: `top` only bounds the
-            // ideal (easy/comfortable) group; every actionable degraded and no-disk-space
-            // candidate is kept regardless.
-            std::vector<model_row> ideal, degraded, no_space;
+            // Bucket by the CSV-estimate tier purely to decide verification priority below - this
+            // is not the final bucketing shown to the user, since verification can move a row to a
+            // different real tier (or drop it outright). Splitting first still matters: it's what
+            // stops the degraded/no-disk-space tails from being crowded out of their own
+            // gguf_lookup verification budget by whatever's estimate-ranked ahead of them.
+            std::vector<model_row> est_ideal, est_degraded, est_no_space;
             for (auto & m : filtered) {
                 if (m.fit_tier == "no-disk-space") {
-                    no_space.push_back(std::move(m));
+                    est_no_space.push_back(std::move(m));
                 } else if (m.fit_tier == "ram-cache" || m.fit_tier == "disk-streaming") {
-                    degraded.push_back(std::move(m));
+                    est_degraded.push_back(std::move(m));
                 } else {
-                    ideal.push_back(std::move(m));
+                    est_ideal.push_back(std::move(m));
                 }
             }
 
-            // search a pool bigger than `top` (gguf_lookup), in parallel, before truncating - a
-            // ranked candidate with no findable community GGUF quant isn't something the user can
-            // click Download on, so it gets filtered out below rather than shown as a dead row;
-            // searching only the eventual top-N would make the "no GGUF found" rows a lookup-limit
-            // artifact instead of an honest "we checked, there isn't one". Run per-group (not one
-            // flat pool) so the degraded/no-disk-space tails each get their own gguf_lookup budget
-            // instead of being crowded out by whatever's ranked ahead of them in the ideal group.
-            auto gguf_search_group = [gguf_lookup](std::vector<model_row> & group) {
+            // Verify a pool bigger than `top` (gguf_lookup), in parallel, before truncating - a
+            // ranked candidate with no real, resolvable community GGUF quant isn't something the
+            // user can click Download on, so it gets filtered out below rather than shown as a dead
+            // (or worse, mis-sized) row; verifying only the eventual top-N would make the "nothing
+            // found" rows a lookup-limit artifact instead of an honest "we checked, there isn't
+            // one". Run per-group (not one flat pool) so each estimate-tier tail gets its own
+            // gguf_lookup budget.
+            auto verify_group = [gguf_lookup, vram_gb, ram_gb, free_gb](std::vector<model_row> & group) {
                 const int n = std::min((int) group.size(), gguf_lookup);
-                std::vector<std::future<std::string>> futures;
+                std::vector<std::future<void>> futures;
                 futures.reserve(n);
                 for (int i = 0; i < n; i++) {
-                    futures.push_back(std::async(std::launch::async, gguf_search, group[i].repo_id));
+                    futures.push_back(std::async(std::launch::async, verify_gguf_row,
+                                                  std::ref(group[i]), vram_gb, ram_gb, free_gb));
                 }
                 for (int i = 0; i < n; i++) {
-                    group[i].gguf_repo = futures[i].get();
+                    futures[i].get();
                 }
-                std::vector<model_row> actionable;
+                std::vector<model_row> verified;
                 for (int i = 0; i < n; i++) {
-                    // beyond the searched pool, gguf_repo is unknown, not confirmed-absent - drop
+                    // beyond the verified pool, gguf_repo is unknown, not confirmed-absent - drop
                     // those too, same reasoning as an actual miss: nothing to click Download on
                     if (!group[i].gguf_repo.empty()) {
-                        actionable.push_back(std::move(group[i]));
+                        verified.push_back(std::move(group[i]));
                     }
                 }
-                group = std::move(actionable);
+                group = std::move(verified);
             };
-            gguf_search_group(ideal);
-            gguf_search_group(degraded);
-            gguf_search_group(no_space);
+            verify_group(est_ideal);
+            verify_group(est_degraded);
+            verify_group(est_no_space);
 
+            // Re-bucket by the now-real fit_tier verify_gguf_row resolved - a row estimated as
+            // "easy" can turn out to only have a real disk-streaming-tier quant available, or vice
+            // versa, and the user needs the tier they see to reflect what they'd actually get.
+            std::vector<model_row> ideal, degraded, no_space;
+            for (auto * group : { &est_ideal, &est_degraded, &est_no_space }) {
+                for (auto & m : *group) {
+                    if (m.fit_tier == "no-disk-space") {
+                        no_space.push_back(std::move(m));
+                    } else if (m.fit_tier == "ram-cache" || m.fit_tier == "disk-streaming") {
+                        degraded.push_back(std::move(m));
+                    } else {
+                        ideal.push_back(std::move(m));
+                    }
+                }
+            }
+
+            auto sort_by_rank = [&rank_by](std::vector<model_row> & group) {
+                std::sort(group.begin(), group.end(), [&rank_by](const model_row & a, const model_row & b) {
+                    if (rank_by == "size") return a.active_gb > b.active_gb;
+                    if (rank_by == "willingness") return a.willingness > b.willingness;
+                    return a.ugi_score > b.ugi_score; // "ugi" and any unrecognized value
+                });
+            };
+            sort_by_rank(ideal);
+            sort_by_rank(degraded);
+            sort_by_rank(no_space);
+
+            // `top` only bounds the ideal (easy/comfortable) group; every actionable degraded and
+            // no-disk-space candidate is kept regardless - see the comment this logic used to carry
+            // above, before re-bucketing moved here: a flat top-N truncation would otherwise always
+            // cut off before reaching a single degraded or no-disk-space row.
             if ((int) ideal.size() > top) ideal.resize(top);
             ideal.insert(ideal.end(), std::make_move_iterator(degraded.begin()), std::make_move_iterator(degraded.end()));
             ideal.insert(ideal.end(), std::make_move_iterator(no_space.begin()), std::make_move_iterator(no_space.end()));
@@ -818,6 +1192,13 @@ void server_model_picker_register_routes(const server_http_context & ctx_http, c
                 });
             }
             out["models"] = arr;
+
+            {
+                std::lock_guard<std::mutex> lk(g_models_response_cache_mutex);
+                g_models_response_cache[cache_key] = {
+                    (long) std::time(nullptr), arr, filtered.size()
+                };
+            }
 
             res->status = 200;
             res->data = out.dump();

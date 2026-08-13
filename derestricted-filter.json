@@ -11,6 +11,7 @@
     "unbound",
     "unrestrict",
     "heretic",
+    "heresy",
     "nsfw",
     "not-for-all-audiences",
     "de-alignment",
@@ -18,8 +19,10 @@
     "ablated",
     "unlimited",
     "refusal-remov",
+    "refusal-vector",
     "amoral",
-    "jailbreak"
+    "jailbreak",
+    "erotic"
   ],
   "known_repo_ids": []
 }
