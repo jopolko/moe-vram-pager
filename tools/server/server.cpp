@@ -2,6 +2,7 @@
 #include "server-http.h"
 #include "server-models.h"
 #include "server-cors-proxy.h"
+#include "server-model-picker.h"
 #include "server-stream.h"
 #include "server-tools.h"
 
@@ -202,6 +203,8 @@ int llama_server(int argc, char ** argv) {
         ctx_http.del ("/models",               ex_wrapper(models_routes->del_router_models));
     }
 
+    server_model_picker_register_routes(ctx_http, params.models_preset); // public endpoint (no API key check), independent of routes/ctx_server
+
     ctx_http.get ("/health",                   ex_wrapper(routes.get_health)); // public endpoint (no API key check)
     ctx_http.get ("/v1/health",                ex_wrapper(routes.get_health)); // public endpoint (no API key check)
     ctx_http.get ("/metrics",                  ex_wrapper(routes.get_metrics));
@@ -370,6 +373,9 @@ int llama_server(int argc, char ** argv) {
         // setup clean up function, to be called before exit
         clean_up = [&ctx_http, &ctx_server]() {
             SRV_INF("%s: cleaning up before exit...\n", __func__);
+            if (llama_context * lctx = ctx_server.get_llama_context(); lctx != nullptr) {
+                llama_moe_stream_print_stats(llama_get_model(lctx));
+            }
             // stop the session GC first, it finalizes live sessions and wakes pending readers
             g_stream_sessions.stop_gc();
             ctx_http.stop();

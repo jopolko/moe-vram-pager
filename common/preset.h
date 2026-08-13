@@ -50,6 +50,12 @@ struct common_preset {
 // interface for multiple presets in one file
 using common_presets = std::map<std::string, common_preset>;
 
+// update one section's key=value options in an INI preset file on disk, preserving all other
+// sections and options; creates the file (and its parent directory) if it doesn't exist yet.
+// keys are raw INI keys (dash-stripped long flag name, e.g. "moe-stream-cache"), not env names.
+void common_preset_write_ini_section(const std::string & path, const std::string & section,
+        const std::map<std::string, std::string> & kv);
+
 // context for loading and editing presets
 struct common_preset_context {
     common_params default_params; // unused for now

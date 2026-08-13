@@ -248,6 +248,35 @@ static std::map<std::string, std::map<std::string, std::string>> parse_ini_from_
     return parsed;
 }
 
+void common_preset_write_ini_section(const std::string & path, const std::string & section,
+        const std::map<std::string, std::string> & kv) {
+    std::map<std::string, std::map<std::string, std::string>> parsed;
+    if (std::filesystem::exists(path)) {
+        parsed = parse_ini_from_file(path);
+    }
+
+    for (const auto & [key, value] : kv) {
+        parsed[section][key] = value;
+    }
+
+    std::filesystem::path fpath(path);
+    if (fpath.has_parent_path()) {
+        std::filesystem::create_directories(fpath.parent_path());
+    }
+
+    std::ofstream out(path, std::ios::trunc);
+    if (!out.good()) {
+        throw std::runtime_error("failed to write preset file: " + path);
+    }
+    for (const auto & [sec_name, opts] : parsed) {
+        out << "[" << sec_name << "]\n";
+        for (const auto & [key, value] : opts) {
+            out << key << " = " << value << "\n";
+        }
+        out << "\n";
+    }
+}
+
 static std::map<std::string, common_arg> get_map_key_opt(common_params_context & ctx_params) {
     std::map<std::string, common_arg> mapping;
     for (const auto & opt : ctx_params.options) {
@@ -284,6 +313,12 @@ common_preset_context::common_preset_context(llama_example ex)
 
 common_presets common_preset_context::load_from_ini(const std::string & path, common_preset & global) const {
     common_presets out;
+    // --models-preset is an evolving config the router (and model-picker) write to over time
+    // (see common_preset_write_ini_section) - a missing file just means "no custom presets yet",
+    // not a fatal error, so router mode can start clean without the caller pre-creating it.
+    if (!std::filesystem::exists(path)) {
+        return out;
+    }
     auto ini_data = parse_ini_from_file(path);
 
     for (auto section : ini_data) {

@@ -2521,6 +2521,32 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.moe_stream_direct = true;
         }
     ).set_env("LLAMA_ARG_MOE_STREAM_DIRECT"));
+    add_opt(common_arg(
+        {"--moe-stream-cpu-cache"},
+        "force the --moe-stream expert cache into host RAM even on a GPU-offloaded layer, instead of "
+        "the layer's own device; implies --moe-stream. For isolating RAM- vs VRAM-cache performance: "
+        "everything else (dense/attention layers, KV cache, compute) still runs on whatever device -ngl "
+        "assigned, only the expert cache's location changes",
+        [](common_params & params) {
+            params.moe_stream = true;
+            params.moe_stream_cpu_cache = true;
+        }
+    ).set_env("LLAMA_ARG_MOE_STREAM_CPU_CACHE"));
+    add_opt(common_arg(
+        {"--moe-stream-prefetch"}, "N",
+        "speculatively prefetch the N hottest experts of the next layer while the current layer's "
+        "GEMM runs, overlapping I/O with compute during decode (the same trick --moe-stream already "
+        "uses across prefill waves, extended to single-token generation). implies --moe-stream. "
+        "0 disables (default). best-effort and non-blocking: a wrong prediction only wastes a cache "
+        "slot temporarily, it cannot affect output correctness",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_stream = true;
+            params.moe_stream_prefetch = (uint32_t) value;
+        }
+    ).set_env("LLAMA_ARG_MOE_STREAM_PREFETCH"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",

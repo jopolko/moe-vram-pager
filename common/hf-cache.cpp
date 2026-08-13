@@ -510,4 +510,8 @@ bool remove_cached_repo(const std::string & repo_id) {
     return removed > 0;
 }
 
+std::string get_cache_dir() {
+    return get_cache_directory().string();
+}
+
 } // namespace hf_cache

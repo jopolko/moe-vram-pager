@@ -32,4 +32,9 @@ std::string finalize_file(const hf_file & file);
 // Remove the entire cached directory for a repo, returns true if removed
 bool remove_cached_repo(const std::string & repo_id);
 
+// The base HF hub cache directory downloads land in (respects LLAMA_CACHE / HF_HUB_CACHE /
+// HUGGINGFACE_HUB_CACHE / HF_HOME / XDG_CACHE_HOME, same as the rest of this file) - exposed so
+// UIs can tell the user where their disk space is actually going.
+std::string get_cache_dir();
+
 } // namespace hf_cache

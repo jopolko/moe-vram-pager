@@ -376,11 +376,15 @@ void server_models::load_models() {
     }
     for (const auto & [name, custom] : custom_presets) {
         if (final_presets.find(name) != final_presets.end()) {
+            // a cache/local-sourced model with a supplementary custom-preset override (e.g. the
+            // model-picker's --moe-stream-cache hint) is still fundamentally cache/local-sourced -
+            // only flip to PRESET for entries that don't already exist, so a real download stays
+            // removable (can_remove) instead of looking like a user-authored preset entry
             final_presets[name].merge(custom);
         } else {
             final_presets[name] = custom;
+            source_map[name] = SERVER_MODEL_SOURCE_PRESET;
         }
-        source_map[name] = SERVER_MODEL_SOURCE_PRESET;
     }
 
     // overlay router's own CLI args on top of every model preset so that
@@ -1124,7 +1128,7 @@ void server_models::update_status(const std::string & name, const update_status_
     cv.notify_all();
 }
 
-void server_models::update_download_progress(const std::string & name, const common_download_progress & progress, bool done, bool ok) {
+void server_models::update_download_progress(const std::string & name, const common_download_progress & progress, bool done, bool ok, const std::string & reason) {
     json curr;
     {
         std::lock_guard<std::mutex> lk(mutex);
@@ -1149,7 +1153,8 @@ void server_models::update_download_progress(const std::string & name, const com
     }
     if (done) {
         cv.notify_all(); // notify in case unload() is waiting for download to be cancelled
-        notify_sse(ok ? "download_finished" : "download_failed", name, {});
+        notify_sse(ok ? "download_finished" : "download_failed", name,
+                   ok || reason.empty() ? json{} : json{{"reason", reason}});
     } else {
         notify_sse("download_progress", name, curr);
     }
@@ -1331,7 +1336,8 @@ void server_models::handle_child_state(const std::string & name, const std::stri
                     update_download_progress(name, {}, true, true);
                     request_exit();
                 } else if (result == "download_failed") {
-                    update_download_progress(name, {}, true, false);
+                    std::string reason = json_value(payload, "reason", std::string());
+                    update_download_progress(name, {}, true, false, reason);
                     request_exit();
                 } else if (!url.empty()) {
                     common_download_progress p;
@@ -1394,6 +1400,7 @@ struct server_download_state : public common_download_callback {
     std::function<bool()> should_stop;
     std::atomic<int64_t> last_progress_time{0}; // multiple files downloading in different threads
     bool is_ok = false;
+    std::string error_reason; // e.g. "no space left on device", surfaced to the frontend
 
     server_download_state(server_child * s) : self(s) {}
 
@@ -1405,6 +1412,7 @@ struct server_download_state : public common_download_callback {
         } catch (const std::exception & e) {
             auto model_name = params.model.get_name();
             SRV_ERR("download failed for model name=%s: %s\n", model_name.c_str(), e.what());
+            error_reason = e.what();
             is_ok = false;
         }
         return is_ok;
@@ -1453,6 +1461,7 @@ int server_child::run_download(common_params & params) {
 
     notify_to_router(server_state_to_str(SERVER_STATE_DOWNLOADING), {
         {"result", ok ? "download_finished" : "download_failed"},
+        {"reason", dl.error_reason},
     });
 
     // router should send CMD_ROUTER_TO_CHILD_EXIT after receiving the result

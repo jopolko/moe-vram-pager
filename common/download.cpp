@@ -10,6 +10,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cerrno>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -250,6 +251,16 @@ static bool common_pull_file(httplib::Client & cli,
         [&](const char *data, size_t len) {
             ofs.write(data, len);
             if (!ofs) {
+                // errno is checked immediately (nothing else runs a syscall in between), so this
+                // reliably reflects the actual write() failure on Linux even though iostream
+                // failures don't formally guarantee errno stays valid. Thrown rather than returned
+                // false: a plain false here re-enters common_download_file_single_online's retry
+                // loop, which is pointless for ENOSPC (the disk doesn't free up between attempts)
+                // and just delays surfacing a real, actionable reason to the caller by ~14s.
+                if (errno == ENOSPC) {
+                    LOG_ERR("%s: no space left on device while writing: %s\n", func, path_tmp.c_str());
+                    throw std::runtime_error("no space left on device");
+                }
                 LOG_ERR("%s: error writing to file: %s\n", func, path_tmp.c_str());
                 return false;
             }

@@ -231,7 +231,7 @@ public:
     // update the status of a model instance (thread-safe)
     // also send SSE notification to /models/sse endpoint
     void update_status(const std::string & name, const update_status_args & args);
-    void update_download_progress(const std::string & name, const common_download_progress & progress, bool done, bool ok = true);
+    void update_download_progress(const std::string & name, const common_download_progress & progress, bool done, bool ok = true, const std::string & reason = "");
 
     // remove a cache model from disk and update the list (thread-safe)
     // note: only cache models can be removed; returns false if the model doesn't exist or is not a cache model

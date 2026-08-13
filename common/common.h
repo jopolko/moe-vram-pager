@@ -587,6 +587,10 @@ struct common_params {
     uint64_t moe_stream_budget     = 0;     // total expert cache byte budget, used when slots == 0 (0 = auto)
     int32_t  moe_stream_io_threads = 0;     // expert load I/O threads (<= 0 = default)
     bool     moe_stream_direct     = false; // use O_DIRECT for expert reads (bypass page cache)
+    bool     moe_stream_cpu_cache  = false; // force the expert cache into host RAM even on a GPU-offloaded
+                                             // layer (isolates RAM- vs VRAM-cache perf for benchmarking)
+    uint32_t moe_stream_prefetch   = 0;     // 0 = disabled; else speculatively prefetch this many of the
+                                             // next layer's hottest experts during decode
 
     bool single_turn       = false; // single turn chat conversation
 

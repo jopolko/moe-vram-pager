@@ -324,6 +324,11 @@ extern "C" {
         uint64_t moe_stream_budget;     // total cache byte budget, used when slots == 0 (0 = auto heuristic)
         int32_t  moe_stream_io_threads; // expert load I/O threads (<= 0 = default)
         bool     moe_stream_direct;     // use O_DIRECT for expert reads (bypass page cache); falls back if unsupported
+        bool     moe_stream_cpu_cache;  // force the expert cache into host RAM even if the layer is GPU-offloaded
+                                         // (isolates RAM- vs VRAM-cache performance for benchmarking; no effect on
+                                         // where the rest of the layer's tensors live)
+        uint32_t moe_stream_prefetch;   // 0 = disabled; else speculatively prefetch this many of the next
+                                         // layer's hottest experts while the current layer's GEMM runs
 
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
