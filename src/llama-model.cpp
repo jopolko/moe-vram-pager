@@ -1293,6 +1293,16 @@ static uint32_t llama_moe_stream_resolve_slots(const llama_model_params & params
         n_slots = std::clamp<uint32_t>(2*hparams.n_expert_used, 16, hparams.n_expert);
     }
 
+    // multi-pass expert GEMMs need at least 3*n_expert_used resident slots to make progress
+    // (see llm_graph_context::build_moe_ffn); clamp up rather than let a too-small explicit
+    // value or byte budget reach that hard abort deep in graph construction.
+    const uint32_t n_slots_min = 3*hparams.n_expert_used;
+    if (n_slots < n_slots_min) {
+        LLAMA_LOG_WARN("%s: MoE expert cache of %u slots is below the %u required for multi-pass "
+                "expert GEMMs -- raising to %u\n", __func__, n_slots, n_slots_min, n_slots_min);
+        n_slots = n_slots_min;
+    }
+
     if (n_slots >= hparams.n_expert) {
         LLAMA_LOG_WARN("%s: MoE expert cache of %u slots covers all %u experts -- streaming disabled, loading normally\n",
                 __func__, n_slots, hparams.n_expert);
@@ -1397,7 +1407,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             if (pimpl->has_tensor_overrides) {
                 LLAMA_LOG_WARN("%s: tensor buffer overrides (-ot/--cpu-moe) do not apply to SSD-streamed expert tensors\n", __func__);
             }
-            pimpl->moe_stream = std::make_unique<llama_moe_stream>(n_layer_all, n_slots, params.moe_stream_io_threads, params.moe_stream_direct);
+            pimpl->moe_stream = std::make_unique<llama_moe_stream>(n_layer_all, n_slots, params.moe_stream_io_threads, params.moe_stream_direct, params.moe_stream_prefetch);
             LLAMA_LOG_INFO("%s: MoE expert SSD streaming enabled, %u of %u experts cached per layer, %d I/O threads\n",
                     __func__, n_slots, hparams.n_expert, pimpl->moe_stream->n_io_threads);
         }
@@ -1764,7 +1774,11 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
                 hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
                 tn, ne, flags | TENSOR_STREAMED);
 
-            ggml_backend_buffer_type_t buft = llama_moe_stream_select_buft(hparams, w->tensor, buft_list_layer);
+            // For isolating RAM- vs VRAM-cache performance: force the cache into host RAM
+            // even though the rest of this (GPU-offloaded) layer stays on-device.
+            ggml_backend_buffer_type_t buft = params.moe_stream_cpu_cache
+                ? ggml_backend_cpu_buffer_type()
+                : llama_moe_stream_select_buft(hparams, w->tensor, buft_list_layer);
             if (buft == nullptr) {
                 throw std::runtime_error(format("failed to find a buffer type for streamed tensor %s", name.c_str()));
             }
@@ -2453,6 +2467,8 @@ llama_model_params llama_model_default_params() {
         /*.moe_stream_budget           =*/ 0,
         /*.moe_stream_io_threads       =*/ 0,
         /*.moe_stream_direct           =*/ false,
+        /*.moe_stream_cpu_cache        =*/ false,
+        /*.moe_stream_prefetch         =*/ 0,
         /*.vocab_only                  =*/ false,
         /*.use_mmap                    =*/ true,
         /*.use_direct_io               =*/ false,

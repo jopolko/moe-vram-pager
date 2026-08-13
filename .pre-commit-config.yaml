@@ -12,8 +12,12 @@ repos:
 - repo: https://github.com/PyCQA/flake8
   rev: 7.0.0
   hooks:
-  -   id: flake8
-      additional_dependencies: [flake8-no-print]
+  - id: flake8
+    # flake8-no-print only has releases pinned to flake8==4.0.1, which
+    # conflicts with the flake8==7.0.0 above and just fails to install.
+    # dropped rather than downgrading flake8: scripts/model_picker.py is a
+    # CLI tool that's supposed to print its results, the rule doesn't fit
+    # this fork's actual Python usage anyway.
 - repo: local
   hooks:
   - id: gen-arch-map

@@ -83,6 +83,10 @@ struct llama_moe_stream_layer {
     std::vector<uint8_t> keep;         // [n_slots] slots the current call must not evict
     std::vector<int32_t> demand_slots; // slots the current call waits on
 
+    // scratch for prefetch_next_layer_locked: which slots this prefetch call has already
+    // claimed, so consecutive picks within the same call don't collide (cleared each call)
+    std::vector<uint8_t> prefetch_keep;
+
     // wave plan for multi-pass prefill (guarded by mgr->mtx): the touched experts are split into
     // plan_n_waves passes of at most plan_capacity experts each, run one pass at a time
     uint32_t plan_capacity  = 0;  // experts per wave, set at graph build
@@ -110,15 +114,22 @@ struct llama_moe_stream_work {
     int32_t  expert = -1;
     int32_t  slot   = -1;
     uint64_t gen    = 0; // stale unless it matches slot_gen[slot]
+
+    // best-effort (wave-preload / decode-prefetch) vs genuine blocking demand. genuine demand is
+    // always push_front'd ahead of any queued speculative work, so q_demand.front().speculative
+    // == false whenever any demand work is queued at all; see worker_loop().
+    bool speculative = false;
 };
 
 struct llama_moe_stream {
-    uint32_t n_slots      = 0; // expert cache slots per streamed layer
-    int32_t  n_io_threads = 0;
+    uint32_t n_slots        = 0; // expert cache slots per streamed layer
+    int32_t  n_io_threads   = 0;
+    uint32_t prefetch_top_k = 0; // 0 = disabled; else speculatively prefetch this many of the
+                                  // next layer's hottest experts while this layer computes
 
     std::vector<std::unique_ptr<llama_moe_stream_layer>> layers; // [n_layer], null = not streamed
 
-    llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n_io_threads, bool direct);
+    llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n_io_threads, bool direct, uint32_t prefetch_top_k);
     ~llama_moe_stream();
 
     llama_moe_stream_layer * layer(int32_t il) const {
@@ -176,13 +187,28 @@ struct llama_moe_stream {
         int64_t n_preload_issued = 0; // next-wave loads started during a wave's compute
         int64_t n_preload_ready  = 0; // wave experts already resident from the previous preload
         int64_t t_stall_wave_us  = 0; // wait time in wave miss handling
+
+        int64_t n_prefetch_issued = 0; // decode-time next-layer speculative loads started
     } stats;
 
     // internals
     void start_workers_locked();
-    void worker_loop();
-    int32_t pick_victim_locked(llama_moe_stream_layer & sl, const uint8_t * keep) const;
+    // demand_only: never pick up speculative work, even if it's all that's queued (see .cpp).
+    // reserves this thread so a genuine stall is never stuck behind an in-flight speculative read.
+    void worker_loop(bool demand_only);
+    // empty_only: never evict a resident (real) slot, only ever return an already-empty one (or
+    // -1 if none exists). For speculative work whose prediction isn't a sure thing (decode
+    // prefetch's hotness-based guess, unlike wave-preload's exact knowledge of the next wave's
+    // experts) - a wrong guess must never cost a real cache hit.
+    int32_t pick_victim_locked(llama_moe_stream_layer & sl, const uint8_t * keep, bool empty_only = false) const;
     void reserve_slot_locked(llama_moe_stream_layer & sl, int32_t expert, int32_t slot);
+
+    // best-effort, non-blocking: reserve + enqueue background loads for the top prefetch_top_k
+    // hottest experts of layer il that are not yet resident/loading, so their I/O overlaps the
+    // current layer's GPU compute. Never waits; a wrong or superseded prediction just wastes a
+    // slot temporarily (self-corrects via the normal eviction policy) - cannot affect
+    // correctness, since worker_loop() discards any load whose slot was reassigned meanwhile.
+    void prefetch_next_layer_locked(int32_t il);
 
     // multi-pass prefill helpers (called by llama_moe_stream_wave_ids, all under mtx)
     void plan_waves_locked(llama_moe_stream_layer & sl, const int32_t * ids, int64_t n); // wave 0: build the plan

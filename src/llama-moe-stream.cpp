@@ -138,7 +138,8 @@ bool llama_moe_stream_layer::matches(const ggml_tensor * gate, const ggml_tensor
 }
 
 // sizes the per-layer table and clamps the I/O thread count; workers are spawned lazily on first use
-llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n_io_threads, bool direct) : n_slots(n_slots) {
+llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n_io_threads, bool direct, uint32_t prefetch_top_k)
+        : n_slots(n_slots), prefetch_top_k(prefetch_top_k) {
     layers.resize(n_layer);
 
     this->n_io_threads = n_io_threads <= 0 ? MOE_STREAM_IO_THREADS_DEFAULT : n_io_threads;
@@ -212,6 +213,7 @@ ggml_tensor * llama_moe_stream::create_cache_tensor(
         sl->route_hotness.resize(n_expert, 0);
         sl->seen         .resize(n_expert, 0);
         sl->keep         .resize(n_slots, 0);
+        sl->prefetch_keep.resize(n_slots, 0);
     }
     GGML_ASSERT(sl->n_expert == n_expert);
 
@@ -304,24 +306,40 @@ void llama_moe_stream::start_workers_locked() {
     }
     workers_started = true;
     workers.reserve(n_io_threads);
+    // with more than one I/O thread, reserve exactly one as demand-only: a blocking read already
+    // in flight can't be preempted, so without this a genuine stall can still end up waiting on
+    // an in-flight speculative read even though push_front already got it to the front of the
+    // queue. one dedicated thread guarantees a stall is never stuck behind a guess, only behind
+    // other genuine demand (unavoidable - there's real work to do).
     for (int32_t i = 0; i < n_io_threads; i++) {
-        workers.emplace_back([this]() { worker_loop(); });
+        const bool demand_only = (n_io_threads > 1) && (i == 0);
+        workers.emplace_back([this, demand_only]() { worker_loop(demand_only); });
     }
 }
 
 // I/O worker: pops a reserved load, reads its expert slab(s) from the GGUF file into the cache
 // slot, and marks the slot RESIDENT (or flags load_failed); stale/duplicate items are skipped
-void llama_moe_stream::worker_loop() {
+void llama_moe_stream::worker_loop(bool demand_only) {
     // page-aligned staging (Metal private buffers require page-aligned source + page-multiple
     // length; O_DIRECT needs the extra head/tail slack for its aligned reads)
     uint8_t * staging = (uint8_t *) moe_aligned_alloc(max_nb_expert + 2*MOE_STREAM_DIRECT_ALIGN);
     GGML_ASSERT(staging != nullptr);
 
+    // genuine demand is always push_front'd ahead of speculative work (see q_demand_work), so
+    // the front of the queue is speculative only when the *whole* queue is speculative - a
+    // demand-only worker just waits that out rather than taking speculative work itself.
+    auto has_eligible_work = [&]{
+        return !q_demand.empty() && (!demand_only || !q_demand.front().speculative);
+    };
+
     std::unique_lock<std::mutex> lk(mtx);
     while (true) {
-        cv_work.wait(lk, [&]{ return shutting_down || !q_demand.empty(); });
+        cv_work.wait(lk, [&]{ return shutting_down || has_eligible_work(); });
         if (shutting_down) {
             break;
+        }
+        if (!has_eligible_work()) {
+            continue; // woken by unrelated notify_one(); still nothing this thread should take
         }
 
         llama_moe_stream_work w = q_demand.front();
@@ -365,7 +383,7 @@ void llama_moe_stream::worker_loop() {
 
 // least valuable evictable slot: empty first, then coldest resident (min route hotness, oldest use
 // as tiebreak); LOADING and keep slots are never candidates. returns -1 when no candidate exists
-int32_t llama_moe_stream::pick_victim_locked(llama_moe_stream_layer & sl, const uint8_t * keep) const {
+int32_t llama_moe_stream::pick_victim_locked(llama_moe_stream_layer & sl, const uint8_t * keep, bool empty_only) const {
     int32_t v = -1;
 
     for (uint32_t s = 0; s < sl.n_slots; s++) {
@@ -374,6 +392,9 @@ int32_t llama_moe_stream::pick_victim_locked(llama_moe_stream_layer & sl, const 
         }
         if (sl.slot_state[s] == LLAMA_MOE_STREAM_SLOT_EMPTY) {
             return s;
+        }
+        if (empty_only) {
+            continue; // never evict a resident slot for a merely-speculative guess
         }
         if (v < 0) {
             v = s;
@@ -407,6 +428,62 @@ void llama_moe_stream::reserve_slot_locked(llama_moe_stream_layer & sl, int32_t 
     sl.seen[expert] = 1;
 }
 
+// best-effort, non-blocking: reserve + enqueue background loads for the top prefetch_top_k
+// hottest experts of layer il that are not yet resident/loading, so their I/O overlaps the
+// current layer's GPU compute. Never waits; a wrong or superseded prediction just wastes a
+// slot temporarily (self-corrects via the normal eviction policy) - cannot affect correctness,
+// since worker_loop() discards any load whose slot was reassigned meanwhile.
+void llama_moe_stream::prefetch_next_layer_locked(int32_t il) {
+    if (prefetch_top_k == 0) {
+        return;
+    }
+    llama_moe_stream_layer * sl = layer(il);
+    if (sl == nullptr) {
+        return;
+    }
+
+    // top prefetch_top_k experts by route hotness, excluding ones already resident or loading;
+    // linear selection is fine since prefetch_top_k is small relative to n_expert
+    std::fill(sl->prefetch_keep.begin(), sl->prefetch_keep.end(), 0);
+
+    uint32_t issued = 0;
+    for (uint32_t pick = 0; pick < prefetch_top_k; pick++) {
+        int32_t  best   = -1;
+        uint32_t best_h = 0;
+        for (uint32_t e = 0; e < sl->n_expert; e++) {
+            if (sl->expert_slot.count((int32_t) e)) {
+                continue; // already resident or loading
+            }
+            if (sl->route_hotness[e] == 0) {
+                continue; // never routed to yet - nothing to predict from
+            }
+            if (best < 0 || sl->route_hotness[e] > best_h) {
+                best   = (int32_t) e;
+                best_h = sl->route_hotness[e];
+            }
+        }
+        if (best < 0) {
+            break; // no more useful candidates
+        }
+
+        // empty_only: a wrong guess must never cost a real cache hit (see pick_victim_locked)
+        const int32_t v = pick_victim_locked(*sl, sl->prefetch_keep.data(), /*empty_only=*/true);
+        if (v < 0) {
+            break; // no empty slot left; cache is under pressure, stop guessing rather than evict
+        }
+        sl->prefetch_keep[v] = 1;
+        reserve_slot_locked(*sl, best, v);
+        q_demand.push_back({ sl, best, v, sl->slot_gen[v], /*speculative=*/true });
+        cv_work.notify_all();
+        issued++;
+    }
+
+    stats.n_prefetch_issued += issued;
+    if (debug && issued > 0) {
+        LLAMA_LOG_DEBUG("%s: layer %d: prefetched %u expert(s) for layer %d\n", __func__, il - 1, issued, il);
+    }
+}
+
 size_t llama_moe_stream::size_bufs() const {
     size_t size = 0;
     for (const auto & buf : bufs) {
@@ -427,6 +504,10 @@ void llama_moe_stream::print_stats() const {
     if (stats.n_wave_calls > 0) {
         LLAMA_LOG_INFO("%s: moe stream: waves = %" PRId64 " (%" PRId64 " non-empty), preloads issued = %" PRId64 " (ready on arrival = %" PRId64 "), wave stall = %.2f ms\n",
                 __func__, stats.n_wave_calls, stats.n_waves_run, stats.n_preload_issued, stats.n_preload_ready, stats.t_stall_wave_us/1000.0);
+    }
+    if (prefetch_top_k > 0) {
+        LLAMA_LOG_INFO("%s: moe stream: decode prefetch: top-%u, %" PRId64 " speculative loads issued\n",
+                __func__, prefetch_top_k, stats.n_prefetch_issued);
     }
 }
 
@@ -504,8 +585,10 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
         if (it != sl->expert_slot.end()) {
             const int32_t s = it->second;
             if (sl->slot_state[s] == LLAMA_MOE_STREAM_SLOT_LOADING) {
-                mgr->q_demand.push_back({ sl, e, s, sl->slot_gen[s] });
-                mgr->cv_work.notify_one();
+                // genuine stall: the GPU is waiting on this expert right now, so it jumps ahead
+                // of any queued speculative (wave-preload/decode-prefetch) work
+                mgr->q_demand.push_front({ sl, e, s, sl->slot_gen[s] });
+                mgr->cv_work.notify_all();
                 waited = true;
             }
             mgr->stats.n_hit++;
@@ -524,8 +607,9 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
                 mgr->stats.n_miss_cold++;
             }
             mgr->reserve_slot_locked(*sl, e, v);
-            mgr->q_demand.push_back({ sl, e, v, sl->slot_gen[v] });
-            mgr->cv_work.notify_one();
+            // genuine stall (see above)
+            mgr->q_demand.push_front({ sl, e, v, sl->slot_gen[v] });
+            mgr->cv_work.notify_all();
             mgr->stats.n_miss++;
             waited = true;
             sl->keep[v] = 1;
@@ -557,6 +641,11 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
         sl->slot_last_use[s] = ++sl->use_counter;
         out[i] = s;
     }
+
+    // this layer's own experts are resident and its GEMM is about to be dispatched to the GPU;
+    // best-effort, non-blocking prefetch of the next layer's likely experts so that I/O overlaps
+    // this layer's compute instead of stalling the next layer's remap call
+    mgr->prefetch_next_layer_locked(sl->il + 1);
 }
 
 // stable per-wave userdata; grows lazily and records the per-wave expert capacity (set at build)
@@ -641,8 +730,9 @@ void llama_moe_stream::stage_wave_locked(std::unique_lock<std::mutex> & lk, llam
                 // already in the cache (resident, or still loading from the previous wave's preload)
                 const int32_t s = it->second;
                 if (sl.slot_state[s] == LLAMA_MOE_STREAM_SLOT_LOADING) {
-                    q_demand.push_back({ &sl, e, s, sl.slot_gen[s] }); // promote to demand, wait for it
-                    cv_work.notify_one();
+                    // promote to demand and jump the queue: this wave is about to wait on it
+                    q_demand.push_front({ &sl, e, s, sl.slot_gen[s] });
+                    cv_work.notify_all();
                     waited = true;
                 } else {
                     stats.n_preload_ready++; // resident from the previous wave's preload
@@ -663,8 +753,9 @@ void llama_moe_stream::stage_wave_locked(std::unique_lock<std::mutex> & lk, llam
                     stats.n_miss_cold++;
                 }
                 reserve_slot_locked(sl, e, v);
-                q_demand.push_back({ &sl, e, v, sl.slot_gen[v] });
-                cv_work.notify_one();
+                // genuine stall: this wave is about to wait on it
+                q_demand.push_front({ &sl, e, v, sl.slot_gen[v] });
+                cv_work.notify_all();
                 stats.n_miss++;
                 waited = true;
                 sl.keep[v] = 1;
@@ -690,8 +781,8 @@ void llama_moe_stream::stage_wave_locked(std::unique_lock<std::mutex> & lk, llam
             }
             reserve_slot_locked(sl, e, v);
             sl.keep[v] = 1;
-            q_demand.push_back({ &sl, e, v, sl.slot_gen[v] });
-            cv_work.notify_one();
+            q_demand.push_back({ &sl, e, v, sl.slot_gen[v], /*speculative=*/true });
+            cv_work.notify_all();
             stats.n_preload_issued++;
         }
     }
