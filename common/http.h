@@ -87,9 +87,11 @@ static common_http_url common_http_parse_url(const std::string & url) {
     return parts;
 }
 
-static std::pair<httplib::Client, common_http_url> common_http_client(const std::string & url) {
-    common_http_url parts = common_http_parse_url(url);
-
+// builds a client for an already-parsed URL - the shared construction logic behind
+// common_http_client(url) below, also used directly by callers that need several independent
+// client connections to the same host (e.g. parallel chunked downloads), where re-parsing the
+// same URL string per connection would be pointless.
+static httplib::Client common_http_client_from_parts(const common_http_url & parts) {
     if (parts.host.empty()) {
         throw std::runtime_error("error: invalid URL format");
     }
@@ -113,6 +115,12 @@ static std::pair<httplib::Client, common_http_url> common_http_client(const std:
 
     cli.set_follow_location(true);
 
+    return cli;
+}
+
+static std::pair<httplib::Client, common_http_url> common_http_client(const std::string & url) {
+    common_http_url parts = common_http_parse_url(url);
+    httplib::Client cli = common_http_client_from_parts(parts);
     return { std::move(cli), std::move(parts) };
 }
 

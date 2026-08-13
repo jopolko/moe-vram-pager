@@ -107,5 +107,27 @@ struct common_download_hf_plan {
     hf_cache::hf_file mmproj;
     hf_cache::hf_file mtp;
     hf_cache::hf_file preset; // if set, only this file is downloaded
+    // if true, model_files holds the ordered legacy `.partNofM` parts (not modern split shards),
+    // and primary is a synthetic placeholder for the reconstructed file - see
+    // common_download_reconstruct_legacy_split()
+    bool primary_is_legacy_split = false;
 };
 common_download_hf_plan common_download_get_hf_plan(const common_params_model & model, const common_download_opts & opts);
+
+// Resolve which real GGUF file(s) in `files` match `tag` (modern split, single file, or legacy
+// `.partNofM` split) - the same matching common_download_get_hf_plan() uses internally, so a
+// caller checking "does this quant really exist, and how big is it" (e.g. the model picker's
+// verification step) can never disagree with what an actual download resolves to. Empty tag means
+// the default priority order (Q4_K_M, Q8_0). Returns a plan with an empty primary.path if nothing
+// matches; only primary/model_files/primary_is_legacy_split are populated (no mmproj/mtp/preset).
+common_download_hf_plan common_download_resolve_model_files(const hf_cache::hf_files & files, const std::string & tag);
+
+// Sequentially download and concatenate a legacy `.partNofM` GGUF split (still used by some
+// uploaders, e.g. mradermacher, whose pipeline predates llama.cpp's native split format) into one
+// file at primary.final_path. Each part is deleted immediately after being appended, so peak extra
+// disk usage is bounded by the largest single part instead of doubling the whole model. Downloads
+// are sequential, not parallel across parts, trading download speed for that bound. Throws on
+// failure, including when there isn't enough free disk for the reconstruction.
+std::string common_download_reconstruct_legacy_split(const hf_cache::hf_files    & parts,
+                                                      const hf_cache::hf_file     & primary,
+                                                      const common_download_opts & opts);

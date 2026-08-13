@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -14,6 +15,7 @@ struct hf_file {
     std::string final_path;
     std::string oid;
     std::string repo_id;
+    uint64_t    size = 0; // bytes; 0 if unknown (e.g. offline cache listing couldn't stat it)
 };
 
 using hf_files = std::vector<hf_file>;

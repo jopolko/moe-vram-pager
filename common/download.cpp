@@ -10,7 +10,9 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -208,12 +210,186 @@ public:
     ProgressBar & operator=(const ProgressBar &) = delete;
 };
 
-static bool common_pull_file(httplib::Client & cli,
+// below this size, connection setup overhead for multiple parallel chunks isn't worth it - a
+// single stream saturates a slow connection just fine, and most non-GGUF sidecar files
+// (tokenizer.json, mmproj, etc.) never come close to this anyway.
+static constexpr uint64_t PARALLEL_DOWNLOAD_MIN_BYTES = 200ull * 1000 * 1000;
+static constexpr int      PARALLEL_DOWNLOAD_MAX_CHUNKS = 8;
+
+// Downloads one file as several concurrent Range-request connections instead of a single
+// stream, each writing directly to its own byte offset in path_tmp (pre-sized to the full
+// length up front, via resize_file - a sparse file on any filesystem that supports one, so this
+// costs no more disk space than the existing single-connection path: same final file, same peak
+// size, no separate per-chunk temp files to merge afterward).
+//
+// Only called for a from-scratch download (p.downloaded == 0) of a large, range-capable file -
+// a resume of a partial single-stream temp file always falls back to the sequential path in
+// common_pull_file below, since tracking exactly which byte ranges of a resumed file are already
+// complete (vs. just sized-but-empty/sparse) adds real correctness risk for comparatively little
+// benefit on what's normally a one-time resume.
+static bool common_pull_file_parallel(const common_http_url & parts,
+                                      const std::string & resolve_path,
+                                      const std::string & path_tmp,
+                                      common_download_progress & p,
+                                      common_download_callback * callback) {
+    // resize_file pre-stretches path_tmp to its final length so every worker can seek straight
+    // to its offset - but that also makes the file's on-disk size lie about how much real data
+    // is in it (std::filesystem::file_size() reports the full stretched length even though most
+    // of it may still be an unwritten hole). common_download_file_single_online's retry loop
+    // trusts file_size() as "bytes already downloaded" to decide whether/where to resume, so any
+    // failure exit from this function - including the early ones below, before a single byte was
+    // requested - MUST remove path_tmp first. Leaving the stretched file behind would make the
+    // next attempt believe the download is already complete (or resumable from the very end)
+    // instead of starting clean.
+    auto fail = [&](const char * reason) {
+        LOG_WRN("%s: %s, falling back / retrying from scratch\n", __func__, reason);
+        std::error_code rm_ec;
+        std::filesystem::remove(path_tmp, rm_ec);
+        return false;
+    };
+
+    const uint64_t total = p.total;
+    int num_chunks = (int) std::min<uint64_t>(PARALLEL_DOWNLOAD_MAX_CHUNKS,
+                                               std::max<uint64_t>(1, total / PARALLEL_DOWNLOAD_MIN_BYTES));
+
+    {
+        std::ofstream touch(path_tmp, std::ios::binary | std::ios::trunc);
+        if (!touch.is_open()) {
+            LOG_ERR("%s: error opening local file for writing: %s\n", __func__, path_tmp.c_str());
+            return fail("could not create temp file");
+        }
+    }
+    std::error_code ec;
+    std::filesystem::resize_file(path_tmp, total, ec);
+    if (ec) {
+        return fail("failed to pre-size temp file for parallel download");
+    }
+
+    LOG_INF("%s: downloading %llu bytes as %d parallel chunks: %s\n",
+            __func__, (unsigned long long) total, num_chunks, path_tmp.c_str());
+
+    std::vector<uint64_t> starts(num_chunks), ends(num_chunks); // ends are inclusive
+    uint64_t chunk_size = total / num_chunks;
+    for (int i = 0; i < num_chunks; ++i) {
+        starts[i] = i * chunk_size;
+        ends[i]   = (i == num_chunks - 1) ? total - 1 : starts[i] + chunk_size - 1;
+    }
+
+    std::atomic<uint64_t> chunk_done[PARALLEL_DOWNLOAD_MAX_CHUNKS];
+    for (int i = 0; i < num_chunks; ++i) chunk_done[i].store(0, std::memory_order_relaxed);
+    std::atomic<bool> failed{false};
+    std::atomic<bool> cancelled{false};
+
+    auto worker = [&](int idx) -> bool {
+        httplib::Client cli = common_http_client_from_parts(parts);
+        cli.set_read_timeout(20, 0);
+        cli.set_write_timeout(20, 0);
+
+        std::fstream ofs(path_tmp, std::ios::in | std::ios::out | std::ios::binary);
+        if (!ofs.is_open()) {
+            return false;
+        }
+        ofs.seekp((std::streamoff) starts[idx]);
+
+        httplib::Headers headers;
+        headers.emplace("Range", "bytes=" + std::to_string(starts[idx]) + "-" + std::to_string(ends[idx]));
+
+        auto res = cli.Get(resolve_path, headers,
+            [&](const char * data, size_t len) {
+                ofs.write(data, (std::streamsize) len);
+                if (!ofs) {
+                    LOG_ERR("%s: error writing chunk %d to file: %s\n", __func__, idx, path_tmp.c_str());
+                    return false;
+                }
+                chunk_done[idx].fetch_add(len, std::memory_order_relaxed);
+                if (failed.load(std::memory_order_relaxed) || cancelled.load(std::memory_order_relaxed) ||
+                    (callback && callback->is_cancelled())) {
+                    return false;
+                }
+                return true;
+            },
+            nullptr
+        );
+
+        // only 206 Partial Content is acceptable here - a server that ignores the Range header
+        // and answers 200 with the *full* body would make this worker try to write the entire
+        // file into its own small offset slice, corrupting the assembled file. Bail instead;
+        // the whole parallel attempt gets torn down and retried (see the caller), and if this
+        // repeats, common_pull_file's normal single-stream path (no Range header on a from-
+        // scratch download) is unaffected by whatever quirk caused it here.
+        if (!res || res->status != 206) {
+            return false;
+        }
+        return true;
+    };
+
+    std::vector<std::future<bool>> futures;
+    for (int i = 0; i < num_chunks; ++i) {
+        futures.push_back(std::async(std::launch::async, worker, i));
+    }
+
+    // dedicated poller thread: the only caller of callback->on_update() for the whole parallel
+    // download, so callback implementations never need to worry about concurrent invocation from
+    // multiple chunk workers.
+    std::atomic<bool> all_done{false};
+    std::thread poller([&]() {
+        while (!all_done.load(std::memory_order_relaxed)) {
+            uint64_t sum = 0;
+            for (int i = 0; i < num_chunks; ++i) sum += chunk_done[i].load(std::memory_order_relaxed);
+            p.downloaded = sum;
+            if (callback) {
+                callback->on_update(p);
+                if (callback->is_cancelled()) {
+                    cancelled.store(true, std::memory_order_relaxed);
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+    });
+
+    bool all_ok = true;
+    for (auto & f : futures) {
+        if (!f.get()) {
+            all_ok = false;
+            failed.store(true, std::memory_order_relaxed);
+        }
+    }
+    all_done.store(true, std::memory_order_relaxed);
+    poller.join();
+
+    uint64_t sum = 0;
+    for (int i = 0; i < num_chunks; ++i) sum += chunk_done[i].load(std::memory_order_relaxed);
+    p.downloaded = sum;
+
+    if (!all_ok || cancelled.load(std::memory_order_relaxed)) {
+        // deliberately restart from scratch next attempt rather than resuming a partial
+        // parallel download - see the function comment above for why.
+        return fail(cancelled.load(std::memory_order_relaxed) ? "download cancelled" : "a chunk failed");
+    }
+    return true;
+}
+
+static bool common_pull_file(const common_http_url & parts,
+                             httplib::Client & cli,
                              const std::string & resolve_path,
                              const std::string & path_tmp,
                              bool supports_ranges,
                              common_download_progress & p,
                              common_download_callback * callback) {
+    if (supports_ranges && p.downloaded == 0 && p.total >= PARALLEL_DOWNLOAD_MIN_BYTES) {
+        if (common_pull_file_parallel(parts, resolve_path, path_tmp, p, callback)) {
+            return true;
+        }
+        // fall through to the single-stream path below - either the parallel attempt failed
+        // outright (in which case the retry loop in common_download_file_single_online will
+        // call us again from scratch next attempt) or pre-sizing the file failed and we
+        // returned early above without downloading anything, so p.downloaded is still 0 and a
+        // normal single-stream attempt right now is exactly correct, not a wasted redo.
+        if (p.downloaded > 0) {
+            return false; // a real partial parallel failure - let the retry loop restart clean
+        }
+    }
+
     std::ofstream ofs(path_tmp, std::ios::binary | std::ios::app);
     if (!ofs.is_open()) {
         LOG_ERR("%s: error opening local file for writing: %s\n", __func__, path_tmp.c_str());
@@ -309,6 +485,16 @@ static int common_download_file_single_online(const std::string & url,
     }
 
     auto [cli, parts] = common_http_client(url);
+
+    // httplib's default client read timeout is 300s of *inactivity*, but a connection that
+    // trickles a few bytes every few seconds never triggers that - it can sit at ~0 throughput
+    // indefinitely without ever failing or becoming cancellable (is_cancelled() is only checked
+    // between chunks in common_pull_file's receiver, so a call blocked in a single long read
+    // never sees it either). shortening this bounds both how long a truly stalled attempt can
+    // hang before the existing retry loop gets a chance to run, and how long a user has to wait
+    // after clicking cancel.
+    cli.set_read_timeout(20, 0);
+    cli.set_write_timeout(20, 0);
 
     httplib::Headers headers;
     for (const auto & h : opts.headers) {
@@ -415,7 +601,7 @@ static int common_download_file_single_online(const std::string & url,
                 __func__, common_http_show_masked_url(parts).c_str(),
                 path_temporary.c_str(), etag.c_str());
 
-        if (common_pull_file(cli, parts.path, path_temporary, supports_ranges, p, opts.callback)) {
+        if (common_pull_file(parts, cli, parts.path, path_temporary, supports_ranges, p, opts.callback)) {
             if (std::rename(path_temporary.c_str(), path.c_str()) != 0) {
                 LOG_ERR("%s: unable to rename file: %s to %s\n", __func__, path_temporary.c_str(), path.c_str());
                 break;
@@ -686,6 +872,121 @@ static hf_cache::hf_file find_best_model(const hf_cache::hf_files & files,
     return {};
 }
 
+struct legacy_split_info {
+    std::string prefix; // full relative path, ending in ".gguf"
+    int index = 0;
+    int count = 0;
+};
+
+// parses uploader-side pre-native-split naming, e.g. "name.Q5_K_M.gguf.part1of6" (still used today
+// by some quantizers, notably mradermacher, whose pipeline predates llama.cpp's split format)
+static legacy_split_info get_legacy_split_info(const std::string & path) {
+    static const std::regex re("^(.+\\.gguf)\\.part([0-9]+)of([0-9]+)$", std::regex::icase);
+    std::smatch m;
+    if (!std::regex_match(path, m, re)) {
+        return {};
+    }
+    return {m[1].str(), std::stoi(m[2].str()), std::stoi(m[3].str())};
+}
+
+// collect all `count` parts sharing `prefix`; returns empty if any index is missing or duplicated
+static hf_cache::hf_files find_legacy_split_group(const hf_cache::hf_files & files,
+                                                   const std::string        & prefix,
+                                                   int                         count) {
+    hf_cache::hf_files group(count);
+    int found = 0;
+
+    for (const auto & f : files) {
+        auto split = get_legacy_split_info(f.path);
+        if (split.count == count && split.prefix == prefix) {
+            if (split.index < 1 || split.index > count || !group[split.index - 1].path.empty()) {
+                return {}; // out of range or duplicate index - malformed group
+            }
+            group[split.index - 1] = f;
+            found++;
+        }
+    }
+    return found == count ? group : hf_cache::hf_files{};
+}
+
+// fallback for repos with no modern .gguf match: find the best legacy `.partNofM` split group for
+// `tag` (or first available if tag is empty). Returns false if none found. On success, out_primary
+// is a synthetic placeholder (no real oid/url - see common_download_reconstruct_legacy_split()) for
+// the reconstructed file, and out_parts holds the real parts in order.
+static bool find_best_legacy_split_model(const hf_cache::hf_files & files,
+                                         const std::string        & tag,
+                                         hf_cache::hf_file         & out_primary,
+                                         hf_cache::hf_files        & out_parts) {
+    std::vector<std::string> tags;
+    if (!tag.empty()) {
+        tags.push_back(tag);
+    } else {
+        tags = {"Q4_K_M", "Q8_0"};
+    }
+
+    auto try_match = [&](const std::regex * pattern) -> bool {
+        std::unordered_set<std::string> tried;
+        for (const auto & f : files) {
+            auto split = get_legacy_split_info(f.path);
+            if (split.count <= 1 || !gguf_filename_is_model(split.prefix)) {
+                continue;
+            }
+            if (pattern && !std::regex_search(f.path, *pattern)) {
+                continue;
+            }
+            if (!tried.insert(split.prefix + "#" + std::to_string(split.count)).second) {
+                continue; // already tried this group via a different part
+            }
+            auto group = find_legacy_split_group(files, split.prefix, split.count);
+            if (group.empty()) {
+                continue; // incomplete/malformed group
+            }
+
+            out_parts = std::move(group);
+            out_primary = hf_cache::hf_file{};
+            out_primary.path    = split.prefix;
+            out_primary.repo_id = f.repo_id;
+            for (const auto & p : out_parts) {
+                out_primary.size += p.size;
+            }
+            // f.final_path ends with f.path verbatim (the ".partNofM" suffix has no path
+            // separators), so trimming that suffix off the end gives the reconstructed path
+            std::string suffix = f.path.substr(split.prefix.size());
+            out_primary.final_path = f.final_path.substr(0, f.final_path.size() - suffix.size());
+            return true;
+        }
+        return false;
+    };
+
+    for (const auto & t : tags) {
+        std::regex pattern(t + "[.-]", std::regex::icase);
+        if (try_match(&pattern)) {
+            return true;
+        }
+    }
+    return tag.empty() && try_match(nullptr);
+}
+
+common_download_hf_plan common_download_resolve_model_files(const hf_cache::hf_files & files, const std::string & tag) {
+    common_download_hf_plan plan;
+
+    hf_cache::hf_file primary = find_best_model(files, tag);
+    if (!primary.path.empty()) {
+        plan.primary = primary;
+        plan.model_files = get_split_files(files, primary);
+        return plan;
+    }
+
+    hf_cache::hf_file  legacy_primary;
+    hf_cache::hf_files legacy_parts;
+    if (find_best_legacy_split_model(files, tag, legacy_primary, legacy_parts)) {
+        plan.primary = legacy_primary;
+        plan.model_files = legacy_parts;
+        plan.primary_is_legacy_split = true;
+    }
+    return plan;
+}
+
 static void list_available_gguf_files(const hf_cache::hf_files & files) {
     LOG_INF("Available GGUF files:\n");
     for (const auto & f : files) {
@@ -719,9 +1020,8 @@ common_download_hf_plan common_download_get_hf_plan(const common_params_model & 
         }
     }
 
-    hf_cache::hf_file primary;
-
     if (!model.hf_file.empty()) {
+        hf_cache::hf_file primary;
         for (const auto & f : all) {
             if (f.path == model.hf_file) {
                 primary = f;
@@ -733,23 +1033,25 @@ common_download_hf_plan common_download_get_hf_plan(const common_params_model & 
             list_available_gguf_files(all);
             return plan;
         }
+        plan.primary = primary;
+        plan.model_files = get_split_files(all, primary);
     } else {
-        primary = find_best_model(all, tag);
-        if (primary.path.empty()) {
+        common_download_hf_plan resolved = common_download_resolve_model_files(all, tag);
+        if (resolved.primary.path.empty()) {
             LOG_ERR("%s: no GGUF files found in repository %s\n", __func__, repo.c_str());
             list_available_gguf_files(all);
             return plan;
         }
+        plan.primary = resolved.primary;
+        plan.model_files = resolved.model_files;
+        plan.primary_is_legacy_split = resolved.primary_is_legacy_split;
     }
-
-    plan.primary = primary;
-    plan.model_files = get_split_files(all, primary);
 
     if (opts.download_mmproj) {
-        plan.mmproj = find_best_mmproj(all, primary.path);
+        plan.mmproj = find_best_mmproj(all, plan.primary.path);
     }
     if (opts.download_mtp) {
-        plan.mtp = find_best_mtp(all, primary.path);
+        plan.mtp = find_best_mtp(all, plan.primary.path);
     }
 
     return plan;
@@ -788,6 +1090,108 @@ std::vector<std::string> common_download_get_all_parts(const std::string & url) 
         parts.push_back(split.prefix + suffix);
     }
     return parts;
+}
+
+std::string common_download_reconstruct_legacy_split(const hf_cache::hf_files    & parts,
+                                                      const hf_cache::hf_file     & primary,
+                                                      const common_download_opts & opts) {
+    namespace fs = std::filesystem;
+
+    if (fs::exists(primary.final_path)) {
+        LOG_DBG("%s: using cached reconstructed file: %s\n", __func__, primary.final_path.c_str());
+        if (opts.callback) {
+            common_download_progress p;
+            p.url     = primary.final_path;
+            p.cached  = true;
+            opts.callback->on_start(p);
+            opts.callback->on_done(p, true);
+        }
+        return primary.final_path;
+    }
+
+    uint64_t total_size   = 0;
+    uint64_t largest_part = 0;
+    for (const auto & part : parts) {
+        total_size   += part.size;
+        largest_part  = std::max(largest_part, part.size);
+    }
+
+    if (!opts.offline) {
+        std::error_code ec;
+        auto space = fs::space(fs::path(primary.final_path).parent_path(), ec);
+        if (!ec) {
+            // peak transient usage: the reconstructed file as it grows, plus one full extra part
+            // held on disk before it's appended and deleted - not the whole model doubled
+            uint64_t required = total_size + largest_part;
+            if (space.available < required) {
+                throw std::runtime_error(string_format(
+                    "not enough disk space to reconstruct legacy split GGUF '%s': needs ~%.1f GB "
+                    "(%.1f GB final file + %.1f GB temporary overhead for the largest part), only %.1f GB free",
+                    primary.path.c_str(),
+                    required / 1e9, total_size / 1e9, largest_part / 1e9, space.available / 1e9));
+            }
+        }
+    }
+
+    LOG_INF("%s: reconstructing legacy split GGUF '%s' from %zu parts (%.1f GB total, downloaded "
+            "sequentially with ~%.1f GB temporary overhead for the largest part)\n",
+            __func__, primary.path.c_str(), parts.size(), total_size / 1e9, largest_part / 1e9);
+
+    std::error_code ec;
+    fs::create_directories(fs::path(primary.final_path).parent_path(), ec);
+
+    const std::string path_temporary = primary.final_path + ".downloadInProgress";
+    {
+        std::ofstream clear(path_temporary, std::ios::binary | std::ios::trunc);
+        if (!clear) {
+            throw std::runtime_error("failed to create temporary file for legacy split reconstruction: " + path_temporary);
+        }
+    }
+
+    std::vector<char> buf(16 * 1024 * 1024);
+
+    for (const auto & part : parts) {
+        int status = common_download_file_single(part.url, part.local_path, opts, /*skip_etag=*/true);
+        if (!is_http_status_ok(status)) {
+            throw std::runtime_error(string_format("failed to download part '%s' (status %d)", part.path.c_str(), status));
+        }
+
+        std::ifstream in(part.local_path, std::ios::binary);
+        if (!in) {
+            throw std::runtime_error("failed to open downloaded part for reading: " + part.local_path);
+        }
+        std::ofstream out(path_temporary, std::ios::binary | std::ios::app);
+        if (!out) {
+            throw std::runtime_error("failed to open reconstruction target for appending: " + path_temporary);
+        }
+        while (in) {
+            in.read(buf.data(), (std::streamsize) buf.size());
+            std::streamsize n = in.gcount();
+            if (n > 0) {
+                out.write(buf.data(), n);
+                if (!out) {
+                    if (errno == ENOSPC) {
+                        throw std::runtime_error("no space left on device while reconstructing: " + path_temporary);
+                    }
+                    throw std::runtime_error("failed writing to reconstruction target: " + path_temporary);
+                }
+            }
+        }
+        in.close();
+        out.close();
+
+        std::error_code rm_ec;
+        fs::remove(part.local_path, rm_ec);
+        if (rm_ec) {
+            LOG_WRN("%s: failed to remove part after appending: %s: %s\n", __func__, part.local_path.c_str(), rm_ec.message().c_str());
+        }
+    }
+
+    if (std::rename(path_temporary.c_str(), primary.final_path.c_str()) != 0) {
+        throw std::runtime_error("failed to finalize reconstructed file: " + path_temporary + " -> " + primary.final_path);
+    }
+
+    return primary.final_path;
 }
 
 //

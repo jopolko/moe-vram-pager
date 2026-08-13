@@ -512,8 +512,35 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
             });
         }
     };
-    if (!plan.model_files.empty()) {
+    // legacy `.partNofM` split reconstruction must run sequentially (see
+    // common_download_reconstruct_legacy_split()), so it's handled synchronously here, before the
+    // parallel task batch below, rather than through the generic add_tasks()/finalize_file() path
+    auto handle_legacy_split = [&opts](const common_download_hf_plan & p, common_params_model & model) -> bool {
+        if (!p.primary_is_legacy_split) {
+            return false;
+        }
+        model.path = common_download_reconstruct_legacy_split(p.model_files, p.primary, opts);
+        return true;
+    };
+    bool model_is_legacy_split = handle_legacy_split(plan, params.model);
+    bool spec_is_legacy_split  = handle_legacy_split(plan_spec, params.speculative.draft.mparams);
+    bool voc_is_legacy_split   = handle_legacy_split(plan_voc, params.vocoder.model);
+
+    if (model_is_legacy_split) {
+        // already handled above
+    } else if (!plan.model_files.empty()) {
         add_tasks(plan.model_files, plan.primary, params.model);
+    } else if (!params.model.hf_repo.empty() && plan.preset.local_path.empty()) {
+        // an hf_repo was explicitly requested but common_download_get_hf_plan() couldn't resolve
+        // any actual model file in it (e.g. the repo only has a calibration imatrix.gguf uploaded
+        // so far, with the real quant shards still pending, or the repo/tag doesn't exist). That's
+        // a hard failure, not "nothing to do" - silently treating it as success here left callers
+        // (e.g. server_download_state::run()) believing the download succeeded with no model path
+        // ever set, which then broke downstream state instead of surfacing a clean error.
+        throw std::runtime_error(string_format(
+            "no downloadable GGUF model file found in repository '%s' (it may only contain "
+            "non-model files such as an imatrix, or the requested quant/tag isn't available yet)",
+            params.model.hf_repo.c_str()));
     }
     if (!plan.mmproj.local_path.empty()) {
         tasks.emplace_back(plan.mmproj, opts, [&]() {
@@ -540,12 +567,12 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
     }
 
     // handle plan_spec (e.g. --spec-draft-hf)
-    if (!plan_spec.model_files.empty()) {
+    if (!spec_is_legacy_split && !plan_spec.model_files.empty()) {
         add_tasks(plan_spec.model_files, plan_spec.primary, params.speculative.draft.mparams);
     }
 
     // handle vocoder plan (e.g. --hf-repo-v)
-    if (!plan_voc.model_files.empty()) {
+    if (!voc_is_legacy_split && !plan_voc.model_files.empty()) {
         add_tasks(plan_voc.model_files, plan_voc.primary, params.vocoder.model);
     }
 
