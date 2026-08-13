@@ -84,6 +84,12 @@
 	// $state, since it's write-only scratch state for computing etaSeconds, not itself rendered.
 	const rateTracker: Record<string, { bytes: number; time: number; emaBps: number | null }> = {};
 
+	// last time each id's dlState was set to 'downloading', from either an SSE progress event or
+	// firing the download - lets refreshRouterModels() tell a real live download (recent SSE
+	// traffic) apart from a stale local 'downloading' left behind by a missed terminal event
+	// (dropped SSE connection, router restart mid-download) that a backend poll should override.
+	const lastDownloadingAt: Record<string, number> = {};
+
 	function formatEta(seconds: number): string {
 		if (!Number.isFinite(seconds) || seconds < 0) return '';
 		if (seconds < 60) return `${Math.ceil(seconds)}s left`;
@@ -116,8 +122,14 @@
 				const status = row?.status?.value as string | undefined;
 				if (!status) continue;
 				// don't clobber a live "downloading" with a stale unloaded row from
-				// before the SSE feed folded the finished download in
-				if (next[row.id]?.phase === 'downloading' && status === 'unloaded') continue;
+				// before the SSE feed folded the finished download in - but only while SSE
+				// traffic for it is actually recent; if the last progress event was more than
+				// 10s ago (missed/never-arrived terminal event, dropped SSE connection, router
+				// restart mid-download) trust the backend's authoritative status instead
+				const downloadingRecently =
+					next[row.id]?.phase === 'downloading' &&
+					Date.now() - (lastDownloadingAt[row.id] ?? 0) < 10_000;
+				if (downloadingRecently && status === 'unloaded') continue;
 				next[row.id] = { phase: status as DlPhase };
 			}
 			dlState = next;
@@ -141,6 +153,10 @@
 		let es: EventSource | null = null;
 		try {
 			es = new EventSource('./models/sse');
+			// (re)connect - including the browser's automatic reconnect after a dropped
+			// connection (router restart, network blip, tab wake from background) - means we
+			// may have missed events while disconnected, so resync from the backend
+			es.onopen = () => void refreshRouterModels();
 			es.onmessage = (ev) => {
 				let envelope: { model?: string; event?: string; data?: Record<string, unknown> };
 				try {
@@ -191,6 +207,7 @@
 						emaBps = emaBps === null ? instantBps : emaBps * 0.7 + instantBps * 0.3;
 					}
 					rateTracker[id] = { bytes: done, time: now, emaBps };
+					lastDownloadingAt[id] = now;
 
 					const remaining = total > done ? total - done : 0;
 					const etaSeconds = emaBps && emaBps > 0 ? remaining / emaBps : undefined;
@@ -258,6 +275,7 @@
 				body: JSON.stringify({ model: id })
 			});
 			if (resp.ok) {
+				lastDownloadingAt[id] = Date.now();
 				dlState = { ...dlState, [id]: { phase: 'downloading', doneBytes: 0, totalBytes: 0 } };
 			} else {
 				const body = await resp.json().catch(() => ({}));
