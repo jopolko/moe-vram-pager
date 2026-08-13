@@ -10,6 +10,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
@@ -213,6 +214,11 @@ public:
         server_child_mode mode = SERVER_CHILD_MODE_NORMAL;
         // used for spawning a downloading child process
         std::optional<server_model_meta> custom_meta = std::nullopt;
+        // one-off launch-arg overrides (env-style keys, e.g. "LLAMA_ARG_CTX_SIZE") applied to
+        // this instance only - not written back to the persisted preset, so the next load (or a
+        // router restart) reverts to whatever's actually saved. Lets the context size for a
+        // given load be chosen at load time instead of being fixed at download time.
+        std::map<std::string, std::string> arg_overrides = {};
     };
 
     // load and unload model instances

@@ -35,8 +35,6 @@
 		quant: string;
 		hf_arch: string;
 		fit_tier: string;
-		ram_spillover_gb: number;
-		ram_risk: boolean;
 		ugi_score: number;
 		willingness: number;
 		is_derestricted: boolean;
@@ -58,11 +56,6 @@
 	let loading = $state(true);
 	let error = $state('');
 	let derestrictedOnly = $state(false);
-	// default view hides models whose total size alone risks thrashing this machine's RAM - see
-	// RAM_THRASH_FRACTION server-side. Off by default so most people never see a slow/heavy pick
-	// by accident; a model worth the wait either way (own it, know what you're getting into) can
-	// still be found and downloaded with this on.
-	let allowRamHeavy = $state(false);
 	let tagsProgress = $state<{ done: number; total: number } | null>(null);
 	// Not $state - purely an internal handle for loadModels() to cancel its own previous in-flight
 	// request, never read by the template.
@@ -86,6 +79,15 @@
 	}
 	let routerAvailable = $state(false);
 	let dlState = $state<Record<string, DlState>>({});
+
+	// Context size is a launch-time (not download-time) choice - it sizes the KV-cache buffer
+	// for the *process* being spawned, so it can only really change per load, not per chat
+	// message. Picked per-model right before hitting Play; DEFAULT_CTX must match
+	// DEFAULT_CTX_SIZE in server-model-picker.cpp (what a fresh download is preset with, and
+	// what this control starts pre-selected to).
+	const DEFAULT_CTX = 8192;
+	const CTX_SIZE_OPTIONS = [4096, 8192, 16384, 32768, 65536];
+	let ctxSizeChoice = $state<Record<string, number>>({});
 
 	// Download speed, EMA-smoothed from successive download_progress events - plain object, not
 	// $state, since it's write-only scratch state for computing etaSeconds, not itself rendered.
@@ -273,7 +275,7 @@
 				body: JSON.stringify({
 					gguf_repo: m.gguf_repo,
 					quant: m.quant,
-					total_gb: m.total_gb
+					active_gb: m.active_gb
 				})
 			});
 			const resp = await fetch('./models', {
@@ -305,10 +307,13 @@
 		if (busyIds.has(id)) return;
 		busyIds = new Set(busyIds).add(id);
 		try {
+			// One-off for this load only - not persisted, so the next load (or a router
+			// restart) reverts to whatever's actually saved in the preset from download time.
+			const ctxSize = ctxSizeChoice[id] ?? DEFAULT_CTX;
 			await fetch('./models/load', {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ model: id })
+				body: JSON.stringify({ model: id, ctx_size: ctxSize })
 			});
 		} finally {
 			const next = new Set(busyIds);
@@ -417,7 +422,6 @@
 				// bigger budget just means a longer queue through that cap, not a bigger burst.
 				gguf_lookup: '50',
 				derestricted_only: String(derestrictedOnly),
-				allow_ram_heavy: String(allowRamHeavy),
 				rank_by: RANK_BY,
 				...(forceRefresh ? { refresh: 'true' } : {})
 			});
@@ -450,11 +454,11 @@
 		}
 	}
 
-	// $effect fires once on mount and again whenever derestrictedOnly/allowRamHeavy change,
-	// no separate onMount needed (that caused a duplicate concurrent fetch).
+	// $effect fires once on mount and again whenever derestrictedOnly changes, no separate
+	// onMount needed (that caused a duplicate concurrent fetch).
 	$effect(() => {
 		// eslint-disable-next-line @typescript-eslint/no-unused-expressions
-		derestrictedOnly, allowRamHeavy;
+		derestrictedOnly;
 		loadModels();
 	});
 
@@ -590,8 +594,8 @@
 				hardware.ram_gb,
 				hardware.ram_free_gb,
 				1,
-				'Shown for reference only - fit ranking is budgeted against Free, not this',
-				"What fit ranking is actually budgeted against. On Linux/WSL this always equals total - ggml treats free RAM as ill-defined and just assumes it's all available, rather than fighting the reclaimable-page-cache accounting mess. Real on Windows builds."
+				'Shown for reference only - not part of fit ranking',
+				"Informational only. The full model always lives on SSD and only the active experts page into VRAM, so RAM isn't part of the fit budget. On Linux/WSL Free always equals Total here - ggml treats free RAM as ill-defined and just assumes it's all available, rather than fighting the reclaimable-page-cache accounting mess. Real on Windows builds."
 			)}
 			<div class="flex items-center gap-3 rounded-lg border px-4 py-3 text-sm whitespace-nowrap">
 				<span class="flex items-center gap-1 text-base font-bold">
@@ -621,15 +625,6 @@
 				title="Only show models that are specifically known derestricted/abliterated finetunes - a curated filter, not a score"
 			>
 				Derestricted finetunes only
-			</Label>
-		</div>
-		<div class="flex items-center gap-2">
-			<Switch id="allow-ram-heavy" bind:checked={allowRamHeavy} />
-			<Label
-				class="text-sm"
-				title="A model whose total file size alone is most of this machine's RAM will thrash under sustained streaming, even when the active-expert set fits VRAM comfortably. Hidden by default; turn this on to see (and download) them anyway."
-			>
-				Allow RAM-heavy models
 			</Label>
 		</div>
 		<Button
@@ -877,32 +872,6 @@
 										Derestricted
 									</Badge>
 								{/if}
-								{#if m.fit_tier === 'ram-cache'}
-									<Badge
-										variant="outline"
-										class="ml-2 align-middle border-amber-300 bg-amber-50 text-amber-700 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-300"
-										title="Active experts don't all fit in VRAM alone - {m.ram_spillover_gb.toFixed(1)} GB of the working set caches in host RAM instead of disk. Still fast, no per-token disk streaming needed for the hot set."
-									>
-										RAM spillover
-									</Badge>
-								{:else if m.fit_tier === 'disk-streaming'}
-									<Badge
-										variant="outline"
-										class="ml-2 align-middle border-orange-300 bg-orange-50 text-orange-700 dark:border-orange-800 dark:bg-orange-950/40 dark:text-orange-300"
-										title="Active expert working set exceeds VRAM+RAM combined - expect real per-token disk reads on cache misses. Still runs, just slower."
-									>
-										Disk streaming
-									</Badge>
-								{/if}
-								{#if m.ram_risk}
-									<Badge
-										variant="outline"
-										class="ml-2 align-middle border-red-300 bg-red-50 text-red-700 dark:border-red-800 dark:bg-red-950/40 dark:text-red-300"
-										title="Total file size is most of this machine's free RAM - expect real thrashing under sustained use, separate from (and on top of) any active-set spillover/streaming above"
-									>
-										RAM risk
-									</Badge>
-								{/if}
 								{#if m.fit_tier === 'no-disk-space' && hardware}
 									<Badge
 										variant="destructive"
@@ -980,6 +949,9 @@
 														<Loader2 class="h-3.5 w-3.5 animate-spin" />
 													</Button>
 												{:else if state.phase === 'unloaded'}
+													{@const headroomGb = hardware
+														? Math.max(0, (hardware.vram_free_gb - m.active_gb) * 0.5)
+														: null}
 													<Button
 														size="icon-sm"
 														variant="outline"
@@ -989,6 +961,20 @@
 													>
 														<Download class="h-3.5 w-3.5 text-blue-600 dark:text-blue-400" />
 													</Button>
+													<select
+														class="h-8 rounded-md border bg-background px-1.5 text-xs"
+														value={ctxSizeChoice[id] ?? DEFAULT_CTX}
+														onchange={(e) =>
+															(ctxSizeChoice[id] = Number((e.target as HTMLSelectElement).value))}
+														disabled={busy}
+														title={headroomGb !== null
+															? `Context size for this load only (not saved - pick again next time). ~${headroomGb.toFixed(1)} GB free for context/compute at current free VRAM, the other half of what's left after this model's ~${m.active_gb.toFixed(1)} GB active footprint (moe-stream-cache gets the rest). Pick more than that and auto-fit trims it down at load instead of failing.`
+															: 'Context size for this load only - not saved, pick again next time'}
+													>
+														{#each CTX_SIZE_OPTIONS as opt}
+															<option value={opt}>{opt >= 1024 ? `${opt / 1024}K` : opt} ctx</option>
+														{/each}
+													</select>
 													<Button
 														size="icon-sm"
 														variant="default"

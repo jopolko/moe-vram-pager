@@ -433,57 +433,37 @@ struct model_row {
     double total_gb  = 0.0;
     std::string quant;
     std::string fit_tier;
-    double ram_spillover_gb = 0.0; // only meaningful when fit_tier == "ram-cache"
-    // total_gb alone (mmap'd file + OS page cache), independent of fit_tier's active-set-only
-    // budget - a model whose active set is comfortably VRAM-resident can still be most of the
-    // machine's RAM in total size, which thrashes the OS page cache under sustained streaming.
-    // Set once total_gb is real (post-verification); excluded from the default view, shown only
-    // with allow_ram_heavy=true.
-    bool ram_risk = false;
     bool is_derestricted = false;
     std::string gguf_repo; // empty if not looked up / not found
 };
 
-// --moe-stream serves the full model from disk with a bounded RAM-LRU cache
-// in front of it, not "everything must be simultaneously resident." So the
-// only hard failure is not being able to store the model at all (disk); a
-// working set bigger than VRAM+RAM just means more cache misses streamed
-// from disk per token (slower), not "won't run." Tiers below are purely
-// informational (expected speed), never exclude a model.
-std::string classify_fit(double active_gb, double total_gb, double vram_gb, double ram_gb, double disk_free_gb) {
-    double easy_budget = vram_gb * 0.35;
-    double vram_budget = vram_gb * 0.75;
-    double ram_budget  = ram_gb * 0.7;
+// The model - every expert, dense or routed - always lives on SSD; --moe-stream reads
+// routed-expert weights off disk on demand into a bounded VRAM cache. Dense weights and
+// the working expert set (active_gb) are the only thing that must actually be VRAM-
+// resident, so that's the only thing gating whether a model is usable at all here - RAM
+// plays no part in this. VRAM_FIT_FRACTION is deliberately a mid-point (not "everything
+// that technically streams"): it holds real headroom back for KV-cache/context and
+// compute buffers so the card is never maxed out just by loading the model, and it's a
+// fraction of free VRAM rather than a fixed GiB figure so the same rule scales correctly
+// from a 1080 Ti up to a 5090 without separate tuning per card size.
+constexpr double VRAM_FIT_FRACTION = 0.55;
 
-    if (total_gb > disk_free_gb) return "no-disk-space"; // can't even be stored
-    if (active_gb <= easy_budget) return "easy";                    // VRAM-resident, plenty of headroom
-    if (active_gb <= vram_budget) return "comfortable";              // VRAM-resident
-    if (active_gb <= vram_gb + ram_budget) return "ram-cache";       // spills into RAM cache, no disk streaming needed for the hot set
-    return "disk-streaming";                                        // active set exceeds VRAM+RAM, expect real per-token disk streaming
+std::string classify_fit(double active_gb, double total_gb, double vram_gb, double disk_free_gb) {
+    if (total_gb > disk_free_gb) return "no-disk-space"; // can't even be stored on SSD
+    if (active_gb <= vram_gb * VRAM_FIT_FRACTION) return "fits";
+    return "too-large"; // active footprint alone would starve context/compute - not shown
 }
 
-// Used only to group results (fastest-expected first, then by UGI within a
-// group) so the top-N selection isn't dominated by a faster-but-lower-UGI
-// pick over a slower-but-much-better one; the tier distinction is
-// informational (shown via fit_tier), not a ranking exclusion - nothing
-// below is ever dropped from results except "no-disk-space".
+// Only two outcomes ever reach the final result list ("fits", scored by UGI; "no-disk-
+// space", shown so the user can see what more storage would unlock) - "too-large" rows
+// are dropped well before this, so fit_order just needs "fits" to sort first.
 int fit_order(const std::string & tier) {
-    if (tier == "easy" || tier == "comfortable") return 0;
-    if (tier == "ram-cache")      return 1;
-    if (tier == "disk-streaming") return 2;
-    return 3; // no-disk-space
+    return tier == "fits" ? 0 : 1;
 }
 
 bool is_usable(const std::string & tier) {
-    return tier != "no-disk-space";
+    return tier == "fits";
 }
-
-// Above this fraction of total RAM, just holding the file's mmap'd pages leaves too little
-// headroom for the OS/other apps and the active-expert cache itself, regardless of how well the
-// active set alone fits VRAM+RAM - the machine ends up thrashing under sustained streaming even
-// though fit_tier (judged on the active set only) reports "easy". Scales with the machine: a
-// generous-RAM box naturally clears far more models than a tight one, rather than a fixed cutoff.
-constexpr double RAM_THRASH_FRACTION = 0.75;
 
 // The router has no auto-fit pass for models it launches (unlike a manually-run llama-server),
 // so leaving --ctx-size unset means "0" reaches llama.cpp as-is, which resolves to the model's
@@ -492,6 +472,14 @@ constexpr double RAM_THRASH_FRACTION = 0.75;
 // (e.g. 262144 tokens on a 26B model). A fixed, generous-for-normal-chat default here instead;
 // editable per-model afterward directly in the preset INI.
 constexpr int DEFAULT_CTX_SIZE = 8192;
+
+// Once active_gb (dense weights + working expert set) is accounted for, whatever's still
+// free in VRAM gets split in half: one half grows --moe-stream-cache (fewer disk-streaming
+// misses on the routed experts), the other half stays reserved for KV-cache/context and
+// compute buffers. A flat fraction of *leftover* VRAM rather than a fixed GiB figure, so
+// it's a "medium" tune that scales the same way on a 1080 Ti as a 5090 - never handing the
+// whole card over to the cache alone.
+constexpr double CACHE_HEADROOM_FRACTION = 0.5;
 
 bool text_matches_terms(const std::vector<std::string> & terms, const std::string & text) {
     std::string lower = to_lower(text);
@@ -730,7 +718,7 @@ hf_cache::hf_files get_repo_files_cached(const std::string & repo_id) {
 // so a row this returns as "IQ3_M, 7.8 GB" can never turn into an actual bf16 download at click
 // time. On success overwrites gguf_repo/quant/active_gb/total_gb/fit_tier with the real numbers; on
 // failure leaves gguf_repo empty so the row gets dropped downstream, same as an outright search miss.
-void verify_gguf_row(model_row & m, double vram_gb, double ram_gb, double free_gb) {
+void verify_gguf_row(model_row & m, double vram_gb, double free_gb) {
     for (auto & repo : gguf_search_candidates(m.repo_id, VERIFY_CANDIDATE_REPOS)) {
         hf_cache::hf_files files = get_repo_files_cached(repo);
         if (files.empty()) continue;
@@ -757,7 +745,7 @@ void verify_gguf_row(model_row & m, double vram_gb, double ram_gb, double free_g
             // size instead of an assumed one - bpw is uniform across tensors for a given quant, so
             // the active-parameter share of file size scales with active_b/total_b either way.
             double active_gb = total_gb * (m.active_b / m.total_b);
-            std::string tier = classify_fit(active_gb, total_gb, vram_gb, ram_gb, free_gb);
+            std::string tier = classify_fit(active_gb, total_gb, vram_gb, free_gb);
             if (!is_usable(tier)) continue;
 
             int order = fit_order(tier);
@@ -776,9 +764,6 @@ void verify_gguf_row(model_row & m, double vram_gb, double ram_gb, double free_g
             m.fit_tier  = best_tier;
             m.active_gb = best_active_gb;
             m.total_gb  = best_total_gb;
-            m.ram_spillover_gb = m.fit_tier == "ram-cache"
-                                      ? std::max(0.0, m.active_gb - vram_gb * 0.75) : 0.0;
-            m.ram_risk  = m.total_gb > ram_gb * RAM_THRASH_FRACTION;
             return; // first real usable match wins - candidates are already priority ordered
         }
     }
@@ -871,10 +856,6 @@ void server_model_picker_register_routes(const server_http_context & ctx_http, c
             bool refresh          = req.get_param("refresh") == "true";
             bool derestricted_only = req.get_param("derestricted_only") == "true";
             bool unsupported_only  = req.get_param("unsupported_only") == "true";
-            // default view hides models whose total size alone risks thrashing this machine's
-            // RAM (see RAM_THRASH_FRACTION); this opts back in for a specific model worth the
-            // slower/heavier streaming, without changing what shows up by default for everyone else
-            bool allow_ram_heavy   = req.get_param("allow_ram_heavy") == "true";
             // Same candidate pool for all three - just a different priority
             // within each fit-tier group. "ugi" (default) = best-known overall
             // quality (UGI's own blended score). "size" = biggest active-param
@@ -919,7 +900,6 @@ void server_model_picker_register_routes(const server_http_context & ctx_http, c
             // fit tiers correctly.
             std::string cache_key = derestricted_only ? "d1" : "d0";
             cache_key += unsupported_only ? "u1" : "u0";
-            cache_key += allow_ram_heavy ? "r1" : "r0";
             cache_key += "|" + rank_by + "|" + std::to_string(top) + "|" + std::to_string(gguf_lookup)
                        + "|" + std::to_string((long) std::round(vram_gb))
                        + "|" + std::to_string((long) std::round(ram_gb))
@@ -1021,18 +1001,17 @@ void server_model_picker_register_routes(const server_http_context & ctx_http, c
                 auto ait = arch_map.find(m.hf_arch);
                 m.arch_supported = ait != arch_map.end();
 
-                // Every quant that fits on disk at all is technically "usable" (that's the whole
-                // point of --moe-stream: disk-streaming still runs, just slower), so picking the
-                // first best-to-worst quant that merely fits on disk picked Q8_0 for nearly every
-                // model regardless of how slow it'd actually be. Instead: find the best fit_tier
-                // any candidate quant can reach, then take the highest-bpw quant that reaches it -
-                // e.g. prefer a smaller quant that's VRAM-resident over Q8_0 that's disk-streaming.
+                // Picking the first best-to-worst quant whose active footprint merely fits under
+                // VRAM_FIT_FRACTION would pick Q8_0 whenever it happens to clear the bar, even
+                // when a smaller quant would leave meaningfully more headroom. Instead: find the
+                // best (lowest fit_order) tier any candidate quant can reach, then take the
+                // highest-bpw quant that still reaches it - best quality that's actually "fits".
                 bool fits_at_any_quant = false;
                 int  best_order        = -1;
                 for (auto & [qname, qbpw] : QUANT_CANDIDATES) {
                     double a_gb = active_b * 1e9 * qbpw / 8 / 1e9;
                     double t_gb = total_b  * 1e9 * qbpw / 8 / 1e9;
-                    std::string tier = classify_fit(a_gb, t_gb, vram_free_gb, ram_free_gb, free_gb);
+                    std::string tier = classify_fit(a_gb, t_gb, vram_free_gb, free_gb);
                     if (!is_usable(tier)) continue;
                     const int order = fit_order(tier);
                     if (best_order < 0 || order < best_order) {
@@ -1045,28 +1024,23 @@ void server_model_picker_register_routes(const server_http_context & ctx_http, c
                     }
                 }
                 if (!fits_at_any_quant) {
-                    // Doesn't fit in *current free* space at any quant - still show the row
-                    // instead of silently dropping it: the user needs to see it to judge what to
-                    // delete to make room for it, not have it vanish with no explanation. Use the
-                    // smallest (most compressed) candidate's footprint, since that's the realistic
-                    // "how much space would I actually need" figure, not the biggest quant's.
+                    // Doesn't fit at any quant, for one of two different reasons - tell them
+                    // apart using the smallest (most compressed) candidate's footprint, since
+                    // that's the realistic "what would it actually take" figure either way.
                     const auto & [qname, qbpw] = QUANT_CANDIDATES.back();
                     double a_gb = active_b * 1e9 * qbpw / 8 / 1e9;
                     double t_gb = total_b  * 1e9 * qbpw / 8 / 1e9;
-                    // ...unless it's bigger than the drive's total capacity, not just what's
-                    // currently free - no amount of deleting ever makes that one fit, so this is
-                    // the one case still worth excluding entirely rather than showing as "needs
-                    // more space".
+                    // Bigger than the drive's total capacity - no amount of deleting ever makes
+                    // this one fit, so it's excluded entirely rather than shown as "needs space".
                     if (t_gb > total_capacity_gb) continue;
                     m.quant     = qname;
                     m.active_gb = a_gb;
                     m.total_gb  = t_gb;
-                    m.fit_tier  = "no-disk-space";
+                    // Still show "doesn't currently fit on disk, free some space" (actionable);
+                    // "active footprint too big for VRAM at any quant" isn't fixable by the user
+                    // at all, so it's filtered out below instead of cluttering the list.
+                    m.fit_tier  = t_gb > free_gb ? "no-disk-space" : "too-large";
                 }
-
-                // ram_spillover_gb is left unset here (0.0) even for an estimate-time "ram-cache"
-                // tier - verify_gguf_row recomputes it from the real resolved size once the row is
-                // verified below, since the estimate tier can change once real sizes are known.
 
                 models.push_back(std::move(m));
             }
@@ -1106,6 +1080,9 @@ void server_model_picker_register_routes(const server_http_context & ctx_http, c
                 }
                 if (derestricted_only && !m.is_derestricted) continue;
                 if (m.ugi_score < min_ugi) continue;
+                // Active footprint doesn't fit VRAM at any quant - no RAM/disk fallback tier
+                // anymore, so there's nothing to show here, actionable or otherwise.
+                if (m.fit_tier == "too-large") continue;
                 filtered.push_back(m);
             }
 
@@ -1120,14 +1097,12 @@ void server_model_picker_register_routes(const server_http_context & ctx_http, c
             // Bucket by the CSV-estimate tier purely to decide verification priority below - this
             // is not the final bucketing shown to the user, since verification can move a row to a
             // different real tier (or drop it outright). Splitting first still matters: it's what
-            // stops the degraded/no-disk-space tails from being crowded out of their own
-            // gguf_lookup verification budget by whatever's estimate-ranked ahead of them.
-            std::vector<model_row> est_ideal, est_degraded, est_no_space;
+            // stops the no-disk-space tail from being crowded out of its own gguf_lookup
+            // verification budget by whatever's estimate-ranked ahead of it.
+            std::vector<model_row> est_ideal, est_no_space;
             for (auto & m : filtered) {
                 if (m.fit_tier == "no-disk-space") {
                     est_no_space.push_back(std::move(m));
-                } else if (m.fit_tier == "ram-cache" || m.fit_tier == "disk-streaming") {
-                    est_degraded.push_back(std::move(m));
                 } else {
                     est_ideal.push_back(std::move(m));
                 }
@@ -1140,13 +1115,13 @@ void server_model_picker_register_routes(const server_http_context & ctx_http, c
             // found" rows a lookup-limit artifact instead of an honest "we checked, there isn't
             // one". Run per-group (not one flat pool) so each estimate-tier tail gets its own
             // gguf_lookup budget.
-            auto verify_group = [gguf_lookup, vram_free_gb, ram_free_gb, free_gb](std::vector<model_row> & group) {
+            auto verify_group = [gguf_lookup, vram_free_gb, free_gb](std::vector<model_row> & group) {
                 const int n = std::min((int) group.size(), gguf_lookup);
                 std::vector<std::future<void>> futures;
                 futures.reserve(n);
                 for (int i = 0; i < n; i++) {
                     futures.push_back(std::async(std::launch::async, verify_gguf_row,
-                                                  std::ref(group[i]), vram_free_gb, ram_free_gb, free_gb));
+                                                  std::ref(group[i]), vram_free_gb, free_gb));
                 }
                 for (int i = 0; i < n; i++) {
                     futures[i].get();
@@ -1162,20 +1137,16 @@ void server_model_picker_register_routes(const server_http_context & ctx_http, c
                 group = std::move(verified);
             };
             verify_group(est_ideal);
-            verify_group(est_degraded);
             verify_group(est_no_space);
 
-            // Re-bucket by the now-real fit_tier verify_gguf_row resolved - a row estimated as
-            // "easy" can turn out to only have a real disk-streaming-tier quant available, or vice
-            // versa, and the user needs the tier they see to reflect what they'd actually get.
-            std::vector<model_row> ideal, degraded, no_space;
-            for (auto * group : { &est_ideal, &est_degraded, &est_no_space }) {
+            // Re-bucket by the now-real fit_tier verify_gguf_row resolved - a row that only
+            // survives verification is always "fits" (is_usable() already excluded anything
+            // else), so this just separates that from the no-disk-space informational tail.
+            std::vector<model_row> ideal, no_space;
+            for (auto * group : { &est_ideal, &est_no_space }) {
                 for (auto & m : *group) {
-                    if (!allow_ram_heavy && m.ram_risk) continue;
                     if (m.fit_tier == "no-disk-space") {
                         no_space.push_back(std::move(m));
-                    } else if (m.fit_tier == "ram-cache" || m.fit_tier == "disk-streaming") {
-                        degraded.push_back(std::move(m));
                     } else {
                         ideal.push_back(std::move(m));
                     }
@@ -1190,15 +1161,11 @@ void server_model_picker_register_routes(const server_http_context & ctx_http, c
                 });
             };
             sort_by_rank(ideal);
-            sort_by_rank(degraded);
             sort_by_rank(no_space);
 
-            // `top` only bounds the ideal (easy/comfortable) group; every actionable degraded and
-            // no-disk-space candidate is kept regardless - see the comment this logic used to carry
-            // above, before re-bucketing moved here: a flat top-N truncation would otherwise always
-            // cut off before reaching a single degraded or no-disk-space row.
+            // `top` only bounds the ideal ("fits") group; every actionable no-disk-space
+            // candidate is kept regardless, so a flat top-N truncation doesn't cut it off first.
             if ((int) ideal.size() > top) ideal.resize(top);
-            ideal.insert(ideal.end(), std::make_move_iterator(degraded.begin()), std::make_move_iterator(degraded.end()));
             ideal.insert(ideal.end(), std::make_move_iterator(no_space.begin()), std::make_move_iterator(no_space.end()));
             filtered = std::move(ideal);
 
@@ -1223,8 +1190,7 @@ void server_model_picker_register_routes(const server_http_context & ctx_http, c
                     {"active_b", m.active_b}, {"total_b", m.total_b},
                     {"active_gb", m.active_gb}, {"total_gb", m.total_gb},
                     {"quant", m.quant},
-                    {"hf_arch", m.hf_arch}, {"fit_tier", m.fit_tier}, {"ram_spillover_gb", m.ram_spillover_gb},
-                    {"ram_risk", m.ram_risk},
+                    {"hf_arch", m.hf_arch}, {"fit_tier", m.fit_tier},
                     {"ugi_score", m.ugi_score}, {"willingness", m.willingness},
                     {"is_derestricted", m.is_derestricted},
                     {"gguf_repo", m.gguf_repo},
@@ -1295,36 +1261,26 @@ void server_model_picker_register_routes(const server_http_context & ctx_http, c
             json body = json::parse(req.body);
             std::string gguf_repo = body.value("gguf_repo", std::string());
             std::string quant     = body.value("quant", std::string());
-            double      total_gb  = body.value("total_gb", 0.0);
+            double      active_gb = body.value("active_gb", 0.0);
             if (gguf_repo.empty() || quant.empty()) {
                 throw std::invalid_argument("gguf_repo and quant are required");
             }
 
-            // Freshly detected here rather than trusting a client-supplied vram_gb (dropped as a
-            // param entirely) - the same "recheck right before firing" reasoning downloadModel()
-            // already applies to disk space: whatever's free can have changed since the page
-            // loaded (another app claimed VRAM, another model got loaded), and total was never
-            // the right basis for this to begin with - see vram_free_gb in the /models handler.
+            // Freshly detected here rather than trusting client-supplied VRAM figures - the same
+            // "recheck right before firing" reasoning downloadModel() already applies to disk
+            // space: whatever's free can have changed since the page loaded (another app claimed
+            // VRAM, another model got loaded).
             hardware_info hw = detect_hardware();
 
-            // Half of *free* VRAM, not classify_fit()'s 0.75-of-total "comfortable" ceiling - that
-            // top end leaves too little headroom for the KV cache/context/compute buffers (and
-            // anything else sharing the card, including another already-loaded model) even before
-            // considering it was sized against the whole card instead of what's actually free.
+            // active_gb (dense weights + working expert set) is going to be VRAM-resident no
+            // matter what - see VRAM_FIT_FRACTION, which already confirmed this row fits under
+            // that basis. --moe-stream-cache only gets a cut of whatever's left over after that,
+            // and only half of THAT (CACHE_HEADROOM_FRACTION), so loading the model never eats
+            // the headroom the fit check reserved for KV-cache/context and compute buffers.
             // --moe-stream-cache only parses integer GiB (or integer slot counts), so round down
             // to a whole GiB with a 1 GiB floor.
-            uint64_t cache_gb = std::max<uint64_t>(1, (uint64_t) (hw.vram_free_gb * 0.5));
-
-            // Full coverage: cache_gb (GiB) can hold every expert in the file, not just the
-            // active subset, so generation never hits the disk-streaming path at all - it's
-            // compute-bound and KV cache belongs in VRAM (default, fastest). Below that line
-            // we're going to take disk-streaming misses regardless, so trade the KV cache's
-            // VRAM for more --moe-stream-cache headroom instead (-nkvo): fewer misses is worth
-            // more than fast attention when attention was never the bottleneck to begin with.
-            // total_gb is the whole GGUF (dense + every expert, not just the active ones) - a
-            // slight overestimate of "expert bytes alone" for the coverage check, but this file
-            // is dominated by expert weight anyway (heavily sparse MoE), so it's close enough.
-            bool full_coverage = total_gb > 0.0 && (double) cache_gb >= total_gb;
+            double headroom_gb = std::max(0.0, hw.vram_free_gb - active_gb);
+            uint64_t cache_gb = std::max<uint64_t>(1, (uint64_t) (headroom_gb * CACHE_HEADROOM_FRACTION));
 
             std::string model_id = gguf_repo + ":" + quant;
             std::string cache_val = std::to_string(cache_gb) + "G";
@@ -1332,7 +1288,6 @@ void server_model_picker_register_routes(const server_http_context & ctx_http, c
             common_preset_write_ini_section(models_preset_path, model_id, {
                 {"moe-stream-cache", cache_val},
                 {"ctx-size", std::to_string(DEFAULT_CTX_SIZE)},
-                {"no-kv-offload", full_coverage ? "false" : "true"},
             });
 
             res->status = 200;
@@ -1341,7 +1296,6 @@ void server_model_picker_register_routes(const server_http_context & ctx_http, c
                 {"model_id", model_id},
                 {"moe_stream_cache_gb", cache_gb},
                 {"ctx_size", DEFAULT_CTX_SIZE},
-                {"no_kv_offload", !full_coverage},
             }.dump();
         } catch (const std::exception & e) {
             res->status = 400;

@@ -890,6 +890,13 @@ void server_models::load(const std::string & name, const load_options & opts) {
     {
         SRV_INF("spawning server instance with name=%s on port %d\n", inst.meta.name.c_str(), inst.meta.port);
 
+        // Apply this load's one-off overrides (e.g. a context size picked at load time) on top
+        // of the persisted preset - same mechanism update_args() itself uses just below for
+        // host/port/alias, just sourced from the caller instead of being fixed here.
+        for (const auto & [env, value] : opts.arg_overrides) {
+            inst.meta.preset.set_option(ctx_preset, env, value);
+        }
+
         inst.meta.update_args(ctx_preset, bin_path); // render args
 
         std::vector<std::string> child_args = inst.meta.args; // copy
@@ -1734,7 +1741,16 @@ void server_models_routes::init_routes() {
             res_err(res, format_error_response("model is already running", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
-        models.load(meta->name);
+        server_models::load_options load_opts;
+        // Optional one-off context size for just this load, e.g. a different conversation
+        // wanting more/less headroom than whatever's persisted from download time - not written
+        // back to the preset, so it doesn't stick past this instance (unload/reload again to
+        // change it, or omit ctx_size to keep the persisted default).
+        int ctx_size = json_value(body, "ctx_size", 0);
+        if (ctx_size > 0) {
+            load_opts.arg_overrides["LLAMA_ARG_CTX_SIZE"] = std::to_string(ctx_size);
+        }
+        models.load(meta->name, load_opts);
         res_ok(res, {{"success", true}});
         return res;
     };
