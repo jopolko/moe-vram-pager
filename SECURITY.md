@@ -1,97 +1,81 @@
 # Security Policy
 
- - [**Reporting a vulnerability**](#reporting-a-vulnerability)
- - [**Requirements**](#requirements)
- - [**Covered Topics**](#covered-topics)
- - [**Using llama.cpp securely**](#using-llamacpp-securely)
-   - [Untrusted models](#untrusted-models)
-   - [Untrusted inputs](#untrusted-inputs)
-   - [Data privacy](#data-privacy)
-   - [Untrusted environments or networks](#untrusted-environments-or-networks)
-   - [Multi-Tenant environments](#multi-tenant-environments)
-
 ## Reporting a vulnerability
 
-> [!IMPORTANT]
-> The private security disclosure program is disabled until further notice. Please submit patches with fixes directly to the repo as public PRs. Emails will be ignored.
+Open a [private security advisory](../../security/advisories/new) on this
+repo (`jopolko/moe-vram-pager`), not on upstream llama.cpp's. This is a
+personal project maintained by one person, so skip the multi-week embargo
+process; a clear description and, if you have one, a minimal reproduction
+is enough. If GitHub advisories aren't working for you, open a regular
+issue and mark clearly that it's security-sensitive without including
+exploit details in the public body.
 
-If you have discovered a security vulnerability in this project that falls inside the [covered topics](#covered-topics), please report it privately. **Do not disclose it as a public issue.** This gives us time to work with you to fix the issue before public exposure, reducing the chance that the exploit will be used before a patch is released.
+## Scope
 
-Please disclose it as a private [security advisory](https://github.com/ggml-org/llama.cpp/security/advisories/new).
+Two categories, handled differently:
 
-A team of volunteers on a reasonable-effort basis maintains this project. As such, please give us at least 90 days to work on a fix before public exposure.
+### 1. Fork-specific code (report here)
 
-### Requirements
+The code this fork actually adds on top of llama.cpp:
 
-Before submitting your report, ensure you meet the following requirements:
+- `src/llama-moe-stream.{cpp,h}` - the expert-streaming cache: paging,
+  eviction, and the worker-thread I/O queue.
+- `tools/server/server-model-picker.{cpp,h}` - fetches remote data (the UGI
+  leaderboard CSV, a derestricted-model term list, an architecture map, live
+  HF tags, HF search results) over HTTP and writes it to a local disk cache;
+  also drives real model downloads in router mode.
+- `common/download.cpp`, `common/hf-cache.{cpp,h}` - the actual file
+  download and Hugging Face cache management.
+- `common/preset.{cpp,h}` - INI read/write for `--models-preset`, including
+  the picker's automatic per-model `--moe-stream-cache` writes.
 
-- You have read this policy and fully understand it.
-- AI is only permitted in an assistive capacity as stated in [AGENTS.md](AGENTS.md). We do not accept reports that are written exclusively by AI.
-- Your report must include a working Proof-of-Concept in the form of a script and/or attached files.
+Things worth specifically checking in a report against this surface: path
+handling around the HF cache directory and `--models-preset` file, anything
+that could turn a crafted HF API response into unexpected local disk
+writes, and resource exhaustion (disk space, thread/connection counts) in
+the download and tag-fetch paths.
 
-Maintainers reserve the right to close the report if these requirements are not fulfilled.
+### 2. Everything else (report upstream)
 
-### Covered Topics
+The rest of the tree is still llama.cpp. Model-loading bugs (GGUF parsing,
+tensor-op backends, the inference engine itself) are almost certainly
+present in unmodified upstream too and should go to
+[ggml-org/llama.cpp's security policy](https://github.com/ggml-org/llama.cpp/security/policy)
+instead, where the people who actually own that code can fix it. If you're
+not sure which side of the line a bug falls on, report it here anyway.
 
-Only vulnerabilities that fall within these parts of the project are considered valid. For problems falling outside of this list, please report them as issues.
+## What this is not
 
-- `src/**/*`
-- `ggml/**/*`
-- `gguf-py/**/*`
-- `tools/server/*`, **excluding** the following topics:
-    - Web UI
-    - Features marked as experimental
-    - Features not recommended for use in untrusted environments (e.g., router, MCP)
-    - Bugs that can lead to Denial-of-Service attack
+**Model output content is not a software vulnerability.** This project
+deliberately makes it easy to find and run derestricted ("uncensored")
+models, on the position that refusal behavior is a content-policy choice
+made by a model's trainers, not a security property of the inference
+software running it - see
+[Why derestricted models](README.md#why-derestricted-models). A model
+answering a question you didn't want it to isn't a bug in this repo. If
+you're looking to report objectionable model output, this isn't the place;
+if you're looking to report an actual software vulnerability (memory
+safety, injection, unintended file access, etc.), that's exactly what this
+policy covers.
 
-Note that none of the topics under [Using llama.cpp securely](#using-llamacpp-securely) are considered vulnerabilities in LLaMA C++.
+## Using this fork securely
 
-For vulnerabilities that fall within the `vendor` directory, please report them directly to the third-party project.
+The general guidance is the same as upstream llama.cpp, worth restating
+here because router mode adds a few new specifics:
 
-## Using llama.cpp securely
-
-### Untrusted models
-Be careful when running untrusted models. This classification includes models created by unknown developers or utilizing data obtained from unknown sources.
-
-*Always execute untrusted models within a secure, isolated environment such as a sandbox* (e.g., containers, virtual machines). This helps protect your system from potentially malicious code.
-
-> [!NOTE]
-> The trustworthiness of a model is not binary. You must always determine the proper level of caution depending on the specific model and how it matches your use case and risk tolerance.
-
-### Untrusted inputs
-
-Some models accept various input formats (text, images, audio, etc.). The libraries converting these inputs have varying security levels, so it's crucial to isolate the model and carefully pre-process inputs to mitigate script injection risks.
-
-For maximum security when handling untrusted inputs, you may need to employ the following:
-
-* Sandboxing: Isolate the environment where the inference happens.
-* Pre-analysis: Check how the model performs by default when exposed to prompt injection (e.g. using [fuzzing for prompt injection](https://github.com/FonduAI/awesome-prompt-injection?tab=readme-ov-file#tools)). This will give you leads on how hard you will have to work on the next topics.
-* Updates: Keep both LLaMA C++ and your libraries updated with the latest security patches.
-* Input Sanitation: Before feeding data to the model, sanitize inputs rigorously. This involves techniques such as:
-    * Validation: Enforce strict rules on allowed characters and data types.
-    * Filtering: Remove potentially malicious scripts or code fragments.
-    * Encoding: Convert special characters into safe representations.
-    * Verification: Run tooling that identifies potential script injections (e.g. [models that detect prompt injection attempts](https://python.langchain.com/docs/guides/safety/hugging_face_prompt_injection)).
-
-### Data privacy
-
-To protect sensitive data from potential leaks or unauthorized access, it is crucial to sandbox the model execution. This means running the model in a secure, isolated environment, which helps mitigate many attack vectors.
-
-### Untrusted environments or networks
-
-If you can't run your models in a secure and isolated environment or if it must be exposed to an untrusted network, make sure to take the following security precautions:
-* Do not use the RPC backend, [ggml-rpc-server](https://github.com/ggml-org/llama.cpp/tree/master/tools/rpc) and [llama-server](https://github.com/ggml-org/llama.cpp/tree/master/tools/server) functionality (see https://github.com/ggml-org/llama.cpp/pull/13061).
-* Confirm the hash of any downloaded artifact (e.g. pre-trained model weights) matches a known-good value.
-* Encrypt your data if sending it over the network.
-
-### Multi-Tenant environments
-
-If you intend to run multiple models in parallel with shared memory, it is your responsibility to ensure the models do not interact or access each other's data. The primary areas of concern are tenant isolation, resource allocation, model sharing and hardware attacks.
-
-1. Tenant Isolation: Models should run separately with strong isolation methods to prevent unwanted data access. Separating networks is crucial for isolation, as it prevents unauthorized access to data or models and malicious users from sending graphs to execute under another tenant's identity.
-
-2. Resource Allocation: A denial of service caused by one model can impact the overall system health. Implement safeguards like rate limits, access controls, and health monitoring.
-
-3. Model Sharing: In a multitenant model sharing design, tenants and users must understand the security risks of running code provided by others. Since there are no reliable methods to detect malicious models, sandboxing the model execution is the recommended approach to mitigate the risk.
-
-4. Hardware Attacks: GPUs or TPUs can also be attacked. [Researches](https://scholar.google.com/scholar?q=gpu+side+channel) has shown that side channel attacks on GPUs are possible, which can make data leak from other models or processes running on the same system at the same time.
+- **Untrusted GGUF files**: only load models from sources you trust. GGUF
+  parsing bugs are a real, historical vulnerability class in llama.cpp; a
+  malicious file is a malicious file regardless of which UI downloaded it.
+- **Router mode spawns child processes**: each loaded model runs as a
+  separate `llama-server` subprocess. Don't expose the router's HTTP API
+  (`--host 0.0.0.0` or beyond) to an untrusted network - it can download
+  and load arbitrary models on request.
+- **`--models-preset` is a local trust boundary**: it's a plain INI file
+  the picker writes to automatically. Don't point it at a path writable by
+  another user or process you don't control.
+- **The HF cache is shared, not sandboxed**: downloaded models land in the
+  standard Hugging Face hub cache (`~/.cache/huggingface/hub` by default,
+  see the info icon next to Free space in the picker UI), the same
+  directory any other HF-based tool on the machine reads from. Treat it
+  with the same trust level you'd give any other tool that shares that
+  cache.
