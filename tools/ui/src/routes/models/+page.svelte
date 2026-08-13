@@ -674,20 +674,25 @@
 									</sup>
 								{/if}
 								{#if m.is_derestricted && !derestrictedOnly}
-									<Badge variant="outline" class="ml-2 align-middle">Derestricted</Badge>
+									<Badge
+										variant="outline"
+										class="ml-2 align-middle border-violet-300 bg-violet-50 text-violet-700 dark:border-violet-800 dark:bg-violet-950/40 dark:text-violet-300"
+									>
+										Derestricted
+									</Badge>
 								{/if}
 								{#if m.fit_tier === 'ram-cache'}
 									<Badge
-										variant="secondary"
-										class="ml-2 align-middle"
+										variant="outline"
+										class="ml-2 align-middle border-amber-300 bg-amber-50 text-amber-700 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-300"
 										title="Active experts don't all fit in VRAM alone - the overflow caches in host RAM instead of disk. Still fast, no per-token disk streaming needed for the hot set."
 									>
 										RAM spillover
 									</Badge>
 								{:else if m.fit_tier === 'disk-streaming'}
 									<Badge
-										variant="tertiary"
-										class="ml-2 align-middle"
+										variant="outline"
+										class="ml-2 align-middle border-orange-300 bg-orange-50 text-orange-700 dark:border-orange-800 dark:bg-orange-950/40 dark:text-orange-300"
 										title="Active expert working set exceeds VRAM+RAM combined - expect real per-token disk reads on cache misses. Still runs, just slower."
 									>
 										Disk streaming
@@ -715,7 +720,7 @@
 										target="_blank"
 										rel="noopener noreferrer"
 										title={m.gguf_repo}
-										class="inline-flex text-muted-foreground hover:text-foreground"
+										class="inline-flex text-teal-600 hover:text-teal-700 dark:text-teal-400 dark:hover:text-teal-300"
 									>
 										<ExternalLink class="h-3.5 w-3.5" />
 									</a>
@@ -741,7 +746,7 @@
 														onclick={() => downloadModel(m)}
 														title={state?.phase === 'failed' ? 'Retry download' : 'Download'}
 													>
-														<Download class="h-3.5 w-3.5" />
+														<Download class="h-3.5 w-3.5 text-blue-600 dark:text-blue-400" />
 													</Button>
 												{:else if state.phase === 'downloading' || state.phase === 'downloaded'}
 													<Button size="icon-sm" variant="outline" disabled title="Downloading">
@@ -764,7 +769,7 @@
 														onclick={() => downloadModel(m)}
 														title="Re-download"
 													>
-														<Download class="h-3.5 w-3.5" />
+														<Download class="h-3.5 w-3.5 text-blue-600 dark:text-blue-400" />
 													</Button>
 													<Button
 														size="icon-sm"
