@@ -34,7 +34,7 @@ import shutil
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import requests
@@ -75,11 +75,16 @@ QUANT_BPW = {
 # reliably) its HF tags list. "heretic" is a known automated-abliteration
 # tool whose output repos tag themselves with it; found by checking an
 # actual model page rather than guessing, same for nsfw/not-for-all-audiences
-# which are real HF tags.
+# which are real HF tags. The second row was added after cross-checking real
+# HF tags pulled for ~160 candidate repos: each term was confirmed on an
+# actual model page, not guessed ("jailbreak" is the one borderline case -
+# seen once, alongside "red-teaming"/"evaluation" tags, so it may also catch
+# a red-team eval repo rather than a ready-to-use uncensored finetune).
 DEFAULT_DERESTRICTED_TERMS = [
     "abliterat", "derestrict", "uncensor", "decensor", "unalign",
     "unshackl", "unfilter", "unbound", "unrestrict", "heretic",
     "nsfw", "not-for-all-audiences", "de-alignment",
+    "obliterat", "ablated", "unlimited", "refusal-remov", "amoral", "jailbreak",
 ]
 # Specific repo ids to always flag regardless of name/tag matching, for
 # cases where a model doesn't self-tag accurately. Add these on GitHub in
@@ -246,24 +251,64 @@ def fetch_all_tags(model_ids: list[str], max_workers: int = 16) -> dict[str, lis
     return cache
 
 
+def real_disk_free_gb(path: str) -> float:
+    """Free space, capped by the real host drive's free space on WSL2.
+
+    On WSL2, `path` typically lives inside a dynamically-growing virtual disk
+    (a VHDX on the Windows host). Its self-reported free space is unallocated
+    blocks *within that virtual disk*, which can be far larger than what's
+    actually left on the physical host drive it still needs to grow into.
+    /mnt/c (when present) is the real host C: drive via DrvFs, so cap by
+    whichever is smaller. Assumes the common default single-drive (C:) WSL
+    setup; won't catch a WSL install relocated to another drive letter.
+    """
+    free_gb = shutil.disk_usage(path).free / 1e9
+    try:
+        is_wsl = "microsoft" in Path("/proc/version").read_text().lower()
+    except OSError:
+        is_wsl = False
+    if is_wsl and Path("/mnt/c").is_dir():
+        try:
+            host_free_gb = shutil.disk_usage("/mnt/c").free / 1e9
+            free_gb = min(free_gb, host_free_gb)
+        except OSError:
+            pass
+    return free_gb
+
+
 def classify_fit(active_gb: float, total_gb: float, vram_gb: float, ram_gb: float, disk_free_gb: float) -> str:
+    """--moe-stream serves the model from disk with a bounded RAM-LRU cache in
+    front of it, not "everything must be simultaneously resident." So the only
+    hard failure is not being able to store the model at all (disk); a working
+    set bigger than VRAM+RAM just means more cache misses streamed from disk
+    per token (slower), not "won't run." Tiers below are purely informational
+    (expected speed), never exclude a model.
+    """
     # Reserve headroom: KV cache + OS + non-expert weights aren't counted
     # above, so don't pretend the full budget is free for the active set.
+    easy_budget = vram_gb * 0.35
     vram_budget = vram_gb * 0.75
     ram_budget = ram_gb * 0.7
 
     if total_gb > disk_free_gb:
-        return "no-disk-space"
+        return "no-disk-space"  # can't even be stored
+    if active_gb <= easy_budget:
+        return "easy"  # VRAM-resident, plenty of headroom
     if active_gb <= vram_budget:
-        return "comfortable"
+        return "comfortable"  # VRAM-resident
     if active_gb <= vram_gb + ram_budget:
-        return "workable"
-    if active_gb <= ram_gb * 0.9:
-        return "marginal"
-    return "wont-fit"
+        return "ram-cache"  # spills into RAM cache, no disk streaming needed for the hot set
+    return "disk-streaming"  # active set exceeds VRAM+RAM, expect real per-token disk streaming
 
 
-FIT_ORDER = {"comfortable": 0, "workable": 1, "marginal": 2, "wont-fit": 3, "no-disk-space": 4}
+# Used only to group results (fastest-expected first, then by UGI within a
+# group) so the top-N selection isn't dominated by a faster-but-lower-UGI
+# pick over a slower-but-much-better one; the tier distinction is
+# informational (shown via fit_tier), not a ranking exclusion - nothing
+# below is ever dropped from results except "no-disk-space".
+FIT_ORDER = {"easy": 0, "comfortable": 0, "ram-cache": 1, "disk-streaming": 2, "no-disk-space": 3}
+
+UNUSABLE_TIERS = {"no-disk-space"}
 
 
 def gguf_search(model_name: str, timeout: float = 8.0) -> str | None:
@@ -300,6 +345,11 @@ def main():
     ap.add_argument("--quant", choices=sorted(QUANT_BPW), default="Q4_K_M")
     ap.add_argument("--derestricted-only", action="store_true", help="only show derestricted/abliterated-tagged models")
     ap.add_argument("--min-ugi", type=float, default=0.0, help="minimum UGI score")
+    ap.add_argument(
+        "--rank-by", choices=("ugi", "size", "willingness"), default="ugi",
+        help="ugi = best overall quality (default); size = biggest active-param model that still fits; "
+             "willingness = least likely to refuse, regardless of general capability",
+    )
     ap.add_argument("--top", type=int, default=20)
     ap.add_argument("--gguf-lookup", type=int, default=10, help="check GGUF availability for the top N results (HF API calls, slow)")
     ap.add_argument("--refresh", action="store_true", help="force re-download the UGI CSV and derestricted-filter.json")
@@ -307,7 +357,7 @@ def main():
     args = ap.parse_args()
 
     bpw = QUANT_BPW[args.quant]
-    disk_free_gb = shutil.disk_usage(args.disk_path).free / 1e9
+    disk_free_gb = real_disk_free_gb(args.disk_path)
 
     arch_map = load_arch_map()
     rows = load_ugi_csv(args.refresh)
@@ -337,10 +387,15 @@ def main():
         m.fit_tier = classify_fit(m.active_gb, m.total_gb, args.vram_gb, args.ram_gb, disk_free_gb)
         models.append(m)
 
+    # The UGI CSV leaves Architecture blank for some (often very new) models -
+    # that means "unknown," not "confirmed this fork can't load it." Default
+    # view: include confirmed-supported and unknown, exclude only confirmed-
+    # unsupported. unsupported_only (gap-finding): show only confirmed gaps,
+    # not unknowns.
     if args.unsupported_only:
-        models = [m for m in models if m.gguf_arch is None]
+        models = [m for m in models if m.hf_arch and m.gguf_arch is None]
     else:
-        models = [m for m in models if m.gguf_arch is not None]
+        models = [m for m in models if not m.hf_arch or m.gguf_arch is not None]
 
     # Tag lookup is what actually catches abliteration-tool-branded repos
     # (e.g. "Heretic-...") that a name-keyword match alone would miss, so
@@ -357,8 +412,15 @@ def main():
         models = [m for m in models if m.is_derestricted]
 
     models = [m for m in models if m.ugi_score >= args.min_ugi]
+    models = [m for m in models if m.fit_tier not in UNUSABLE_TIERS]  # won't run on this hardware at all
 
-    models.sort(key=lambda m: (FIT_ORDER.get(m.fit_tier, 9), -m.ugi_score))
+    rank_keys = {
+        "size": lambda m: -m.active_gb,
+        "willingness": lambda m: -m.willingness,
+        "ugi": lambda m: -m.ugi_score,
+    }
+    rank_key = rank_keys[args.rank_by]
+    models.sort(key=lambda m: (FIT_ORDER.get(m.fit_tier, 9), rank_key(m)))
     models = models[: args.top]
 
     for i, m in enumerate(models):
