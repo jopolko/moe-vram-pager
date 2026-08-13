@@ -11,7 +11,9 @@
 		MessageSquare,
 		Loader2,
 		Play,
-		Info
+		Info,
+		Square,
+		RefreshCw
 	} from '@lucide/svelte';
 	import { Switch } from '$lib/components/ui/switch';
 	import { Label } from '$lib/components/ui/label';
@@ -55,6 +57,9 @@
 	let error = $state('');
 	let derestrictedOnly = $state(false);
 	let tagsProgress = $state<{ done: number; total: number } | null>(null);
+	// Not $state - purely an internal handle for loadModels() to cancel its own previous in-flight
+	// request, never read by the template.
+	let loadModelsAbort: AbortController | null = null;
 
 	// Router-mode download/load management. Deliberately independent of
 	// $lib/stores/models.svelte.ts (the chat UI's own model switcher) - this
@@ -67,12 +72,26 @@
 		phase: DlPhase;
 		doneBytes?: number;
 		totalBytes?: number;
+		etaSeconds?: number;
 		reason?: string;
 		loadPct?: number;
 		loadStage?: string;
 	}
 	let routerAvailable = $state(false);
 	let dlState = $state<Record<string, DlState>>({});
+
+	// Download speed, EMA-smoothed from successive download_progress events - plain object, not
+	// $state, since it's write-only scratch state for computing etaSeconds, not itself rendered.
+	const rateTracker: Record<string, { bytes: number; time: number; emaBps: number | null }> = {};
+
+	function formatEta(seconds: number): string {
+		if (!Number.isFinite(seconds) || seconds < 0) return '';
+		if (seconds < 60) return `${Math.ceil(seconds)}s left`;
+		const mins = Math.round(seconds / 60);
+		if (mins < 60) return `${mins}m left`;
+		const hrs = Math.floor(mins / 60);
+		return `${hrs}h ${mins % 60}m left`;
+	}
 	let loadedDropdownOpen = $state(false);
 	let busyIds = $state<Set<string>>(new Set());
 
@@ -163,14 +182,33 @@
 						| Record<string, { done: number; total: number }>
 						| undefined;
 					const { done, total } = sumProgress(progress ?? {});
-					dlState = { ...dlState, [id]: { phase: 'downloading', doneBytes: done, totalBytes: total } };
+
+					const now = Date.now();
+					const prev = rateTracker[id];
+					let emaBps = prev?.emaBps ?? null;
+					if (prev && now > prev.time && done >= prev.bytes) {
+						const instantBps = ((done - prev.bytes) / (now - prev.time)) * 1000;
+						emaBps = emaBps === null ? instantBps : emaBps * 0.7 + instantBps * 0.3;
+					}
+					rateTracker[id] = { bytes: done, time: now, emaBps };
+
+					const remaining = total > done ? total - done : 0;
+					const etaSeconds = emaBps && emaBps > 0 ? remaining / emaBps : undefined;
+
+					dlState = {
+						...dlState,
+						[id]: { phase: 'downloading', doneBytes: done, totalBytes: total, etaSeconds }
+					};
 				} else if (envelope.event === 'download_finished') {
+					delete rateTracker[id];
 					dlState = { ...dlState, [id]: { phase: 'downloaded' } };
 					void refreshRouterModels();
 				} else if (envelope.event === 'download_failed') {
+					delete rateTracker[id];
 					const reason = envelope.data?.reason as string | undefined;
 					dlState = { ...dlState, [id]: { phase: 'failed', reason } };
 				} else if (envelope.event === 'model_remove') {
+					delete rateTracker[id];
 					const next = { ...dlState };
 					delete next[id];
 					dlState = next;
@@ -223,7 +261,11 @@
 				dlState = { ...dlState, [id]: { phase: 'downloading', doneBytes: 0, totalBytes: 0 } };
 			} else {
 				const body = await resp.json().catch(() => ({}));
-				throw new Error(body.error || `Request failed (${resp.status})`);
+				// the router's error body is {error: {message, type, code}} (server-models.cpp's
+				// res_err), not a plain string like the model-picker endpoints below use - so
+				// body.error itself isn't a valid Error message, only body.error.message is.
+				const message = body.error?.message || body.error || `Request failed (${resp.status})`;
+				throw new Error(message);
 			}
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
@@ -252,15 +294,29 @@
 
 	async function deleteRouterModel(id: string) {
 		if (busyIds.has(id)) return;
-		if (!confirm(`Delete downloaded files for ${id}? This frees disk space; re-downloading later works the same as the first time.`)) {
+		const isLoaded = dlState[id]?.phase === 'loaded';
+		const isDownloading = dlState[id]?.phase === 'downloading';
+		const message = isDownloading
+			? `Stop the download for ${id}? Any partial data will be removed; you can restart it from scratch later.`
+			: isLoaded
+				? `Delete downloaded files for ${id}? It's currently loaded, so it will be stopped first. This frees disk space; re-downloading later works the same as the first time.`
+				: `Delete downloaded files for ${id}? This frees disk space; re-downloading later works the same as the first time.`;
+		if (!confirm(message)) {
 			return;
 		}
 		busyIds = new Set(busyIds).add(id);
 		try {
-			await fetch(`./models?model=${encodeURIComponent(id)}`, { method: 'DELETE' });
+			const resp = await fetch(`./models?model=${encodeURIComponent(id)}`, { method: 'DELETE' });
+			if (!resp.ok) {
+				const body = await resp.json().catch(() => ({}));
+				throw new Error(body.error?.message || body.error || `Request failed (${resp.status})`);
+			}
 			const next = { ...dlState };
 			delete next[id];
 			dlState = next;
+			await loadModels();
+		} catch (e) {
+			error = e instanceof Error ? e.message : String(e);
 		} finally {
 			const nextBusy = new Set(busyIds);
 			nextBusy.delete(id);
@@ -285,7 +341,15 @@
 		}
 	}
 
-	async function loadModels() {
+	async function loadModels(forceRefresh = false) {
+		// Cancel any still-in-flight request from a previous call (e.g. the user toggled the
+		// derestricted filter again before the last load finished) - without this, whichever
+		// request happens to resolve last wins, which can silently overwrite fresh results with a
+		// stale (or by-then-irrelevant) response instead of the current toggle state's data.
+		loadModelsAbort?.abort();
+		const controller = new AbortController();
+		loadModelsAbort = controller;
+
 		loading = true;
 		error = '';
 		tagsProgress = null;
@@ -295,12 +359,21 @@
 		try {
 			const params = new URLSearchParams({
 				top: '30',
-				gguf_lookup: '60',
+				// Each lookup now does real per-file HF verification (up to a few tree-API round
+				// trips), not just one cheap search call, and not every lookup resolves to an
+				// actionable real match - budget needs headroom above the ~25 final results wanted
+				// per tier. Safe to keep generous since server-model-picker.cpp's hf_request_limiter
+				// caps actual concurrent HF requests process-wide regardless of this number; a
+				// bigger budget just means a longer queue through that cap, not a bigger burst.
+				gguf_lookup: '50',
 				derestricted_only: String(derestrictedOnly),
-				rank_by: RANK_BY
+				rank_by: RANK_BY,
+				...(forceRefresh ? { refresh: 'true' } : {})
 			});
 
-			const resp = await fetch(`./model-picker/models?${params.toString()}`);
+			const resp = await fetch(`./model-picker/models?${params.toString()}`, {
+				signal: controller.signal
+			});
 			if (!resp.ok) {
 				const body = await resp.json().catch(() => ({}));
 				throw new Error(body.error || `Request failed (${resp.status})`);
@@ -310,11 +383,19 @@
 			models = data.models;
 			routerAvailable = Boolean(data.router_available);
 		} catch (e) {
+			// superseded by a newer loadModels() call, not a real failure - the newer call already
+			// owns loading/error state, so leave it alone here.
+			if (e instanceof DOMException && e.name === 'AbortError') return;
 			error = e instanceof Error ? e.message : String(e);
 		} finally {
+			// progressTimer is per-call and must always be cleared regardless of which request
+			// "wins" - only the shared loading/tagsProgress state is guarded, so a superseded call
+			// doesn't stomp on the newer call's still-in-progress state.
 			clearInterval(progressTimer);
-			tagsProgress = null;
-			loading = false;
+			if (loadModelsAbort === controller) {
+				tagsProgress = null;
+				loading = false;
+			}
 		}
 	}
 
@@ -421,6 +502,16 @@
 			demand, instead of loading the entire model upfront.
 		</p>
 		<p class="text-sm text-muted-foreground">Identify every MoE model that will run on your current hardware.</p>
+		<p class="text-xs text-muted-foreground">
+			Model catalog and scores sourced from the <a
+				href="https://huggingface.co/spaces/DontPlanToEnd/UGI-Leaderboard"
+				target="_blank"
+				rel="noopener noreferrer"
+				class="underline hover:text-foreground">HF UGI-Leaderboard</a
+			>. Within what fits your hardware, results are ranked by UGI score, and each one is
+			checked against a real downloadable file on Hugging Face before it's shown, so the
+			quant and size listed are never just an estimate.
+		</p>
 	</div>
 
 	{#snippet hwCard(label: string, total: number, free: number, decimals: number, totalTitle?: string, freeTitle?: string)}
@@ -481,6 +572,16 @@
 				Derestricted finetunes only
 			</Label>
 		</div>
+		<Button
+			size="sm"
+			variant="outline"
+			disabled={loading}
+			onclick={() => loadModels(true)}
+			title="The list below is cached for up to 6 hours so a page refresh stays instant - use this to pull the latest UGI-leaderboard data and re-check for new GGUF quants right now"
+		>
+			<RefreshCw class="h-3.5 w-3.5 {loading ? 'animate-spin' : ''}" />
+			Check for new models
+		</Button>
 		{#if routerAvailable}
 			<DropdownMenu.Root bind:open={loadedDropdownOpen}>
 				<DropdownMenu.Trigger>
@@ -521,10 +622,10 @@
 									{/if}
 									<span class="min-w-0 truncate" title={id}>{id}</span>
 								</DropdownMenu.Item>
-								{#if state.phase === 'unloaded' || state.phase === 'failed'}
+								{#if state.phase === 'unloaded' || state.phase === 'failed' || state.phase === 'loaded'}
 									<button
 										type="button"
-										class="shrink-0 rounded-sm p-1.5 text-muted-foreground hover:bg-destructive/10 hover:text-destructive disabled:pointer-events-none disabled:opacity-50"
+										class="shrink-0 rounded-sm p-1.5 text-destructive hover:bg-destructive/10 hover:text-destructive disabled:pointer-events-none disabled:opacity-50"
 										title="Delete downloaded files"
 										disabled={busy}
 										onclick={(e) => {
@@ -533,6 +634,19 @@
 										}}
 									>
 										<Trash2 class="h-3.5 w-3.5" />
+									</button>
+								{:else if state.phase === 'downloading'}
+									<button
+										type="button"
+										class="shrink-0 rounded-sm p-1.5 text-destructive hover:bg-destructive/10 hover:text-destructive disabled:pointer-events-none disabled:opacity-50"
+										title="Stop download"
+										disabled={busy}
+										onclick={(e) => {
+											e.stopPropagation();
+											deleteRouterModel(id);
+										}}
+									>
+										<Square class="h-3.5 w-3.5" />
 									</button>
 								{/if}
 							</div>
@@ -756,7 +870,20 @@
 													>
 														<Download class="h-3.5 w-3.5 text-blue-600 dark:text-blue-400" />
 													</Button>
-												{:else if state.phase === 'downloading' || state.phase === 'downloaded'}
+												{:else if state.phase === 'downloading'}
+													<Button size="icon-sm" variant="outline" disabled title="Downloading">
+														<Loader2 class="h-3.5 w-3.5 animate-spin" />
+													</Button>
+													<Button
+														size="icon-sm"
+														variant="ghost"
+														disabled={busy}
+														onclick={() => deleteRouterModel(id)}
+														title="Stop download"
+													>
+														<Square class="h-3.5 w-3.5 text-destructive" />
+													</Button>
+												{:else if state.phase === 'downloaded'}
 													<Button size="icon-sm" variant="outline" disabled title="Downloading">
 														<Loader2 class="h-3.5 w-3.5 animate-spin" />
 													</Button>
@@ -809,7 +936,11 @@
 													<div class="h-1 w-full overflow-hidden rounded-full bg-muted">
 														<div class="h-full rounded-full bg-primary transition-all" style="width: {pct ?? 8}%"></div>
 													</div>
-													<span class="text-[10px] text-muted-foreground">{pct !== null ? `${pct}%` : '...'}</span>
+													<span class="text-[10px] text-muted-foreground">
+														{pct !== null ? `${pct}%` : '...'}{state.etaSeconds !== undefined
+															? ` · ${formatEta(state.etaSeconds)}`
+															: ''}
+													</span>
 												</div>
 											{:else if state?.phase === 'loading'}
 												<div class="w-24">

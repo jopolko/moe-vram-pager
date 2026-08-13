@@ -308,6 +308,12 @@ import type { SvelteKitPWAOptions } from '@vite-pwa/sveltekit';
 export const SVELTEKIT_PWA_OPTIONS: SvelteKitPWAOptions = {
 	// Strategy: generateSW - the plugin generates a service worker automatically
 	// using Workbox. For a custom SW, use 'injectManifest' instead.
+	// autoUpdate (not the default 'prompt'): apply and reload as soon as a new SW is detected,
+	// with no "Update available" popup to click through. With 'prompt', a reload during active
+	// development runs stale cached code first, fetches live data once on that stale page, then
+	// the manual update click forces a second reload that fetches everything again - doubling
+	// every HF request burst the model picker's verification step makes per test cycle.
+	registerType: 'autoUpdate',
 	// Manifest configuration
 	manifest: PWA_MANIFEST,
 
