@@ -434,6 +434,12 @@ struct model_row {
     std::string quant;
     std::string fit_tier;
     double ram_spillover_gb = 0.0; // only meaningful when fit_tier == "ram-cache"
+    // total_gb alone (mmap'd file + OS page cache), independent of fit_tier's active-set-only
+    // budget - a model whose active set is comfortably VRAM-resident can still be most of the
+    // machine's RAM in total size, which thrashes the OS page cache under sustained streaming.
+    // Set once total_gb is real (post-verification); excluded from the default view, shown only
+    // with allow_ram_heavy=true.
+    bool ram_risk = false;
     bool is_derestricted = false;
     std::string gguf_repo; // empty if not looked up / not found
 };
@@ -471,6 +477,21 @@ int fit_order(const std::string & tier) {
 bool is_usable(const std::string & tier) {
     return tier != "no-disk-space";
 }
+
+// Above this fraction of total RAM, just holding the file's mmap'd pages leaves too little
+// headroom for the OS/other apps and the active-expert cache itself, regardless of how well the
+// active set alone fits VRAM+RAM - the machine ends up thrashing under sustained streaming even
+// though fit_tier (judged on the active set only) reports "easy". Scales with the machine: a
+// generous-RAM box naturally clears far more models than a tight one, rather than a fixed cutoff.
+constexpr double RAM_THRASH_FRACTION = 0.75;
+
+// The router has no auto-fit pass for models it launches (unlike a manually-run llama-server),
+// so leaving --ctx-size unset means "0" reaches llama.cpp as-is, which resolves to the model's
+// full native training context - unbounded as far as any of this file's VRAM/RAM budgeting is
+// concerned, and enough on its own to blow way past any headroom fraction classify_fit reserves
+// (e.g. 262144 tokens on a 26B model). A fixed, generous-for-normal-chat default here instead;
+// editable per-model afterward directly in the preset INI.
+constexpr int DEFAULT_CTX_SIZE = 8192;
 
 bool text_matches_terms(const std::vector<std::string> & terms, const std::string & text) {
     std::string lower = to_lower(text);
@@ -757,6 +778,7 @@ void verify_gguf_row(model_row & m, double vram_gb, double ram_gb, double free_g
             m.total_gb  = best_total_gb;
             m.ram_spillover_gb = m.fit_tier == "ram-cache"
                                       ? std::max(0.0, m.active_gb - vram_gb * 0.75) : 0.0;
+            m.ram_risk  = m.total_gb > ram_gb * RAM_THRASH_FRACTION;
             return; // first real usable match wins - candidates are already priority ordered
         }
     }
@@ -849,6 +871,10 @@ void server_model_picker_register_routes(const server_http_context & ctx_http, c
             bool refresh          = req.get_param("refresh") == "true";
             bool derestricted_only = req.get_param("derestricted_only") == "true";
             bool unsupported_only  = req.get_param("unsupported_only") == "true";
+            // default view hides models whose total size alone risks thrashing this machine's
+            // RAM (see RAM_THRASH_FRACTION); this opts back in for a specific model worth the
+            // slower/heavier streaming, without changing what shows up by default for everyone else
+            bool allow_ram_heavy   = req.get_param("allow_ram_heavy") == "true";
             // Same candidate pool for all three - just a different priority
             // within each fit-tier group. "ugi" (default) = best-known overall
             // quality (UGI's own blended score). "size" = biggest active-param
@@ -865,6 +891,14 @@ void server_model_picker_register_routes(const server_http_context & ctx_http, c
             hardware_info hw = detect_hardware();
             double vram_gb = req.get_param("vram_gb").empty() ? hw.vram_gb : std::stod(req.get_param("vram_gb"));
             double ram_gb  = req.get_param("ram_gb").empty()  ? hw.ram_gb  : std::stod(req.get_param("ram_gb"));
+            // What fit-tier budgets and moe-stream-cache sizing actually compute against - vram_gb/
+            // ram_gb above (total) are reported for display only now. Assuming the whole card/whole
+            // machine is available ignores whatever else is already using it: the OS, a browser,
+            // another loaded model, or someone actually gaming on the same GPU. Same free-not-total
+            // reasoning disk_free_gb below already applies; overridable for the same testability
+            // reason too.
+            double vram_free_gb = req.get_param("vram_free_gb").empty() ? hw.vram_free_gb : std::stod(req.get_param("vram_free_gb"));
+            double ram_free_gb  = req.get_param("ram_free_gb").empty()  ? hw.ram_free_gb  : std::stod(req.get_param("ram_free_gb"));
             // overridable like vram_gb/ram_gb above, mainly so the no-disk-space / too-big-for-
             // this-drive tiers are actually testable without needing a physically full disk
             double free_gb = req.get_param("disk_free_gb").empty()
@@ -885,9 +919,12 @@ void server_model_picker_register_routes(const server_http_context & ctx_http, c
             // fit tiers correctly.
             std::string cache_key = derestricted_only ? "d1" : "d0";
             cache_key += unsupported_only ? "u1" : "u0";
+            cache_key += allow_ram_heavy ? "r1" : "r0";
             cache_key += "|" + rank_by + "|" + std::to_string(top) + "|" + std::to_string(gguf_lookup)
                        + "|" + std::to_string((long) std::round(vram_gb))
                        + "|" + std::to_string((long) std::round(ram_gb))
+                       + "|" + std::to_string((long) std::round(vram_free_gb))
+                       + "|" + std::to_string((long) std::round(ram_free_gb))
                        + "|" + std::to_string((long) std::round(free_gb))
                        + "|" + std::to_string((long) std::round(total_capacity_gb))
                        + "|" + cache_dir_for_key;
@@ -995,7 +1032,7 @@ void server_model_picker_register_routes(const server_http_context & ctx_http, c
                 for (auto & [qname, qbpw] : QUANT_CANDIDATES) {
                     double a_gb = active_b * 1e9 * qbpw / 8 / 1e9;
                     double t_gb = total_b  * 1e9 * qbpw / 8 / 1e9;
-                    std::string tier = classify_fit(a_gb, t_gb, vram_gb, ram_gb, free_gb);
+                    std::string tier = classify_fit(a_gb, t_gb, vram_free_gb, ram_free_gb, free_gb);
                     if (!is_usable(tier)) continue;
                     const int order = fit_order(tier);
                     if (best_order < 0 || order < best_order) {
@@ -1103,13 +1140,13 @@ void server_model_picker_register_routes(const server_http_context & ctx_http, c
             // found" rows a lookup-limit artifact instead of an honest "we checked, there isn't
             // one". Run per-group (not one flat pool) so each estimate-tier tail gets its own
             // gguf_lookup budget.
-            auto verify_group = [gguf_lookup, vram_gb, ram_gb, free_gb](std::vector<model_row> & group) {
+            auto verify_group = [gguf_lookup, vram_free_gb, ram_free_gb, free_gb](std::vector<model_row> & group) {
                 const int n = std::min((int) group.size(), gguf_lookup);
                 std::vector<std::future<void>> futures;
                 futures.reserve(n);
                 for (int i = 0; i < n; i++) {
                     futures.push_back(std::async(std::launch::async, verify_gguf_row,
-                                                  std::ref(group[i]), vram_gb, ram_gb, free_gb));
+                                                  std::ref(group[i]), vram_free_gb, ram_free_gb, free_gb));
                 }
                 for (int i = 0; i < n; i++) {
                     futures[i].get();
@@ -1134,6 +1171,7 @@ void server_model_picker_register_routes(const server_http_context & ctx_http, c
             std::vector<model_row> ideal, degraded, no_space;
             for (auto * group : { &est_ideal, &est_degraded, &est_no_space }) {
                 for (auto & m : *group) {
+                    if (!allow_ram_heavy && m.ram_risk) continue;
                     if (m.fit_tier == "no-disk-space") {
                         no_space.push_back(std::move(m));
                     } else if (m.fit_tier == "ram-cache" || m.fit_tier == "disk-streaming") {
@@ -1186,6 +1224,7 @@ void server_model_picker_register_routes(const server_http_context & ctx_http, c
                     {"active_gb", m.active_gb}, {"total_gb", m.total_gb},
                     {"quant", m.quant},
                     {"hf_arch", m.hf_arch}, {"fit_tier", m.fit_tier}, {"ram_spillover_gb", m.ram_spillover_gb},
+                    {"ram_risk", m.ram_risk},
                     {"ugi_score", m.ugi_score}, {"willingness", m.willingness},
                     {"is_derestricted", m.is_derestricted},
                     {"gguf_repo", m.gguf_repo},
@@ -1256,24 +1295,44 @@ void server_model_picker_register_routes(const server_http_context & ctx_http, c
             json body = json::parse(req.body);
             std::string gguf_repo = body.value("gguf_repo", std::string());
             std::string quant     = body.value("quant", std::string());
+            double      total_gb  = body.value("total_gb", 0.0);
             if (gguf_repo.empty() || quant.empty()) {
                 throw std::invalid_argument("gguf_repo and quant are required");
             }
 
+            // Freshly detected here rather than trusting a client-supplied vram_gb (dropped as a
+            // param entirely) - the same "recheck right before firing" reasoning downloadModel()
+            // already applies to disk space: whatever's free can have changed since the page
+            // loaded (another app claimed VRAM, another model got loaded), and total was never
+            // the right basis for this to begin with - see vram_free_gb in the /models handler.
             hardware_info hw = detect_hardware();
-            double vram_gb = body.contains("vram_gb") ? body.at("vram_gb").get<double>() : hw.vram_gb;
 
-            // same VRAM headroom fraction as classify_fit()'s "comfortable" tier budget: leave
-            // room for the KV cache/context/compute buffers alongside the resident expert cache.
+            // Half of *free* VRAM, not classify_fit()'s 0.75-of-total "comfortable" ceiling - that
+            // top end leaves too little headroom for the KV cache/context/compute buffers (and
+            // anything else sharing the card, including another already-loaded model) even before
+            // considering it was sized against the whole card instead of what's actually free.
             // --moe-stream-cache only parses integer GiB (or integer slot counts), so round down
             // to a whole GiB with a 1 GiB floor.
-            uint64_t cache_gb = std::max<uint64_t>(1, (uint64_t) (vram_gb * 0.75));
+            uint64_t cache_gb = std::max<uint64_t>(1, (uint64_t) (hw.vram_free_gb * 0.5));
+
+            // Full coverage: cache_gb (GiB) can hold every expert in the file, not just the
+            // active subset, so generation never hits the disk-streaming path at all - it's
+            // compute-bound and KV cache belongs in VRAM (default, fastest). Below that line
+            // we're going to take disk-streaming misses regardless, so trade the KV cache's
+            // VRAM for more --moe-stream-cache headroom instead (-nkvo): fewer misses is worth
+            // more than fast attention when attention was never the bottleneck to begin with.
+            // total_gb is the whole GGUF (dense + every expert, not just the active ones) - a
+            // slight overestimate of "expert bytes alone" for the coverage check, but this file
+            // is dominated by expert weight anyway (heavily sparse MoE), so it's close enough.
+            bool full_coverage = total_gb > 0.0 && (double) cache_gb >= total_gb;
 
             std::string model_id = gguf_repo + ":" + quant;
             std::string cache_val = std::to_string(cache_gb) + "G";
 
             common_preset_write_ini_section(models_preset_path, model_id, {
                 {"moe-stream-cache", cache_val},
+                {"ctx-size", std::to_string(DEFAULT_CTX_SIZE)},
+                {"no-kv-offload", full_coverage ? "false" : "true"},
             });
 
             res->status = 200;
@@ -1281,6 +1340,8 @@ void server_model_picker_register_routes(const server_http_context & ctx_http, c
                 {"success", true},
                 {"model_id", model_id},
                 {"moe_stream_cache_gb", cache_gb},
+                {"ctx_size", DEFAULT_CTX_SIZE},
+                {"no_kv_offload", !full_coverage},
             }.dump();
         } catch (const std::exception & e) {
             res->status = 400;

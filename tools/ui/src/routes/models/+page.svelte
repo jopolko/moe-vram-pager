@@ -13,7 +13,8 @@
 		Play,
 		Info,
 		Square,
-		RefreshCw
+		RefreshCw,
+		Power
 	} from '@lucide/svelte';
 	import { Switch } from '$lib/components/ui/switch';
 	import { Label } from '$lib/components/ui/label';
@@ -35,6 +36,7 @@
 		hf_arch: string;
 		fit_tier: string;
 		ram_spillover_gb: number;
+		ram_risk: boolean;
 		ugi_score: number;
 		willingness: number;
 		is_derestricted: boolean;
@@ -56,6 +58,11 @@
 	let loading = $state(true);
 	let error = $state('');
 	let derestrictedOnly = $state(false);
+	// default view hides models whose total size alone risks thrashing this machine's RAM - see
+	// RAM_THRASH_FRACTION server-side. Off by default so most people never see a slow/heavy pick
+	// by accident; a model worth the wait either way (own it, know what you're getting into) can
+	// still be found and downloaded with this on.
+	let allowRamHeavy = $state(false);
 	let tagsProgress = $state<{ done: number; total: number } | null>(null);
 	// Not $state - purely an internal handle for loadModels() to cancel its own previous in-flight
 	// request, never read by the template.
@@ -266,7 +273,7 @@
 				body: JSON.stringify({
 					gguf_repo: m.gguf_repo,
 					quant: m.quant,
-					vram_gb: hardware?.vram_gb
+					total_gb: m.total_gb
 				})
 			});
 			const resp = await fetch('./models', {
@@ -303,6 +310,31 @@
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({ model: id })
 			});
+		} finally {
+			const next = new Set(busyIds);
+			next.delete(id);
+			busyIds = next;
+		}
+	}
+
+	async function unloadRouterModel(id: string) {
+		if (busyIds.has(id)) return;
+		busyIds = new Set(busyIds).add(id);
+		try {
+			const resp = await fetch('./models/unload', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ model: id })
+			});
+			if (!resp.ok) {
+				const body = await resp.json().catch(() => ({}));
+				throw new Error(body.error?.message || body.error || `Request failed (${resp.status})`);
+			}
+			// optimistic - the SSE status_change event normally does this, but don't leave the
+			// button showing "loaded" for the round trip if that event is slow/dropped
+			dlState = { ...dlState, [id]: { phase: 'unloaded' } };
+		} catch (e) {
+			error = e instanceof Error ? e.message : String(e);
 		} finally {
 			const next = new Set(busyIds);
 			next.delete(id);
@@ -385,6 +417,7 @@
 				// bigger budget just means a longer queue through that cap, not a bigger burst.
 				gguf_lookup: '50',
 				derestricted_only: String(derestrictedOnly),
+				allow_ram_heavy: String(allowRamHeavy),
 				rank_by: RANK_BY,
 				...(forceRefresh ? { refresh: 'true' } : {})
 			});
@@ -417,11 +450,11 @@
 		}
 	}
 
-	// $effect fires once on mount and again whenever derestrictedOnly changes,
+	// $effect fires once on mount and again whenever derestrictedOnly/allowRamHeavy change,
 	// no separate onMount needed (that caused a duplicate concurrent fetch).
 	$effect(() => {
 		// eslint-disable-next-line @typescript-eslint/no-unused-expressions
-		derestrictedOnly;
+		derestrictedOnly, allowRamHeavy;
 		loadModels();
 	});
 
@@ -549,16 +582,16 @@
 				hardware.vram_gb,
 				hardware.vram_free_gb,
 				1,
-				'Fit ranking is budgeted against total VRAM, not free',
-				"Close other GPU apps and this goes up - unlike disk space, VRAM is never overcommitted so this is a real live number"
+				'Shown for reference only - fit ranking is budgeted against Free, not this',
+				"What fit ranking is actually budgeted against. Close other GPU apps and this goes up - unlike disk space, VRAM is never overcommitted so this is a real live number"
 			)}
 			{@render hwCard(
 				'RAM',
 				hardware.ram_gb,
 				hardware.ram_free_gb,
 				1,
-				'Fit ranking is budgeted against total RAM, not free',
-				"On Linux/WSL this always equals total - ggml treats free RAM as ill-defined and just assumes it's all available, rather than fighting the reclaimable-page-cache accounting mess. Real on Windows builds."
+				'Shown for reference only - fit ranking is budgeted against Free, not this',
+				"What fit ranking is actually budgeted against. On Linux/WSL this always equals total - ggml treats free RAM as ill-defined and just assumes it's all available, rather than fighting the reclaimable-page-cache accounting mess. Real on Windows builds."
 			)}
 			<div class="flex items-center gap-3 rounded-lg border px-4 py-3 text-sm whitespace-nowrap">
 				<span class="flex items-center gap-1 text-base font-bold">
@@ -588,6 +621,15 @@
 				title="Only show models that are specifically known derestricted/abliterated finetunes - a curated filter, not a score"
 			>
 				Derestricted finetunes only
+			</Label>
+		</div>
+		<div class="flex items-center gap-2">
+			<Switch id="allow-ram-heavy" bind:checked={allowRamHeavy} />
+			<Label
+				class="text-sm"
+				title="A model whose total file size alone is most of this machine's RAM will thrash under sustained streaming, even when the active-expert set fits VRAM comfortably. Hidden by default; turn this on to see (and download) them anyway."
+			>
+				Allow RAM-heavy models
 			</Label>
 		</div>
 		<Button
@@ -640,6 +682,20 @@
 									{/if}
 									<span class="min-w-0 truncate" title={id}>{id}</span>
 								</DropdownMenu.Item>
+								{#if state.phase === 'loaded'}
+									<button
+										type="button"
+										class="shrink-0 rounded-sm p-1.5 text-muted-foreground hover:bg-muted-foreground/10 hover:text-foreground disabled:pointer-events-none disabled:opacity-50"
+										title="Unload (frees VRAM/RAM, keeps the downloaded files)"
+										disabled={busy}
+										onclick={(e) => {
+											e.stopPropagation();
+											unloadRouterModel(id);
+										}}
+									>
+										<Power class="h-3.5 w-3.5" />
+									</button>
+								{/if}
 								{#if state.phase === 'unloaded' || state.phase === 'failed' || state.phase === 'loaded'}
 									<button
 										type="button"
@@ -838,6 +894,15 @@
 										Disk streaming
 									</Badge>
 								{/if}
+								{#if m.ram_risk}
+									<Badge
+										variant="outline"
+										class="ml-2 align-middle border-red-300 bg-red-50 text-red-700 dark:border-red-800 dark:bg-red-950/40 dark:text-red-300"
+										title="Total file size is most of this machine's free RAM - expect real thrashing under sustained use, separate from (and on top of) any active-set spillover/streaming above"
+									>
+										RAM risk
+									</Badge>
+								{/if}
 								{#if m.fit_tier === 'no-disk-space' && hardware}
 									<Badge
 										variant="destructive"
@@ -945,6 +1010,15 @@
 												{:else if state.phase === 'loaded'}
 													<Button size="icon-sm" variant="default" href="../?model={encodeURIComponent(id)}" title="Chat">
 														<MessageSquare class="h-3.5 w-3.5" />
+													</Button>
+													<Button
+														size="icon-sm"
+														variant="outline"
+														disabled={busy}
+														onclick={() => unloadRouterModel(id)}
+														title="Unload (frees VRAM/RAM, keeps the downloaded files)"
+													>
+														<Power class="h-3.5 w-3.5" />
 													</Button>
 												{/if}
 											</div>
