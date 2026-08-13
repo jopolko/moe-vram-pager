@@ -56,18 +56,32 @@ this one).
   same clamp) - it didn't always; a too-small explicit or budget-derived
   value used to reach the hard abort directly. If you see that abort
   message again, this clamp regressed.
-- **Known real bug, not yet fixed**: `q_demand` is a single FIFO queue.
-  Genuine blocking demand-loads (the GPU is stalled waiting) and
-  best-effort speculative loads (wave preload, decode prefetch) all
-  `push_back` onto it with no priority distinction. Under real I/O
-  pressure (small cache, `--moe-stream-direct` to remove page-cache
-  confounding) this measurably hurts: decode-phase prefetch dropped
-  throughput from 3.68 to 1.46 tok/s in a controlled A/B (`--moe-stream-cache 24s`,
-  a Qwen3-30B-A3B model, `top-4` prefetch) because a real stall can land
-  behind several already-queued speculative guesses. The fix (proposed,
-  not yet applied): make the four genuinely-blocking enqueue call sites
-  `push_front` instead of `push_back`, leaving the two speculative sites
-  (`push_back`) as lower priority. Same single queue, no new subsystem.
+- **`q_demand` priority inversion: fixed and confirmed resolved.** Was a
+  single FIFO queue where genuine blocking demand-loads (the GPU is
+  stalled waiting) and best-effort speculative loads (wave preload,
+  decode prefetch) all `push_back` with no priority distinction. Under
+  real I/O pressure this measurably hurt: decode-phase prefetch dropped
+  throughput from 3.68 to 1.46 tok/s in a controlled A/B
+  (`--moe-stream-cache 24s`, a Qwen3-30B-A3B model, `top-4` prefetch)
+  because a real stall could land behind several already-queued
+  speculative guesses. Three fixes applied, in order, since the first
+  two alone didn't fully resolve it:
+  1. The four genuinely-blocking enqueue sites use `push_front` instead
+     of `push_back`; the two speculative sites stay `push_back`. Tested
+     alone - still bad (fixed-p0-a: 2.54 tok/s, fixed-p4-a: 1.41 tok/s).
+  2. Reserved one I/O thread as demand-only when `n_io_threads > 1`
+     (`worker_loop(bool demand_only)`), so a real stall can't get stuck
+     behind a worker busy on speculative work. Tested alone - still
+     marginally worse (reserved-p4-a: 1.14 tok/s), but this run
+     surfaced the real signal: hit rate dropped 72.02% -> 65.69% with
+     prefetch on, proving the actual problem was cache eviction
+     pollution, not scheduling.
+  3. **The actual fix**: `pick_victim_locked` gained an `empty_only`
+     flag; speculative prefetch now only fills already-empty slots and
+     never evicts a resident one. Confirmed via matched stats with
+     prefetch on vs. off (72.02% hit rate / ~4.8ms/call either way, "0
+     speculative loads issued" once the cache is full) under both a
+     pressured cache and a roomy one.
 - Router mode (`tools/server/server-models.{cpp,h}`, upstream llama.cpp
   feature, not something we built): manages multiple model child
   processes, on-demand download with real SSE progress
@@ -121,12 +135,13 @@ picker flow.
 
 ## Open threads / next steps
 
-1. Fix the `q_demand` priority inversion (see above) - the actual next
-   engineering task, and the reason decode-phase prefetch isn't proven to
-   help yet despite being correctness-verified and demonstrably firing.
-2. Retest decode-phase prefetch against a real disk-streaming-tier model
+1. Retest decode-phase prefetch against a real disk-streaming-tier model
    (hundreds of GB) once one exists locally, now that download-from-the-UI
-   removes the manual-download friction that blocked this earlier.
+   removes the manual-download friction that blocked this earlier, and
+   now that the `q_demand` priority inversion above is actually fixed -
+   the small-model, artificially-shrunk-cache tests so far only prove the
+   fix doesn't regress the pressured case, not that prefetch helps on a
+   real target-sized model.
 3. `scripts/model_picker.py` (the Python CLI mirror) has not been updated
    with the C++ side's newest fit-tier/quant logic changes in a while -
    diff it against `server-model-picker.cpp` before trusting it's still
