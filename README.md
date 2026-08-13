@@ -48,16 +48,21 @@ Early and actively changing. What works today:
 ## Hardware
 
 Targets NVIDIA GPUs via CUDA. Built and tested against a GTX 1080 Ti
-(Pascal, compute capability 6.1): pin `CMAKE_CUDA_ARCHITECTURES` to your
-own GPU's compute capability when building.
+(Pascal, compute capability 6.1). `CMAKE_CUDA_ARCHITECTURES` is
+auto-detected from whatever GPU is actually in the build machine
+(CMake's `native` mode, upstream ggml/CMake logic, requires CMake
+>= 3.24 and CUDA >= 11.6) - don't set it by hand unless you're
+cross-compiling for different hardware than you're building on, in
+which case pass `-DCMAKE_CUDA_ARCHITECTURES=<your compute capability>`
+explicitly.
 
 ## Quick start
 
 ```sh
-# Configure - enable CUDA and the web UI, set your GPU's compute capability
+# Configure - enable CUDA and the web UI. CMAKE_CUDA_ARCHITECTURES is
+# auto-detected from the GPU in this machine, no need to set it by hand.
 cmake -B build \
   -DGGML_CUDA=ON \
-  -DCMAKE_CUDA_ARCHITECTURES=61 \
   -DLLAMA_BUILD_UI=ON \
   -DCMAKE_BUILD_TYPE=Release
 

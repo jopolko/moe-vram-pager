@@ -703,14 +703,24 @@ void server_model_picker_register_routes(const server_http_context & ctx_http, c
                 return a.ugi_score > b.ugi_score; // "ugi" and any unrecognized value
             });
 
-            // Split before the top-N cut: no-disk-space candidates always sort last
-            // (fit_order == 3), so a single flat top-N truncation would silently starve them
-            // out behind ordinary fitting models even though the user still needs to see them
-            // to judge what to delete for the one they actually want. `top` only bounds the
-            // fitting group below; every actionable no-disk-space candidate is kept.
-            std::vector<model_row> fits, no_space;
+            // Split before the top-N cut. fit_order groups sort easy/comfortable (0) ahead of
+            // ram-cache/disk-streaming (1-2) ahead of no-disk-space (3), and in real data the
+            // easy/comfortable group alone routinely exceeds `top` on its own (e.g. 99 vs the
+            // default top=30) - a single flat top-N truncation would then *always* cut off
+            // before reaching a single ram-cache or no-disk-space row, no matter how large `top`
+            // reasonably gets, even though the user needs to see both (spillover models to judge
+            // performance, no-disk-space ones to judge what to delete). So: `top` only bounds the
+            // ideal (easy/comfortable) group; every actionable degraded and no-disk-space
+            // candidate is kept regardless.
+            std::vector<model_row> ideal, degraded, no_space;
             for (auto & m : filtered) {
-                (m.fit_tier == "no-disk-space" ? no_space : fits).push_back(std::move(m));
+                if (m.fit_tier == "no-disk-space") {
+                    no_space.push_back(std::move(m));
+                } else if (m.fit_tier == "ram-cache" || m.fit_tier == "disk-streaming") {
+                    degraded.push_back(std::move(m));
+                } else {
+                    ideal.push_back(std::move(m));
+                }
             }
 
             // search a pool bigger than `top` (gguf_lookup), in parallel, before truncating - a
@@ -718,8 +728,8 @@ void server_model_picker_register_routes(const server_http_context & ctx_http, c
             // click Download on, so it gets filtered out below rather than shown as a dead row;
             // searching only the eventual top-N would make the "no GGUF found" rows a lookup-limit
             // artifact instead of an honest "we checked, there isn't one". Run per-group (not one
-            // flat pool) so the no-disk-space tail gets its own gguf_lookup budget instead of
-            // being crowded out by whatever's ranked ahead of it in the fitting group.
+            // flat pool) so the degraded/no-disk-space tails each get their own gguf_lookup budget
+            // instead of being crowded out by whatever's ranked ahead of them in the ideal group.
             auto gguf_search_group = [gguf_lookup](std::vector<model_row> & group) {
                 const int n = std::min((int) group.size(), gguf_lookup);
                 std::vector<std::future<std::string>> futures;
@@ -740,12 +750,14 @@ void server_model_picker_register_routes(const server_http_context & ctx_http, c
                 }
                 group = std::move(actionable);
             };
-            gguf_search_group(fits);
+            gguf_search_group(ideal);
+            gguf_search_group(degraded);
             gguf_search_group(no_space);
 
-            if ((int) fits.size() > top) fits.resize(top);
-            fits.insert(fits.end(), std::make_move_iterator(no_space.begin()), std::make_move_iterator(no_space.end()));
-            filtered = std::move(fits);
+            if ((int) ideal.size() > top) ideal.resize(top);
+            ideal.insert(ideal.end(), std::make_move_iterator(degraded.begin()), std::make_move_iterator(degraded.end()));
+            ideal.insert(ideal.end(), std::make_move_iterator(no_space.begin()), std::make_move_iterator(no_space.end()));
+            filtered = std::move(ideal);
 
             json out;
             std::string cache_dir;
@@ -757,7 +769,7 @@ void server_model_picker_register_routes(const server_http_context & ctx_http, c
             out["hardware"] = {
                 {"vram_gb", vram_gb}, {"ram_gb", ram_gb},
                 {"vram_free_gb", hw.vram_free_gb}, {"ram_free_gb", hw.ram_free_gb},
-                {"disk_free_gb", free_gb}, {"cache_dir", cache_dir},
+                {"disk_free_gb", free_gb}, {"disk_total_gb", total_capacity_gb}, {"cache_dir", cache_dir},
             };
             out["router_available"] = !models_preset_path.empty();
             out["count"] = filtered.size();

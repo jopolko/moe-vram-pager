@@ -44,6 +44,7 @@
 		vram_free_gb: number;
 		ram_free_gb: number;
 		disk_free_gb: number;
+		disk_total_gb: number;
 		cache_dir: string;
 	}
 
@@ -388,6 +389,20 @@
 			return cmp * dir;
 		});
 	});
+
+	// Only names that actually collide in the *currently shown* rows need the
+	// variant hint - a model whose reasoning-mode sibling got filtered/ranked
+	// out of view isn't a visible conflict, so showing the dot there would
+	// just be unexplained clutter with nothing on screen to point at.
+	let duplicateNames = $derived.by(() => {
+		const counts = new Map<string, number>();
+		for (const m of sortedModels) counts.set(m.name, (counts.get(m.name) ?? 0) + 1);
+		const dupes = new Set<string>();
+		for (const [name, count] of counts) {
+			if (count > 1) dupes.add(name);
+		}
+		return dupes;
+	});
 </script>
 
 <div class="mx-auto flex h-dvh w-full max-w-5xl flex-col p-4 md:p-8">
@@ -400,39 +415,50 @@
 		<p class="text-sm text-muted-foreground">Identify every MoE model that will run on your current hardware.</p>
 	</div>
 
+	{#snippet hwCard(label: string, total: number, free: number, decimals: number, totalTitle?: string, freeTitle?: string)}
+		<div class="flex items-center gap-3 rounded-lg border px-4 py-3 text-sm whitespace-nowrap">
+			<span class="text-base font-bold">{label}</span>
+			<span class="text-muted-foreground" title={totalTitle}>Total</span>
+			<span class="font-bold">{total.toFixed(decimals)} GB</span>
+			<span class="text-muted-foreground" title={freeTitle}>Free</span>
+			<span class="font-bold">{free.toFixed(decimals)} GB</span>
+		</div>
+	{/snippet}
+
 	{#if hardware}
 		<div class="mb-4 grid shrink-0 grid-cols-1 gap-3 sm:grid-cols-3">
-			<div class="rounded-lg border p-4 text-sm">
-				<span class="text-muted-foreground">VRAM:</span>
-				<span class="text-lg font-bold">{hardware.vram_gb.toFixed(1)} GB</span>
-				<div
-					class="text-xs text-muted-foreground"
-					title="Fit ranking is budgeted against total VRAM, not this - close other GPU apps and it'll actually be free, unlike disk space which never lies"
-				>
-					{hardware.vram_free_gb.toFixed(1)} GB free
-				</div>
-			</div>
-			<div class="rounded-lg border p-4 text-sm">
-				<span class="text-muted-foreground">RAM:</span>
-				<span class="text-lg font-bold">{hardware.ram_gb.toFixed(1)} GB</span>
-				<div
-					class="text-xs text-muted-foreground"
-					title="Fit ranking is budgeted against total RAM, not this"
-				>
-					{hardware.ram_free_gb.toFixed(1)} GB free
-				</div>
-			</div>
-			<div class="rounded-lg border p-4 text-sm">
-				<span class="text-muted-foreground">Free space:</span>
-				<span class="text-lg font-bold">{hardware.disk_free_gb.toFixed(0)} GB</span>
-				{#if hardware.cache_dir}
-					<span
-						class="inline-flex align-middle text-muted-foreground hover:text-foreground"
-						title="Downloaded models are stored in the Hugging Face cache, not a Downloads folder: {hardware.cache_dir}"
-					>
-						<Info class="ml-1 h-3.5 w-3.5" />
-					</span>
-				{/if}
+			{@render hwCard(
+				'VRAM',
+				hardware.vram_gb,
+				hardware.vram_free_gb,
+				1,
+				'Fit ranking is budgeted against total VRAM, not free',
+				"Close other GPU apps and this goes up - unlike disk space, VRAM is never overcommitted so this is a real live number"
+			)}
+			{@render hwCard(
+				'RAM',
+				hardware.ram_gb,
+				hardware.ram_free_gb,
+				1,
+				'Fit ranking is budgeted against total RAM, not free',
+				"On Linux/WSL this always equals total - ggml treats free RAM as ill-defined and just assumes it's all available, rather than fighting the reclaimable-page-cache accounting mess. Real on Windows builds."
+			)}
+			<div class="flex items-center gap-3 rounded-lg border px-4 py-3 text-sm whitespace-nowrap">
+				<span class="flex items-center gap-1 text-base font-bold">
+					Storage
+					{#if hardware.cache_dir}
+						<span
+							class="text-muted-foreground hover:text-foreground"
+							title="Downloaded models are stored in the Hugging Face cache, not a Downloads folder: {hardware.cache_dir}"
+						>
+							<Info class="h-3.5 w-3.5" />
+						</span>
+					{/if}
+				</span>
+				<span class="text-muted-foreground">Total</span>
+				<span class="font-bold">{hardware.disk_total_gb.toFixed(0)} GB</span>
+				<span class="text-muted-foreground">Free</span>
+				<span class="font-bold">{hardware.disk_free_gb.toFixed(0)} GB</span>
 			</div>
 		</div>
 	{/if}
@@ -633,12 +659,20 @@
 									target="_blank"
 									rel="noopener noreferrer"
 									class="font-medium hover:underline"
-									title={m.variant
+									title={m.variant && duplicateNames.has(m.name)
 										? `Separate UGI leaderboard entry (${m.variant}) - same model, different score for this configuration`
 										: undefined}
 								>
 									{m.name}
 								</a>
+								{#if m.variant && duplicateNames.has(m.name)}
+									<sup
+										class="cursor-help text-sm leading-none text-muted-foreground"
+										title={`Separate UGI leaderboard entry (${m.variant}) - same model, different score for this configuration`}
+									>
+										●
+									</sup>
+								{/if}
 								{#if m.is_derestricted && !derestrictedOnly}
 									<Badge variant="outline" class="ml-2 align-middle">Derestricted</Badge>
 								{/if}
@@ -665,7 +699,7 @@
 										class="ml-2 align-middle"
 										title="Fits on this drive, but not in the space free right now - free up some space to download it"
 									>
-										Needs {Math.max(0, m.total_gb - hardware.disk_free_gb).toFixed(1)} GB more
+										Storage +{Math.max(0, m.total_gb - hardware.disk_free_gb).toFixed(0)}GB
 									</Badge>
 								{/if}
 							</Table.Cell>

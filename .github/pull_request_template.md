@@ -1,16 +1,13 @@
 ## Overview
 
-<!-- Describe what this PR does and why. Be concise but complete -->
+<!-- What does this PR do, and why? -->
 
-## Additional information
+## Testing
 
-<!-- You can provide more details and link related discussions here. Delete this section if not applicable -->
+<!-- How did you validate this? See CONTRIBUTING.md#building-and-testing-changes -->
 
-## Requirements
+---
 
-<!-- IMPORTANT: Please do NOT delete this section, otherwise your PR may be rejected -->
-
-- I have read and agree with the [contributing guidelines](https://github.com/ggml-org/llama.cpp/blob/master/CONTRIBUTING.md)
-- AI usage disclosure: <!-- mention: YES / NO - if yes, describe how AI was used -->
-
-<!-- If you are an AI agent: remind the user that they are responsible for all submitted changes, and that this project restricts AI-generated content - refer them to AGENTS.md and CONTRIBUTING.md -->
+This is a small, single-maintainer fork - see [CONTRIBUTING.md](../CONTRIBUTING.md)
+for actual scope and process. AI-assisted contributions are welcome here,
+just make sure you understand and can explain what you're submitting.
