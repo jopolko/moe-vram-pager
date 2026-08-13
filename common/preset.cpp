@@ -277,6 +277,32 @@ void common_preset_write_ini_section(const std::string & path, const std::string
     }
 }
 
+bool common_preset_remove_ini_section(const std::string & path, const std::string & section) {
+    if (!std::filesystem::exists(path)) {
+        return false;
+    }
+    std::map<std::string, std::map<std::string, std::string>> parsed = parse_ini_from_file(path);
+
+    auto it = parsed.find(section);
+    if (it == parsed.end()) {
+        return false;
+    }
+    parsed.erase(it);
+
+    std::ofstream out(path, std::ios::trunc);
+    if (!out.good()) {
+        throw std::runtime_error("failed to write preset file: " + path);
+    }
+    for (const auto & [sec_name, opts] : parsed) {
+        out << "[" << sec_name << "]\n";
+        for (const auto & [key, value] : opts) {
+            out << key << " = " << value << "\n";
+        }
+        out << "\n";
+    }
+    return true;
+}
+
 static std::map<std::string, common_arg> get_map_key_opt(common_params_context & ctx_params) {
     std::map<std::string, common_arg> mapping;
     for (const auto & opt : ctx_params.options) {

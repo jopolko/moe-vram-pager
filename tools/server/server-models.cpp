@@ -1170,6 +1170,36 @@ bool server_models::remove(const std::string & name) {
     if (it == mapping.end()) {
         throw std::runtime_error("model name=" + name + " is not found");
     }
+    if (it->second.meta.source == SERVER_MODEL_SOURCE_PRESET) {
+        // a picker-authored preset entry (e.g. written by /model-picker/prepare-download
+        // before the actual download ran, then never followed through) has no cached files
+        // to remove - just drop it from the picker's own preset ini so it stops showing up
+        // as "available". requires an in-flight/loaded instance to be stopped first, same as
+        // the cache-removal path below.
+        if (it->second.meta.status == SERVER_MODEL_STATUS_DOWNLOADING) {
+            SRV_INF("cancelling download for model name=%s\n", name.c_str());
+            it->second.subproc->request_exit();
+        } else if (it->second.meta.is_running()) {
+            SRV_INF("stopping model instance name=%s\n", name.c_str());
+            stopping_models.insert(name);
+            if (it->second.meta.status == SERVER_MODEL_STATUS_LOADING) {
+                it->second.subproc->terminate();
+            }
+            cv_stop.notify_all();
+        }
+        wait(lk, name, [](const server_model_meta & meta) {
+            return meta.status == SERVER_MODEL_STATUS_UNLOADED
+                || meta.status == SERVER_MODEL_STATUS_DOWNLOADED;
+        });
+        bool ok = base_params.models_preset.empty()
+            ? false
+            : common_preset_remove_ini_section(base_params.models_preset, name);
+        mapping.erase(name);
+        SRV_INF("removing preset entry name=%s from %s (%s)\n",
+                name.c_str(), base_params.models_preset.c_str(), ok ? "succeeded" : "not found");
+        notify_sse("model_remove", name, {});
+        return ok;
+    }
     if (it->second.meta.source != SERVER_MODEL_SOURCE_CACHE) {
         throw std::runtime_error("model name=" + name + " is not removable (not from cache)");
     }
@@ -1833,8 +1863,9 @@ void server_models_routes::init_routes() {
 
         // validate by fetching metadata
         bool ok = false;
+        common_models_handler handler;
         try {
-            common_models_handler_init(p, LLAMA_EXAMPLE_SERVER);
+            handler = common_models_handler_init(p, LLAMA_EXAMPLE_SERVER);
             ok = true;
         } catch (...) {
             SRV_ERR("unknown error while validating model '%s'\n", name.c_str());
@@ -1844,6 +1875,19 @@ void server_models_routes::init_routes() {
 
         if (!ok) {
             throw std::invalid_argument("model validation failed, unable to download");
+        }
+
+        // reject up front (before spawning a download child) if the repo doesn't actually
+        // resolve to a downloadable model file - e.g. a quant that's listed by name but whose
+        // GGUF shards haven't actually been uploaded yet (only a calibration imatrix.gguf is
+        // there so far). common_models_handler_apply() also guards against this when the actual
+        // download runs, but catching it here means the UI gets an immediate, honest rejection
+        // instead of the picker implying the download will work.
+        if (handler.plan.model_files.empty() && handler.plan.preset.local_path.empty()) {
+            throw std::invalid_argument(
+                "no downloadable GGUF model file found in repository '" + name + "' (it may only "
+                "contain non-model files such as an imatrix, or the requested quant/tag isn't "
+                "available yet)");
         }
 
         // reject if model already exists
