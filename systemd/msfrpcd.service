@@ -1,0 +1,16 @@
+[Unit]
+Description=Metasploit RPC daemon (local-only, feeds MetasploitMCP)
+After=msf-db.service network.target
+Wants=msf-db.service
+
+[Service]
+Type=simple
+User=josh
+WorkingDirectory=/home/josh
+EnvironmentFile=/var/secrets/moe-vram-pager.env
+ExecStart=/bin/bash -c 'exec /usr/bin/msfrpcd -f -S -a 127.0.0.1 -p 55553 -U msf -P "$MSF_PASSWORD"'
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

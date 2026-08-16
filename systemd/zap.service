@@ -1,0 +1,20 @@
+[Unit]
+Description=OWASP ZAP headless daemon (local-only, API on 8090)
+After=network.target
+
+[Service]
+Type=simple
+User=josh
+WorkingDirectory=/home/josh/tools-zap/ZAP_2.17.0
+EnvironmentFile=/var/secrets/moe-vram-pager.env
+ExecStart=/bin/bash -c 'exec /home/josh/tools-zap/ZAP_2.17.0/zap.sh -daemon -host 127.0.0.1 -port 8090 \
+    -config api.key="$ZAP_API_KEY" \
+    -config api.addrs.addr.name=127.0.0.1 \
+    -config api.addrs.addr.regex=false \
+    -config api.disablekey=false \
+    -config oast.callback.localaddr=127.0.0.1'
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

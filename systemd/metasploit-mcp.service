@@ -1,0 +1,19 @@
+[Unit]
+Description=MetasploitMCP bridge (local-only, feeds llama.cpp webui / pentest_agent.py)
+After=msfrpcd.service network.target
+Requires=msfrpcd.service
+
+[Service]
+Type=simple
+User=josh
+WorkingDirectory=/home/josh/MetasploitMCP
+EnvironmentFile=/var/secrets/moe-vram-pager.env
+Environment=MSF_SERVER=127.0.0.1
+Environment=MSF_PORT=55553
+Environment=MSF_SSL=false
+ExecStart=/home/josh/MetasploitMCP/.venv/bin/python MetasploitMCP.py --transport http --host 127.0.0.1 --port 8085
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

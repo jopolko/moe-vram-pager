@@ -1,0 +1,14 @@
+[Unit]
+Description=Metasploit Framework database
+Before=msfrpcd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=josh
+WorkingDirectory=/home/josh
+ExecStart=/usr/bin/msfdb start
+ExecStop=/usr/bin/msfdb stop
+
+[Install]
+WantedBy=multi-user.target
