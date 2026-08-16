@@ -185,6 +185,48 @@ model refused to discuss the attack technique it was supposed to help you
 analyze" is a recurring problem, that's exactly the gap this exists to
 close.
 
+## Pentest appliance
+
+Optional layer on top of the base MoE VRAM Pager: a local-LLM-driven
+recon/exploit agent, wired into six real offensive-security platforms, with
+a hard-gated recon/exploit phase split. Full from-scratch setup (systemd
+units, per-tool install, API keys, architecture diagram) lives in
+[PENTEST_APPLIANCE.md](PENTEST_APPLIANCE.md); summary below.
+
+An uncensored model chosen by the picker above (see
+[Why derestricted models](#why-derestricted-models)) drives a tool-calling
+loop (`tools/pentest_agent.py`) against an authorized target. A `/pentest`
+panel in the web UI (`tools/pentest_ui_api.py` sidecar + SvelteKit
+frontend) starts, monitors, and stops runs, and compiles a PDF report when
+one finishes.
+
+| Platform | Role | Reached via |
+|---|---|---|
+| [Metasploit Framework](https://github.com/rapid7/metasploit-framework) | Exploitation, payload generation, session control | `MetasploitMCP` bridge &rarr; `msfrpcd` |
+| [Sliver](https://github.com/BishopFox/sliver) | C2 / post-exploitation | `sliver-client mcp` (Sliver's own built-in MCP server) |
+| [OWASP ZAP](https://www.zaproxy.org/) | Web app spidering + active scan | ZAP's REST API directly (it has no MCP server of its own) |
+| [NIST NVD](https://nvd.nist.gov/) | CVE lookup by keyword or exact CPE 2.3 string | `services.nvd.nist.gov` REST API |
+| nmap | Port/service/OS scanning, NSE scripts | local binary, `cap_net_raw`/`cap_net_admin` via setcap (no root) |
+| Passive origin OSINT | Find a real origin IP behind a CDN/WAF | Certificate Transparency logs (crt.sh) + DNS, cross-checked against Cloudflare's published ranges |
+
+### Phase gating
+
+Recon and active exploitation are separate runs, split at the code level,
+not just by prompt:
+
+- **Recon** (default, safe to run unattended) - only read-only/scanning
+  tools are exposed to the model at all; exploitation tool schemas are
+  never sent, so the model can't call them mid-run no matter what it
+  decides.
+- **Exploit** (opt-in, human-gated) - requires `--phase exploit` **and**
+  `--confirm-exploitation` together, one flag alone isn't enough. Typically
+  run with `--resume-from` pointing at the recon run's log, so the model
+  has the human-reviewed findings as context instead of starting blind.
+- **Always-on backstop** - a destructive-command regex (`rm -rf`, `mkfs`,
+  `dd ... of=/dev/...`, `shutdown`/`reboot`, `iptables -F`, ...) blocks
+  matching session commands even inside exploit phase, a code-level check
+  rather than something the model is just asked nicely to avoid.
+
 ## Repo layout
 
 - `src/llama-moe-stream.{cpp,h}`: the expert-streaming cache itself.
@@ -199,6 +241,13 @@ close.
   computed `--moe-stream-cache` value per model.
 - `HANDOFF.md`: running technical log: hardware constraints, build
   gotchas, and open engineering threads.
+- `tools/pentest_agent.py`: the recon/exploit agent loop and its local
+  tools (nmap, CVE lookup, origin-IP OSINT, ZAP, raw TCP/UDP).
+- `tools/pentest_ui_api.py`, `tools/ui/src/routes/pentest/`: the `/pentest`
+  web UI panel and the sidecar API that runs/streams/stops agent runs.
+- `tools/pentest_report.py`: turns a run's JSON log into a PDF report.
+- `PENTEST_APPLIANCE.md`: from-scratch setup for the pentest appliance
+  layer - see [Pentest appliance](#pentest-appliance) above.
 
 ## License
 
