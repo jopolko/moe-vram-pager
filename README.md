@@ -306,13 +306,17 @@ MetasploitMCP, on FastAPI/Uvicorn/Pydantic/ReportLab/`requests`/`mcp` - see
 
 ### Phase gating
 
-Recon and active exploitation are separate runs, split at the code level,
-not just by prompt:
+OSINT, recon, and active exploitation are separate runs, split at the code
+level, not just by prompt:
 
-- **Recon** (default, safe to run unattended) - only read-only/scanning
-  tools are exposed to the model at all; exploitation tool schemas are
-  never sent, so the model can't call them mid-run no matter what it
-  decides.
+- **OSINT** (optional, most passive) - only `theharvester_scan` and
+  `google_dork_search` are exposed; every request goes to a third-party
+  public data source, never to the target itself. Run it ahead of recon if
+  you want its findings available to resume into a later run.
+- **Direct Recon** (default, safe to run unattended) - only read-only/
+  scanning tools are exposed to the model at all; exploitation tool
+  schemas are never sent, so the model can't call them mid-run no matter
+  what it decides.
 - **Exploit** (opt-in, human-gated) - requires `--phase exploit` **and**
   `--confirm-exploitation` together, one flag alone isn't enough. Typically
   run with `--resume-from` pointing at the recon run's log, so the model
