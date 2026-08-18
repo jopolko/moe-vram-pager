@@ -45,7 +45,7 @@ Early and actively changing. What works today:
   the chat UI - no CLI round-trip per model. See
   [Quick start](#quick-start) below.
 
-## Hardware
+## Hardware and system requirements
 
 Targets NVIDIA GPUs via CUDA. Built and tested against a GTX 1080 Ti
 (Pascal, compute capability 6.1). `CMAKE_CUDA_ARCHITECTURES` is
@@ -55,6 +55,62 @@ auto-detected from whatever GPU is actually in the build machine
 cross-compiling for different hardware than you're building on, in
 which case pass `-DCMAKE_CUDA_ARCHITECTURES=<your compute capability>`
 explicitly.
+
+- **NVIDIA GPU + [CUDA toolkit](https://developer.nvidia.com/cuda-toolkit)**
+  installed and on `PATH` before running `cmake -B build -DGGML_CUDA=ON`.
+  Any VRAM amount works in principle - `--moe-stream-cache` sizes the
+  expert cache to whatever fits, and the model picker (`/models`) shows
+  you which quant of which model actually fits your specific card. More
+  VRAM simply means fewer disk reads per token, not a hard cutoff.
+- **RAM** as the second cache tier below VRAM: experts that don't fit in
+  VRAM cache to host RAM before falling back to disk. More RAM shrinks
+  the disk-streaming tier the same way more VRAM does.
+- **Fast local storage matters more than GPU class for the disk-streaming
+  case this project targets.** A local NVMe SSD is the intended target;
+  a network-backed or virtualized disk (WSL2's virtual disk is a real
+  example from this project's own dev box) can dominate the bottleneck
+  regardless of GPU. `--moe-stream-io-threads` is disk-specific, not
+  GPU-specific - more threads measured *slower* on this project's own
+  WSL2 virtual disk (opposite of typical bare-metal NVMe advice); tune
+  it against your own disk instead of assuming a number.
+- **Disk space** for the model file itself - the whole point of this
+  project is running models whose GGUF is hundreds of GB, so budget disk
+  space accordingly (the picker flags a model "needs N GB more" instead
+  of hiding it if it doesn't fit yet).
+
+### Performance: what's actually been measured, and what hasn't
+
+The only benchmark data that exists so far comes from this project's own
+dev box (GTX 1080 Ti, 11GB VRAM) against `Qwen3-30B-A3B-Q4_K_M` (~18.6GB) -
+a model chosen for fast iteration, not for being representative of the
+disk-streaming-tier case this project actually targets. Two numbers from
+that testing, both decode-phase tok/s, same config, differing only in
+Linux page-cache warmth between runs: 8.32 tok/s warm vs. 5.27 tok/s cold.
+That gap alone should tell you page-cache state matters as much as raw
+disk speed for anything short of `--moe-stream-direct` (which trades that
+variability away for consistently slower absolute numbers, useful for
+controlled A/B testing, not for real usage).
+
+**No numbers exist yet for other GPUs, or for a genuinely huge model
+(hundreds of GB, the actual target use case) exercising the real
+disk-streaming tier under sustained cache pressure.** Treat any specific
+tok/s figure for an RTX 3090/4090/5090/etc. as something nobody has
+measured on this fork - don't trust a number you see quoted for this
+project unless it cites its own model size, cache size, and disk type,
+because those three variables swing results far more than GPU generation
+does once the model doesn't fit in VRAM+RAM.
+
+**Warning on huge models specifically**: this is the regime the project
+targets but hasn't stress-tested end-to-end yet. Expect disk I/O, not GPU
+compute, to be the dominant bottleneck once the working set exceeds
+VRAM+RAM - a model that's merely large but still fits in VRAM+RAM will
+feel close to native llama.cpp speed, while one that genuinely exceeds
+both will bottleneck on storage throughput and page-cache pressure per
+token, however fast the GPU is. If you hit this case, the levers worth
+tuning are `--moe-stream-io-threads` (verify against your own disk, don't
+assume higher is better), `--moe-stream-cache` (bigger cache, fewer
+misses, if you have the VRAM/RAM to spare), and whether your storage is
+local NVMe vs. anything virtualized or network-backed.
 
 ## Quick start
 
@@ -188,25 +244,70 @@ close.
 ## Pentest appliance
 
 Optional layer on top of the base MoE VRAM Pager: a local-LLM-driven
-recon/exploit agent, wired into six real offensive-security platforms, with
-a hard-gated recon/exploit phase split. Full from-scratch setup (systemd
-units, per-tool install, API keys, architecture diagram) lives in
-[PENTEST_APPLIANCE.md](PENTEST_APPLIANCE.md); summary below.
+recon/exploit agent, wired into real offensive-security and OSINT
+platforms, with a hard-gated osint/recon/exploit phase split. Full
+from-scratch setup (systemd units, per-tool install, API keys, architecture
+diagram) lives in [PENTEST_APPLIANCE.md](PENTEST_APPLIANCE.md); summary
+below.
 
 An uncensored model chosen by the picker above (see
 [Why derestricted models](#why-derestricted-models)) drives a tool-calling
 loop (`tools/pentest_agent.py`) against an authorized target. A `/pentest`
 panel in the web UI (`tools/pentest_ui_api.py` sidecar + SvelteKit
-frontend) starts, monitors, and stops runs, and compiles a PDF report when
-one finishes.
+frontend) starts, monitors, restarts, and stops runs, and compiles a PDF
+report when one finishes.
+
+### Setup
+
+```bash
+tools/setup_pentest_appliance.sh
+```
+
+One idempotent script for the whole stack: builds `llama-server`, installs
+nmap with the raw-socket capabilities `nmap_scan` needs, offers to install
+Metasploit Framework and OWASP ZAP (each asks for confirmation first, since
+both installers do more than drop a single package), clones and patches
+[MetasploitMCP](https://github.com/GH05TCREW/MetasploitMCP), writes the
+secrets file (prompts for `MSF_PASSWORD`/`ZAP_API_KEY`, blank = generate a
+random one), installs the systemd units and a scoped passwordless-sudo
+rule, starts everything, and verifies it's up. Safe to re-run any time -
+every step checks current state first and skips what's already done. See
+[PENTEST_APPLIANCE.md](PENTEST_APPLIANCE.md) for exactly what each step
+does and how to run any piece by hand instead.
+
+### Start / stop / restart
+
+```bash
+tools/pentest_appliance.sh start     # msf-db -> msfrpcd -> metasploit-mcp -> zap -> pentest-ui-api -> llama-moe-router
+tools/pentest_appliance.sh stop      # reverse order
+tools/pentest_appliance.sh restart
+tools/pentest_appliance.sh status
+```
+
+Wraps the six systemd services in the dependency order the Metasploit
+chain needs, stopping in reverse so nothing loses a dependency mid-
+teardown. Requires the passwordless-sudo rule the setup script installs -
+without it, `sudo` blocks mid-sequence waiting for a password with no
+terminal to read it from.
+
+Ordered from most passive (never touches the target) to most aggressive
+(runs real exploits against it):
 
 | Platform | Role | Reached via |
 |---|---|---|
-| [Metasploit Framework](https://github.com/rapid7/metasploit-framework) | Exploitation, payload generation, session control | `MetasploitMCP` bridge &rarr; `msfrpcd` |
-| [OWASP ZAP](https://www.zaproxy.org/) | Web app spidering + active scan | ZAP's REST API directly (it has no MCP server of its own) |
+| [theHarvester](https://github.com/laramies/theHarvester) | Passive OSINT aggregator: emails, subdomains/hosts, IPs from Certificate Transparency, search engines, breach indexes, wayback history | local checkout, run via `uv` - no API key needed |
+| Google dorking | Curated Google Hacking Database-style queries (exposed admin panels, leaked config/backup files, directory listings, exposed `.git`, ...) | DuckDuckGo HTML search - never contacts google.com or the target |
 | [NIST NVD](https://nvd.nist.gov/) | CVE lookup by keyword or exact CPE 2.3 string | `services.nvd.nist.gov` REST API |
-| nmap | Port/service/OS scanning, NSE scripts | local binary, `cap_net_raw`/`cap_net_admin` via setcap (no root) |
 | Passive origin OSINT | Find a real origin IP behind a CDN/WAF | Certificate Transparency logs (crt.sh) + DNS, cross-checked against Cloudflare's published ranges |
+| nmap | Port/service/OS scanning, NSE scripts | local binary, `cap_net_raw`/`cap_net_admin`/`cap_net_bind_service` via setcap (no root) |
+| [OWASP ZAP](https://www.zaproxy.org/) (Zed Attack Proxy) | Web app spidering (recon), then active scan with real attack payloads (exploit) | ZAP's REST API directly (it has no MCP server of its own) |
+| [Metasploit Framework](https://github.com/rapid7/metasploit-framework) | Exploitation, payload generation, session control - the most aggressive tier | `msfrpcd`, its local RPC daemon (port 55553, loopback-only) |
+| [MetasploitMCP](https://github.com/GH05TCREW/MetasploitMCP) | Wraps `msfrpcd`'s RPC API as an MCP server | MCP session over SSE (port 8085), separate repo cloned by the setup script |
+
+`pentest_ui_api.py` (the sidecar behind the `/pentest` panel) and
+`pentest_report.py` (PDF generation) run from the same Python venv as
+MetasploitMCP, on FastAPI/Uvicorn/Pydantic/ReportLab/`requests`/`mcp` - see
+`tools/requirements-pentest-agent.txt`.
 
 ### Phase gating
 
@@ -245,6 +346,10 @@ not just by prompt:
 - `tools/pentest_ui_api.py`, `tools/ui/src/routes/pentest/`: the `/pentest`
   web UI panel and the sidecar API that runs/streams/stops agent runs.
 - `tools/pentest_report.py`: turns a run's JSON log into a PDF report.
+- `tools/setup_pentest_appliance.sh`: idempotent, from-scratch install of
+  the whole pentest appliance stack.
+- `tools/pentest_appliance.sh`: start/stop/restart/status for the six
+  appliance systemd services, in dependency order.
 - `PENTEST_APPLIANCE.md`: from-scratch setup for the pentest appliance
   layer - see [Pentest appliance](#pentest-appliance) above.
 
