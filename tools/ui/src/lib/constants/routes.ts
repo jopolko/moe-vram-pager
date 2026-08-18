@@ -27,5 +27,7 @@ export const ROUTES = {
 	/** Settings base — for dynamic settings URLs use RouterService. */
 	SETTINGS: '#/settings',
 	/** Search — mobile-only full-page conversation search. */
-	SEARCH: '#/search'
+	SEARCH: '#/search',
+	/** Pentest appliance — fire-and-forget recon/exploit runs, bypasses chat tool-calling. */
+	PENTEST: '#/pentest'
 } as const;

@@ -203,7 +203,6 @@ one finishes.
 | Platform | Role | Reached via |
 |---|---|---|
 | [Metasploit Framework](https://github.com/rapid7/metasploit-framework) | Exploitation, payload generation, session control | `MetasploitMCP` bridge &rarr; `msfrpcd` |
-| [Sliver](https://github.com/BishopFox/sliver) | C2 / post-exploitation | `sliver-client mcp` (Sliver's own built-in MCP server) |
 | [OWASP ZAP](https://www.zaproxy.org/) | Web app spidering + active scan | ZAP's REST API directly (it has no MCP server of its own) |
 | [NIST NVD](https://nvd.nist.gov/) | CVE lookup by keyword or exact CPE 2.3 string | `services.nvd.nist.gov` REST API |
 | nmap | Port/service/OS scanning, NSE scripts | local binary, `cap_net_raw`/`cap_net_admin` via setcap (no root) |
