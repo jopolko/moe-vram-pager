@@ -325,6 +325,15 @@ level, not just by prompt:
   `dd ... of=/dev/...`, `shutdown`/`reboot`, `iptables -F`, ...) blocks
   matching session commands even inside exploit phase, a code-level check
   rather than something the model is just asked nicely to avoid.
+- **Never scans CDN/edge infrastructure** - before nmap, ZAP, or any
+  Metasploit module ever touches a host, that host is resolved and checked
+  against Cloudflare's published ranges and known second-CDN CNAME chains
+  (Akamai, CloudFront, Fastly, Azure Front Door, ...); a target domain that
+  resolves to one, or an "origin IP" candidate that turns out to be one, is
+  refused rather than scanned, and the refusal is logged (`safety_skip`
+  events, shown live in the `/pentest` UI). This is a code-level gate, not
+  a prompt instruction, and applies the same way whether the host came from
+  `--target`, `find_origin_ip`, or a resumed prior run.
 
 ## Repo layout
 
