@@ -4,6 +4,7 @@
 #include "download.h"
 #include "hf-cache.h"
 #include "ggml-backend.h"
+#include "gguf.h"
 #include "preset.h"
 
 #include <nlohmann/json.hpp>
@@ -435,6 +436,9 @@ struct model_row {
     std::string fit_tier;
     bool is_derestricted = false;
     std::string gguf_repo; // empty if not looked up / not found
+    int  n_ctx_train = 0;  // 0 if unverified
+    bool kv_verified = false; // true once fetch_kv_hparams succeeded for this row
+    std::vector<double> ctx_options_gb; // parallel to CTX_SIZE_OPTIONS, empty if unverified
 };
 
 // The model - every expert, dense or routed - always lives on SSD; --moe-stream reads
@@ -448,10 +452,25 @@ struct model_row {
 // from a 1080 Ti up to a 5090 without separate tuning per card size.
 constexpr double VRAM_FIT_FRACTION = 0.55;
 
-std::string classify_fit(double active_gb, double total_gb, double vram_gb, double disk_free_gb) {
+// The floor the fit check itself now enforces, instead of leaving "how much context actually
+// fits" as an afterthought decided by whatever's left over once a model is already marked
+// "fits" (that afterthought used to bottom out at a flat, model-agnostic 8192 - see
+// DEFAULT_CTX_SIZE below). When a row's real KV-cache hyperparameters are known
+// (kv_cache_gb > 0, from estimate_kv_cache_gb(h, MIN_USEFUL_CTX_TOKENS)), classify_fit
+// requires active_gb + kv_cache_gb to clear VRAM_FIT_FRACTION together, so a model that
+// would only leave room for a useless few thousand tokens of context no longer reports "fits."
+constexpr int MIN_USEFUL_CTX_TOKENS = 32768;
+
+// Mirrors CTX_SIZE_OPTIONS in tools/ui/src/routes/models/+page.svelte's ctxPicker - kept here
+// rather than reimplementing estimate_kv_cache_gb's SWA-aware math in TypeScript, so the
+// frontend only ever compares precomputed numbers against headroom instead of duplicating (and
+// risking drift from) the formula itself.
+constexpr int CTX_SIZE_OPTIONS[] = {4096, 8192, 16384, 32768, 65536};
+
+std::string classify_fit(double active_gb, double total_gb, double vram_gb, double disk_free_gb, double kv_cache_gb = 0.0) {
     if (total_gb > disk_free_gb) return "no-disk-space"; // can't even be stored on SSD
-    if (active_gb <= vram_gb * VRAM_FIT_FRACTION) return "fits";
-    return "too-large"; // active footprint alone would starve context/compute - not shown
+    if (active_gb + kv_cache_gb <= vram_gb * VRAM_FIT_FRACTION) return "fits";
+    return "too-large"; // active footprint (+ a useful context, when known) would starve compute - not shown
 }
 
 // Only two outcomes ever reach the final result list ("fits", scored by UGI; "no-disk-
@@ -480,6 +499,15 @@ constexpr int DEFAULT_CTX_SIZE = 8192;
 // it's a "medium" tune that scales the same way on a 1080 Ti as a 5090 - never handing the
 // whole card over to the cache alone.
 constexpr double CACHE_HEADROOM_FRACTION = 0.5;
+
+// Same idea, for the second-tier host-RAM cache (--moe-stream-ram-cache): a flat fraction of
+// whatever RAM detect_hardware() reports as free (hw.ram_free_gb, already the OS's own
+// "available for new allocations" figure - MemAvailable on Linux, which on WSL2 is capped by
+// .wslconfig's [wsl2] memory= setting, so this scales down automatically on a constrained
+// Windows host same as it scales up on a bare-metal Linux box with lots of RAM). The other half
+// stays free for the OS, the model's own mmap'd dense weights, and everything else already
+// competing for host memory - the RAM cache is a bonus tier, not the primary residency source.
+constexpr double RAM_CACHE_HEADROOM_FRACTION = 0.5;
 
 bool text_matches_terms(const std::vector<std::string> & terms, const std::string & text) {
     std::string lower = to_lower(text);
@@ -711,6 +739,352 @@ hf_cache::hf_files get_repo_files_cached(const std::string & repo_id) {
     return files;
 }
 
+// Per-model attention-shape hyperparameters needed to price a KV-cache in real bytes -
+// none of this is in HF's ?expand[]=gguf metadata (verified live: that only ever returns
+// total/architecture/context_length/chat_template/tokenizer tokens/totalFileSize), but it
+// is reliably in the base model's own config.json, which model_row.repo_id already points
+// at (separate from gguf_repo, the resolved quant repo verify_gguf_row finds).
+struct kv_hparams {
+    bool ok = false;
+    int n_layer = 0;
+    int n_head_kv = 0;
+    int head_dim = 0;
+    int n_ctx_train = 0;
+    int sliding_window = 0;         // 0 = no SWA
+    int sliding_window_pattern = 0; // every Nth layer is full attention; 0/1 = treat all layers as full
+};
+
+// Reads the handful of fields classify_fit's KV-cache estimate needs out of a parsed
+// config.json object. Returns ok=false if num_hidden_layers isn't present - the one field
+// with no safe default, so its absence means "can't verify this model" rather than "assume
+// zero layers." Caller retries this against a nested "text_config" object first for VLM-
+// wrapper architectures (confirmed live against gemma-3-12b-it/gemma-3-4b-it) where the text
+// model's real hparams aren't at the top level.
+kv_hparams parse_kv_hparams(const json & cfg) {
+    kv_hparams h;
+    if (!cfg.contains("num_hidden_layers") || !cfg["num_hidden_layers"].is_number()) return h;
+
+    h.n_layer = cfg["num_hidden_layers"].get<int>();
+
+    int n_head = cfg.value("num_attention_heads", 0);
+    h.n_head_kv = cfg.value("num_key_value_heads", n_head); // no GQA -> same as query heads
+
+    int hidden_size = cfg.value("hidden_size", 0);
+    h.head_dim = cfg.value("head_dim", 0);
+    if (h.head_dim <= 0 && n_head > 0) h.head_dim = hidden_size / n_head;
+
+    h.n_ctx_train = cfg.value("max_position_embeddings", 0);
+    h.sliding_window = cfg.value("sliding_window", 0);
+    h.sliding_window_pattern = cfg.value("sliding_window_pattern", 0);
+
+    h.ok = h.n_layer > 0 && h.n_head_kv > 0 && h.head_dim > 0;
+    return h;
+}
+
+// GET the base model's config.json - not the GGUF repo's, the original HF repo model_row.repo_id
+// already carries from the UGI CSV. A small, standard, well-documented JSON file (unlike a GGUF's
+// own header, which would require a binary range-request parser and risks pulling in several MB of
+// embedded tokenizer vocab before reaching the fields we actually want).
+kv_hparams fetch_kv_hparams(const std::string & repo_id) {
+    common_remote_params params;
+    params.timeout = 6;
+    kv_hparams h;
+    try {
+        hf_request_guard guard;
+        auto [http_code, body] = common_remote_get_content(
+            "https://huggingface.co/" + repo_id + "/raw/main/config.json", params);
+        if (http_code != 200 || body.empty()) return h;
+        json cfg = json::parse(std::string(body.begin(), body.end()), nullptr, false);
+        if (cfg.is_discarded() || !cfg.is_object()) return h;
+
+        h = parse_kv_hparams(cfg);
+        if (!h.ok && cfg.contains("text_config") && cfg["text_config"].is_object()) {
+            h = parse_kv_hparams(cfg["text_config"]);
+        }
+    } catch (const std::exception &) {
+        // best-effort only
+    }
+    return h;
+}
+
+std::mutex g_kv_hparams_cache_mutex;
+
+// TTL-disk-cached wrapper around fetch_kv_hparams, same shape as get_repo_files_cached but
+// keyed by the base repo_id and cached for HF_TAGS_TTL_SECONDS - a model's architecture
+// hyperparameters never change post-release, so this is effectively a permanent cache that
+// just re-warms itself monthly.
+kv_hparams get_kv_hparams_cached(const std::string & repo_id) {
+    std::string cache_path = fs_get_cache_file("model-picker-kv-hparams.json");
+    long now = (long) std::time(nullptr);
+
+    {
+        std::lock_guard<std::mutex> lock(g_kv_hparams_cache_mutex);
+        json cache = json::parse(read_file(cache_path), nullptr, false);
+        if (!cache.is_discarded() && cache.is_object()) {
+            auto it = cache.find(repo_id);
+            if (it != cache.end() && it->contains("t") && it->contains("h") &&
+                now - (*it)["t"].get<long>() < HF_TAGS_TTL_SECONDS) {
+                kv_hparams h;
+                auto & hj = (*it)["h"];
+                h.ok                     = hj.value("ok", false);
+                h.n_layer                = hj.value("n_layer", 0);
+                h.n_head_kv              = hj.value("n_head_kv", 0);
+                h.head_dim               = hj.value("head_dim", 0);
+                h.n_ctx_train            = hj.value("n_ctx_train", 0);
+                h.sliding_window         = hj.value("sliding_window", 0);
+                h.sliding_window_pattern = hj.value("sliding_window_pattern", 0);
+                return h;
+            }
+        }
+    }
+
+    kv_hparams h = fetch_kv_hparams(repo_id);
+
+    {
+        std::lock_guard<std::mutex> lock(g_kv_hparams_cache_mutex);
+        json cache = json::parse(read_file(cache_path), nullptr, false);
+        if (cache.is_discarded() || !cache.is_object()) cache = json::object();
+        cache[repo_id] = {
+            {"t", now},
+            {"h", {
+                {"ok", h.ok}, {"n_layer", h.n_layer}, {"n_head_kv", h.n_head_kv},
+                {"head_dim", h.head_dim}, {"n_ctx_train", h.n_ctx_train},
+                {"sliding_window", h.sliding_window}, {"sliding_window_pattern", h.sliding_window_pattern},
+            }},
+        };
+        write_file(cache_path, cache.dump());
+    }
+
+    return h;
+}
+
+// Estimate KV-cache VRAM for ctx_tokens of context, F16 (llama.cpp's default; this UI doesn't
+// expose --cache-type-k/v) - so this only ever over-estimates real usage, never under. SWA layers
+// (when sliding_window_pattern is known) are priced at min(ctx_tokens, sliding_window) instead of
+// the full context, since only every Nth layer pays the full price; with no pattern info every
+// layer is conservatively priced as full-attention.
+double estimate_kv_cache_gb(const kv_hparams & h, int ctx_tokens) {
+    constexpr int kv_bytes_per_elem = 2; // F16
+    int pattern     = h.sliding_window_pattern > 1 ? h.sliding_window_pattern : 0;
+    int full_layers = pattern ? (h.n_layer + pattern - 1) / pattern : h.n_layer;
+    int swa_layers  = h.n_layer - full_layers;
+    int swa_ctx     = h.sliding_window > 0 ? std::min(ctx_tokens, h.sliding_window) : ctx_tokens;
+
+    double bytes = 0.0;
+    bytes += (double) full_layers * h.n_head_kv * h.head_dim * 2 /*K+V*/ * kv_bytes_per_elem * ctx_tokens;
+    bytes += (double) swa_layers  * h.n_head_kv * h.head_dim * 2         * kv_bytes_per_elem * swa_ctx;
+    return bytes / 1e9;
+}
+
+// Assessment of an arbitrary user-supplied GGUF (local file or direct URL), not from the
+// curated UGI list - read straight out of the GGUF's own metadata header instead of a base
+// HF repo's config.json, so it works for any file, including ones with no matching HF repo.
+struct gguf_probe {
+    bool ok = false;
+    std::string arch;
+    int n_layer = 0;
+    int n_head_kv = 0;
+    int head_dim = 0;
+    int n_ctx_train = 0;
+    int sliding_window = 0;
+    int sliding_window_pattern = 0;
+    int n_expert = 0;
+    int n_expert_used = 0;
+    double total_gb = 0.0;  // sum of every tensor's byte size
+    double active_gb = 0.0; // dense + (moe experts scaled by n_expert_used/n_expert)
+    std::string quant_label;
+    bool is_split = false; // "split.count" KV present - size may be understated, see caller
+};
+
+kv_hparams gguf_probe_to_kv_hparams(const gguf_probe & p) {
+    kv_hparams h;
+    h.ok                     = p.ok;
+    h.n_layer                = p.n_layer;
+    h.n_head_kv               = p.n_head_kv;
+    h.head_dim               = p.head_dim;
+    h.n_ctx_train            = p.n_ctx_train;
+    h.sliding_window         = p.sliding_window;
+    h.sliding_window_pattern = p.sliding_window_pattern;
+    return h;
+}
+
+// Shared metadata extraction, once a gguf_context has been opened (no_alloc, header-only) by
+// either the local-file or remote-callback path below. Expert-merged tensors in this fork's
+// GGUF convention hold every routed expert's weights in one tensor per layer/projection (name
+// containing "_exps."), so their total byte size scales down by n_expert_used/n_expert for the
+// active-VRAM estimate; everything else (dense/shared weights, embeddings, norms) always
+// counts in full.
+gguf_probe gguf_probe_from_ctx(struct gguf_context * ctx) {
+    gguf_probe p;
+
+    int64_t arch_id = gguf_find_key(ctx, "general.architecture");
+    p.arch = arch_id >= 0 ? gguf_get_val_str(ctx, arch_id) : "";
+    p.is_split = gguf_find_key(ctx, "split.count") >= 0;
+
+    auto get_int = [&](const std::string & suffix, int def = 0) -> int {
+        std::string key = p.arch + "." + suffix;
+        int64_t id = gguf_find_key(ctx, key.c_str());
+        if (id < 0) return def;
+        switch (gguf_get_kv_type(ctx, id)) {
+            case GGUF_TYPE_UINT8:  return gguf_get_val_u8(ctx, id);
+            case GGUF_TYPE_INT8:   return gguf_get_val_i8(ctx, id);
+            case GGUF_TYPE_UINT16: return gguf_get_val_u16(ctx, id);
+            case GGUF_TYPE_INT16:  return gguf_get_val_i16(ctx, id);
+            case GGUF_TYPE_UINT32: return (int) gguf_get_val_u32(ctx, id);
+            case GGUF_TYPE_INT32:  return gguf_get_val_i32(ctx, id);
+            case GGUF_TYPE_UINT64: return (int) gguf_get_val_u64(ctx, id);
+            case GGUF_TYPE_INT64:  return (int) gguf_get_val_i64(ctx, id);
+            default: return def;
+        }
+    };
+
+    p.n_layer   = get_int("block_count");
+    int n_head  = get_int("attention.head_count");
+    p.n_head_kv = get_int("attention.head_count_kv", n_head);
+    int embd    = get_int("embedding_length");
+    p.head_dim  = get_int("attention.key_length");
+    if (p.head_dim <= 0 && n_head > 0) p.head_dim = embd / n_head;
+    p.n_ctx_train            = get_int("context_length");
+    p.sliding_window         = get_int("attention.sliding_window");
+    p.sliding_window_pattern = get_int("attention.sliding_window_pattern");
+    p.n_expert               = get_int("expert_count");
+    p.n_expert_used          = get_int("expert_used_count");
+
+    int64_t n_tensors = gguf_get_n_tensors(ctx);
+    double dense_bytes = 0.0, moe_bytes = 0.0;
+    std::map<std::string, int64_t> type_votes; // by cumulative bytes, to find the dominant quant
+    for (int64_t i = 0; i < n_tensors; i++) {
+        std::string name = gguf_get_tensor_name(ctx, i);
+        size_t sz = gguf_get_tensor_size(ctx, i);
+        if (name.find("_exps.") != std::string::npos) {
+            moe_bytes += (double) sz;
+        } else {
+            dense_bytes += (double) sz;
+        }
+        if (sz > 1000000) { // skip tiny norm/bias tensors when picking a representative quant
+            type_votes[ggml_type_name(gguf_get_tensor_type(ctx, i))] += (int64_t) sz;
+        }
+    }
+    p.total_gb = (dense_bytes + moe_bytes) / 1e9;
+    p.active_gb = (p.n_expert > 0 && p.n_expert_used > 0)
+        ? (dense_bytes + moe_bytes * ((double) p.n_expert_used / p.n_expert)) / 1e9
+        : p.total_gb;
+
+    int64_t best_bytes = 0;
+    for (auto & [type_name, bytes] : type_votes) {
+        if (bytes > best_bytes) { best_bytes = bytes; p.quant_label = type_name; }
+    }
+
+    p.ok = p.n_layer > 0 && p.n_head_kv > 0 && p.head_dim > 0 && n_tensors > 0;
+    return p;
+}
+
+gguf_probe probe_gguf_local(const std::string & path) {
+    gguf_init_params params;
+    params.no_alloc = true;
+    params.ctx = nullptr;
+    struct gguf_context * ctx = gguf_init_from_file(path.c_str(), params);
+    if (!ctx) return gguf_probe{};
+
+    gguf_probe p = gguf_probe_from_ctx(ctx);
+    gguf_free(ctx);
+
+    // Ground truth for a local file - trust the filesystem over the tensor-size sum (which
+    // omits header/KV/alignment overhead, a rounding error in practice but free to correct).
+    std::error_code ec;
+    auto file_size = std::filesystem::file_size(path, ec);
+    if (!ec && file_size > 0) {
+        double real_total_gb = (double) file_size / 1e9;
+        if (p.total_gb > 0) {
+            double scale = real_total_gb / p.total_gb;
+            p.active_gb *= scale;
+        }
+        p.total_gb = real_total_gb;
+    }
+    return p;
+}
+
+// Hard ceiling on how much of a remote GGUF's header we'll ever fetch/buffer - real headers
+// (KV pairs + tensor-info table) are a tiny fraction of this even for huge vocabs. Also handed
+// to gguf_init_from_callback as max_expected_size so the parser treats reads past it as a
+// legitimate end-of-data rather than assuming unlimited bytes remain (a true unbounded value
+// there let a truncated/corrupt remote header run the parser past valid memory).
+constexpr uint64_t GGUF_REMOTE_MAX_HEADER_BYTES = 256ull * 1024 * 1024;
+
+// Backs gguf_init_from_callback with ranged HTTP GETs against a remote URL, so only the header
+// (magic/version/KV pairs/tensor-info table) is ever fetched - never the multi-GB tensor data
+// blob. A single generous prefetch covers virtually every model in one round trip; only issues
+// a second, larger ranged GET if the parser asks for bytes beyond it (e.g. an unusually large
+// vocab/KV array).
+struct gguf_remote_reader {
+    std::string url;
+    std::vector<char> buf;
+    uint64_t buf_len = 0;
+    bool failed = false;
+
+    bool ensure(uint64_t offset, size_t len) {
+        if (offset + len <= buf_len) return true;
+        if (failed) return false;
+
+        // A GGUF header is read as thousands of small fields (one HTTP round trip per field
+        // would be requested here otherwise, since the parser tracks its own read position and
+        // calls the callback per-field). Doubling the fetch size each time turns a header whose
+        // KV/vocab data runs past the initial prefetch into O(log n) requests instead of O(n),
+        // capped well above any real header (tensor data is never touched - no_alloc skips it).
+        uint64_t want = std::max<uint64_t>(offset + (uint64_t) len, buf_len == 0 ? 0 : buf_len * 2);
+        want = std::min<uint64_t>(want, GGUF_REMOTE_MAX_HEADER_BYTES);
+        if (want < offset + (uint64_t) len) {
+            failed = true; // header apparently larger than any real GGUF's - bail out
+            return false;
+        }
+        common_remote_params params;
+        params.timeout = 15;
+        params.headers.push_back({"Range", "bytes=0-" + std::to_string(want - 1)});
+        auto [http_code, body] = common_remote_get_content(url, params);
+        if ((http_code != 200 && http_code != 206) || body.empty()) {
+            failed = true;
+            return false;
+        }
+        buf.assign(body.begin(), body.end());
+        buf_len = buf.size();
+        return buf_len > offset; // may still be < want if that's genuinely the whole file
+    }
+};
+
+constexpr size_t GGUF_REMOTE_PREFETCH_BYTES = 2 * 1024 * 1024;
+
+size_t gguf_remote_read_cb(void * userdata, void * output, uint64_t offset, size_t len) {
+    auto * r = (gguf_remote_reader *) userdata;
+    if (!r->ensure(offset, len)) return 0;
+    if (offset >= r->buf_len) return 0;
+    size_t avail = (size_t) std::min<uint64_t>((uint64_t) len, r->buf_len - offset);
+    std::memcpy(output, r->buf.data() + offset, avail);
+    return avail;
+}
+
+gguf_probe probe_gguf_remote(const std::string & url) {
+    gguf_remote_reader reader;
+    reader.url = url;
+    if (!reader.ensure(0, GGUF_REMOTE_PREFETCH_BYTES)) return gguf_probe{};
+
+    gguf_init_params params;
+    params.no_alloc = true;
+    params.ctx = nullptr;
+    // max_expected_size isn't a hint - passing 0 makes the reader believe 0 bytes remain and
+    // every read fails immediately (gguf_init_from_callback only special-cases max_chunk_read==0,
+    // not this parameter). We don't know the real remote file size up front, so bound it by our
+    // own header-fetch ceiling instead of passing something like UINT64_MAX - that let a
+    // truncated/corrupt remote header be treated as having unlimited bytes remaining, which
+    // crashed the parser instead of failing the read cleanly.
+    struct gguf_context * ctx =
+        gguf_init_from_callback(gguf_remote_read_cb, &reader, 0, GGUF_REMOTE_MAX_HEADER_BYTES, params);
+    if (!ctx) return gguf_probe{};
+
+    gguf_probe p = gguf_probe_from_ctx(ctx);
+    gguf_free(ctx);
+    return p;
+}
+
 // Verify a candidate row against real HF file listings instead of trusting the CSV-estimate size:
 // try each of the top VERIFY_CANDIDATE_REPOS composite-scored repos, and within each, each quant
 // best-to-worst, until a REAL resolvable file (or split group) is found that actually fits - reusing
@@ -719,6 +1093,15 @@ hf_cache::hf_files get_repo_files_cached(const std::string & repo_id) {
 // time. On success overwrites gguf_repo/quant/active_gb/total_gb/fit_tier with the real numbers; on
 // failure leaves gguf_repo empty so the row gets dropped downstream, same as an outright search miss.
 void verify_gguf_row(model_row & m, double vram_gb, double free_gb) {
+    // Real per-model KV-cache hyperparameters, fetched once per row regardless of which
+    // candidate repo/quant ends up winning below - it's a property of the base model
+    // (m.repo_id), not of any particular GGUF quant. h.ok == false (fetch failed, or an
+    // architecture parse_kv_hparams can't read cleanly, e.g. recurrent/hybrid-memory
+    // archs) falls back to kv_cache_gb = 0.0, i.e. classify_fit's pre-existing
+    // active_gb-only check - unverifiable, not zero-cost.
+    kv_hparams h = get_kv_hparams_cached(m.repo_id);
+    double kv_cache_gb = h.ok ? estimate_kv_cache_gb(h, MIN_USEFUL_CTX_TOKENS) : 0.0;
+
     for (auto & repo : gguf_search_candidates(m.repo_id, VERIFY_CANDIDATE_REPOS)) {
         hf_cache::hf_files files = get_repo_files_cached(repo);
         if (files.empty()) continue;
@@ -745,7 +1128,7 @@ void verify_gguf_row(model_row & m, double vram_gb, double free_gb) {
             // size instead of an assumed one - bpw is uniform across tensors for a given quant, so
             // the active-parameter share of file size scales with active_b/total_b either way.
             double active_gb = total_gb * (m.active_b / m.total_b);
-            std::string tier = classify_fit(active_gb, total_gb, vram_gb, free_gb);
+            std::string tier = classify_fit(active_gb, total_gb, vram_gb, free_gb, kv_cache_gb);
             if (!is_usable(tier)) continue;
 
             int order = fit_order(tier);
@@ -759,11 +1142,16 @@ void verify_gguf_row(model_row & m, double vram_gb, double free_gb) {
         }
 
         if (best_order >= 0) {
-            m.gguf_repo = repo;
-            m.quant     = best_quant;
-            m.fit_tier  = best_tier;
-            m.active_gb = best_active_gb;
-            m.total_gb  = best_total_gb;
+            m.gguf_repo    = repo;
+            m.quant        = best_quant;
+            m.fit_tier     = best_tier;
+            m.active_gb    = best_active_gb;
+            m.total_gb     = best_total_gb;
+            m.n_ctx_train  = h.n_ctx_train;
+            m.kv_verified  = h.ok;
+            if (h.ok) {
+                for (int ctx : CTX_SIZE_OPTIONS) m.ctx_options_gb.push_back(estimate_kv_cache_gb(h, ctx));
+            }
             return; // first real usable match wins - candidates are already priority ordered
         }
     }
@@ -1194,6 +1582,9 @@ void server_model_picker_register_routes(const server_http_context & ctx_http, c
                     {"ugi_score", m.ugi_score}, {"willingness", m.willingness},
                     {"is_derestricted", m.is_derestricted},
                     {"gguf_repo", m.gguf_repo},
+                    {"n_ctx_train", m.n_ctx_train},
+                    {"kv_verified", m.kv_verified},
+                    {"ctx_options_gb", m.ctx_options_gb},
                 });
             }
             out["models"] = arr;
@@ -1260,10 +1651,40 @@ void server_model_picker_register_routes(const server_http_context & ctx_http, c
         try {
             json body = json::parse(req.body);
             std::string gguf_repo = body.value("gguf_repo", std::string());
+            std::string repo_id   = body.value("repo_id", std::string()); // base HF repo, for KV-cache sizing
             std::string quant     = body.value("quant", std::string());
+            std::string path      = body.value("path", std::string()); // ad-hoc local-file source
+            std::string url       = body.value("url", std::string());  // ad-hoc direct-URL source
             double      active_gb = body.value("active_gb", 0.0);
-            if (gguf_repo.empty() || quant.empty()) {
-                throw std::invalid_argument("gguf_repo and quant are required");
+            int         ctx_size  = body.value("ctx_size", DEFAULT_CTX_SIZE);
+
+            // Ad-hoc GGUF assessment (server-model-picker.cpp's /model-picker/assess-gguf) has
+            // no repo_id to re-derive KV-cache hparams from - the client passes the same
+            // gguf_probe fields it already got back from that endpoint instead.
+            bool has_inline_hparams = body.contains("n_layer");
+            kv_hparams inline_h;
+            if (has_inline_hparams) {
+                inline_h.n_layer                = body.value("n_layer", 0);
+                inline_h.n_head_kv              = body.value("n_head_kv", 0);
+                inline_h.head_dim               = body.value("head_dim", 0);
+                inline_h.n_ctx_train            = body.value("n_ctx_train", 0);
+                inline_h.sliding_window         = body.value("sliding_window", 0);
+                inline_h.sliding_window_pattern = body.value("sliding_window_pattern", 0);
+                inline_h.ok = inline_h.n_layer > 0 && inline_h.n_head_kv > 0 && inline_h.head_dim > 0;
+            }
+
+            std::string model_id;
+            if (!gguf_repo.empty() && !quant.empty()) {
+                model_id = gguf_repo + ":" + quant;
+            } else if (!path.empty()) {
+                model_id = path;
+            } else if (!url.empty()) {
+                model_id = url;
+            } else {
+                throw std::invalid_argument("gguf_repo+quant, path, or url is required");
+            }
+            if (ctx_size <= 0) {
+                ctx_size = DEFAULT_CTX_SIZE;
             }
 
             // Freshly detected here rather than trusting client-supplied VRAM figures - the same
@@ -1274,20 +1695,41 @@ void server_model_picker_register_routes(const server_http_context & ctx_http, c
 
             // active_gb (dense weights + working expert set) is going to be VRAM-resident no
             // matter what - see VRAM_FIT_FRACTION, which already confirmed this row fits under
-            // that basis. --moe-stream-cache only gets a cut of whatever's left over after that,
-            // and only half of THAT (CACHE_HEADROOM_FRACTION), so loading the model never eats
-            // the headroom the fit check reserved for KV-cache/context and compute buffers.
-            // --moe-stream-cache only parses integer GiB (or integer slot counts), so round down
-            // to a whole GiB with a 1 GiB floor.
+            // that basis. Real KV-cache bytes for the actually-requested ctx_size are reserved
+            // next (when repo_id's hparams are known - see fetch_kv_hparams), so moe-stream-cache
+            // can no longer eat the space this specific context size needs. Only unverifiable rows
+            // (repo_id missing, or hparams fetch failed) fall back to the old blind 50/50 split of
+            // whatever's left after active_gb alone.
             double headroom_gb = std::max(0.0, hw.vram_free_gb - active_gb);
-            uint64_t cache_gb = std::max<uint64_t>(1, (uint64_t) (headroom_gb * CACHE_HEADROOM_FRACTION));
 
-            std::string model_id = gguf_repo + ":" + quant;
+            double kv_cache_gb = 0.0;
+            if (!repo_id.empty()) {
+                kv_hparams h = get_kv_hparams_cached(repo_id);
+                if (h.ok) kv_cache_gb = estimate_kv_cache_gb(h, ctx_size);
+            } else if (inline_h.ok) {
+                kv_cache_gb = estimate_kv_cache_gb(inline_h, ctx_size);
+            }
+
+            // --moe-stream-cache only gets a cut of whatever's left over after active_gb AND this
+            // context's real KV-cache reservation, and only half of THAT (CACHE_HEADROOM_FRACTION),
+            // so loading the model never eats the headroom left for compute buffers. --moe-stream-
+            // cache only parses integer GiB (or integer slot counts), so round down to a whole GiB
+            // with a 1 GiB floor.
+            double cache_headroom_gb = std::max(0.0, headroom_gb - kv_cache_gb);
+            uint64_t cache_gb = std::max<uint64_t>(1, (uint64_t) (cache_headroom_gb * CACHE_HEADROOM_FRACTION));
+
             std::string cache_val = std::to_string(cache_gb) + "G";
+
+            // second-tier host-RAM cache: sized off hw.ram_free_gb alone (independent of VRAM/
+            // active_gb/kv_cache_gb above - it's a different physical pool), floored at 0 rather
+            // than 1 since unlike moe-stream-cache this tier is optional and fine to skip
+            // entirely on a RAM-starved box (e.g. WSL2 with a small .wslconfig memory= cap).
+            uint64_t ram_cache_gb = (uint64_t) (std::max(0.0, hw.ram_free_gb) * RAM_CACHE_HEADROOM_FRACTION);
 
             common_preset_write_ini_section(models_preset_path, model_id, {
                 {"moe-stream-cache", cache_val},
-                {"ctx-size", std::to_string(DEFAULT_CTX_SIZE)},
+                {"moe-stream-ram-cache", std::to_string(ram_cache_gb)},
+                {"ctx-size", std::to_string(ctx_size)},
             });
 
             res->status = 200;
@@ -1295,7 +1737,77 @@ void server_model_picker_register_routes(const server_http_context & ctx_http, c
                 {"success", true},
                 {"model_id", model_id},
                 {"moe_stream_cache_gb", cache_gb},
-                {"ctx_size", DEFAULT_CTX_SIZE},
+                {"moe_stream_ram_cache_gb", ram_cache_gb},
+                {"ctx_size", ctx_size},
+            }.dump();
+        } catch (const std::exception & e) {
+            res->status = 400;
+            res->data = json{{"error", e.what()}}.dump();
+        }
+
+        return res;
+    });
+
+    // Instant hardware-fit assessment for an arbitrary GGUF not in the curated UGI list -
+    // "local" reads a file already on disk, "url" range-reads just the header (never the
+    // multi-GB tensor data) over HTTP. Both go through the same probe_gguf_* -> gguf_probe
+    // pipeline and the same classify_fit()/estimate_kv_cache_gb() the curated rows use, so
+    // the verdict means the same thing here as it does anywhere else on this page.
+    ctx_http.post("/model-picker/assess-gguf", [](const server_http_req & req) -> server_http_res_ptr {
+        auto res = std::make_unique<server_http_res>();
+        res->content_type = "application/json; charset=utf-8";
+
+        try {
+            json body = json::parse(req.body);
+            std::string source = body.value("source", std::string());
+            std::string path   = body.value("path", std::string());
+            std::string url    = body.value("url", std::string());
+
+            gguf_probe p;
+            if (source == "local") {
+                if (path.empty()) throw std::invalid_argument("path is required for source=local");
+                p = probe_gguf_local(path);
+            } else if (source == "url") {
+                if (url.empty()) throw std::invalid_argument("url is required for source=url");
+                p = probe_gguf_remote(url);
+            } else {
+                throw std::invalid_argument("source must be \"local\" or \"url\"");
+            }
+
+            if (!p.ok) {
+                res->status = 422;
+                res->data = json{{"error", "couldn't read GGUF metadata from that " +
+                    std::string(source == "local" ? "path" : "URL") +
+                    " - check it exists and is a valid GGUF file"}}.dump();
+                return res;
+            }
+
+            hardware_info hw = detect_hardware();
+            double free_gb = disk_free_gb(".");
+            kv_hparams h = gguf_probe_to_kv_hparams(p);
+            double kv_cache_gb = h.ok ? estimate_kv_cache_gb(h, MIN_USEFUL_CTX_TOKENS) : 0.0;
+            std::string fit = classify_fit(p.active_gb, p.total_gb, hw.vram_free_gb, free_gb, kv_cache_gb);
+
+            res->status = 200;
+            res->data = json{
+                {"fit", fit},
+                {"arch", p.arch},
+                {"is_moe", p.n_expert > 0},
+                {"quant_label", p.quant_label},
+                {"active_gb", p.active_gb},
+                {"total_gb", p.total_gb},
+                {"kv_cache_gb", kv_cache_gb},
+                {"n_ctx_train", p.n_ctx_train},
+                {"is_split", p.is_split},
+                {"vram_free_gb", hw.vram_free_gb},
+                {"disk_free_gb", free_gb},
+                {"n_layer", p.n_layer},
+                {"n_head_kv", p.n_head_kv},
+                {"head_dim", p.head_dim},
+                {"sliding_window", p.sliding_window},
+                {"sliding_window_pattern", p.sliding_window_pattern},
+                {"n_expert", p.n_expert},
+                {"n_expert_used", p.n_expert_used},
             }.dump();
         } catch (const std::exception & e) {
             res->status = 400;

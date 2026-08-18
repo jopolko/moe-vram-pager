@@ -22,6 +22,7 @@
 	import { Button } from '$lib/components/ui/button';
 	import * as Table from '$lib/components/ui/table';
 	import * as DropdownMenu from '$lib/components/ui/dropdown-menu';
+	import DialogLoadGguf from '$lib/components/app/dialogs/DialogLoadGguf.svelte';
 
 	interface ModelRow {
 		name: string;
@@ -39,6 +40,9 @@
 		willingness: number;
 		is_derestricted: boolean;
 		gguf_repo: string;
+		n_ctx_train: number;
+		kv_verified: boolean;
+		ctx_options_gb: number[]; // parallel to CTX_SIZE_OPTIONS, real KV-cache GB per option; empty if unverified
 	}
 
 	interface HardwareInfo {
@@ -79,15 +83,75 @@
 	}
 	let routerAvailable = $state(false);
 	let dlState = $state<Record<string, DlState>>({});
+	let loadGgufOpen = $state(false);
 
 	// Context size is a launch-time (not download-time) choice - it sizes the KV-cache buffer
-	// for the *process* being spawned, so it can only really change per load, not per chat
-	// message. Picked per-model right before hitting Play; DEFAULT_CTX must match
-	// DEFAULT_CTX_SIZE in server-model-picker.cpp (what a fresh download is preset with, and
-	// what this control starts pre-selected to).
+	// for the *process* being spawned. bestCtxForRow() picks the largest option verified to fit
+	// in current headroom and is what download/load use by default. ctxOverride lets a user pick
+	// a different size per row after download - never written back to the preset (matches the
+	// backend's own one-off /models/load ctx_size, see server-models.cpp's post_router_models_load
+	// comment), so it only affects the *next* load and reverts to bestCtxForRow() on a router
+	// restart. It never applies to an already-running instance - that's a launch-time param, so
+	// changing it always means unload + reload, not a live update.
+	let ctxOverride = $state<Record<string, number>>({});
+
+	// DEFAULT_CTX is only the fallback for unverified rows and must match DEFAULT_CTX_SIZE in
+	// server-model-picker.cpp.
 	const DEFAULT_CTX = 8192;
 	const CTX_SIZE_OPTIONS = [4096, 8192, 16384, 32768, 65536];
-	let ctxSizeChoice = $state<Record<string, number>>({});
+
+	// Largest context size verified to fit this model's real KV-cache size within current free
+	// VRAM headroom (m.ctx_options_gb, computed server-side by estimate_kv_cache_gb). Falls back
+	// to DEFAULT_CTX when the row's KV hyperparameters couldn't be verified (config.json fetch
+	// failed, or an architecture parse_kv_hparams can't read cleanly) - unverifiable, not zero-cost.
+	function bestCtxForRow(m: ModelRow): number {
+		if (!hardware || !m.kv_verified || m.ctx_options_gb.length !== CTX_SIZE_OPTIONS.length) {
+			return DEFAULT_CTX;
+		}
+		const headroomGb = Math.max(0, hardware.vram_free_gb - m.active_gb);
+		let best = DEFAULT_CTX;
+		for (let i = 0; i < CTX_SIZE_OPTIONS.length; i++) {
+			if (m.ctx_options_gb[i] <= headroomGb) best = CTX_SIZE_OPTIONS[i];
+		}
+		return best;
+	}
+
+	// ctxOverride, if the user picked one for this row, else bestCtxForRow()'s pick. This is what
+	// downloadModel()/loadRouterModel() actually send as ctx_size, and what the estimate column
+	// (kvCacheGbForRow/estTotalGbForRow) reflects, so the displayed number always matches what a
+	// Load click will actually request.
+	function effectiveCtxForRow(m: ModelRow): number {
+		const id = modelIdFor(m);
+		return (id && ctxOverride[id]) || bestCtxForRow(m);
+	}
+
+	// Real KV-cache GB for whatever ctx size effectiveCtxForRow() actually picks for this row -
+	// kept in sync so the estimate shown always matches the ctx size a Load click will actually
+	// request. 0 (not "unknown") when unverified, same fallback semantics as ctx_options_gb
+	// itself - see its declaration above.
+	function kvCacheGbForRow(m: ModelRow): number {
+		if (!m.kv_verified || m.ctx_options_gb.length !== CTX_SIZE_OPTIONS.length) {
+			return 0;
+		}
+		const idx = CTX_SIZE_OPTIONS.indexOf(effectiveCtxForRow(m));
+		return idx >= 0 ? m.ctx_options_gb[idx] : 0;
+	}
+
+	// Rough allowance for what neither active_gb nor the KV-cache estimate accounts for: ubatch/
+	// compute scratch buffers and CUDA graph memory. Not modeled precisely (it depends on batch
+	// size, architecture, and backend) - a flat pad keeps the headline total from undershooting
+	// real usage, which is the whole point of showing a total instead of active_gb alone. Still
+	// label the number as an estimate in the UI; this is a floor, not a promise.
+	const COMPUTE_BUFFER_FUDGE_GB = 0.5;
+
+	// Best-effort total VRAM a row will actually use once loaded: active weights + KV cache at
+	// this row's default ctx size + compute buffer pad. This is what gets shown as the headline
+	// number - active_gb alone (still available as a tooltip breakdown) was the smaller, more
+	// precise-looking figure that didn't include KV cache or compute buffers, so it read as a
+	// promise it wasn't meant to be.
+	function estTotalGbForRow(m: ModelRow): number {
+		return m.active_gb + kvCacheGbForRow(m) + COMPUTE_BUFFER_FUDGE_GB;
+	}
 
 	// Download speed, EMA-smoothed from successive download_progress events - plain object, not
 	// $state, since it's write-only scratch state for computing etaSeconds, not itself rendered.
@@ -274,8 +338,10 @@
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({
 					gguf_repo: m.gguf_repo,
+					repo_id: m.repo_id,
 					quant: m.quant,
-					active_gb: m.active_gb
+					active_gb: m.active_gb,
+					ctx_size: bestCtxForRow(m)
 				})
 			});
 			const resp = await fetch('./models', {
@@ -308,8 +374,12 @@
 		busyIds = new Set(busyIds).add(id);
 		try {
 			// One-off for this load only - not persisted, so the next load (or a router
-			// restart) reverts to whatever's actually saved in the preset from download time.
-			const ctxSize = ctxSizeChoice[id] ?? DEFAULT_CTX;
+			// restart) reverts to whatever's actually saved in the preset from download time,
+			// unless the user picked a ctxOverride for this row (see effectiveCtxForRow).
+			// Looked up by id (not passed in) since this is called both from the main table
+			// (where the row is right there) and the "Loaded:" dropdown (which only has id/state).
+			const row = models.find((mm) => modelIdFor(mm) === id);
+			const ctxSize = row ? effectiveCtxForRow(row) : ctxOverride[id] || DEFAULT_CTX;
 			await fetch('./models/load', {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
@@ -515,7 +585,7 @@
 					cmp = (QUANT_ORDER[a.quant] ?? 9) - (QUANT_ORDER[b.quant] ?? 9);
 					break;
 				case 'active':
-					cmp = a.active_gb - b.active_gb;
+					cmp = estTotalGbForRow(a) - estTotalGbForRow(b);
 					break;
 				case 'total':
 					cmp = a.total_gb - b.total_gb;
@@ -551,22 +621,8 @@
 
 <div class="mx-auto flex h-dvh w-full max-w-5xl flex-col p-4 md:p-8">
 	<div class="mb-6 shrink-0 text-center">
-		<h1 class="text-2xl font-bold tracking-tight uppercase">Mixture of Experts Models</h1>
-		<p class="text-sm text-muted-foreground">
-			Run MoE models larger than your VRAM by paging only the active experts into memory on
-			demand, instead of loading the entire model upfront.
-		</p>
-		<p class="text-sm text-muted-foreground">Identify every MoE model that will run on your current hardware.</p>
-		<p class="text-xs text-muted-foreground">
-			Model catalog and scores sourced from the <a
-				href="https://huggingface.co/spaces/DontPlanToEnd/UGI-Leaderboard"
-				target="_blank"
-				rel="noopener noreferrer"
-				class="underline hover:text-foreground">HF UGI-Leaderboard</a
-			>. Within what fits your hardware, results are ranked by UGI score, and each one is
-			checked against a real downloadable file on Hugging Face before it's shown, so the
-			quant and size listed are never just an estimate.
-		</p>
+		<h1 class="text-2xl font-bold tracking-tight">MoE VRAM Pager</h1>
+		<p class="text-base font-bold italic text-foreground">Run MoE models that don't fit in your VRAM.</p>
 	</div>
 
 	{#snippet hwCard(label: string, total: number, free: number, decimals: number, totalTitle?: string, freeTitle?: string)}
@@ -638,6 +694,10 @@
 			Check for new models
 		</Button>
 		{#if routerAvailable}
+			<Button size="sm" variant="outline" onclick={() => (loadGgufOpen = true)}>
+				<Download class="h-3.5 w-3.5" />
+				Load GGUF
+			</Button>
 			<DropdownMenu.Root bind:open={loadedDropdownOpen}>
 				<DropdownMenu.Trigger>
 					{#snippet child({ props })}
@@ -726,6 +786,8 @@
 		{/if}
 	</div>
 
+	<DialogLoadGguf bind:open={loadGgufOpen} onLoaded={() => void refreshRouterModels()} />
+
 	{#if error}
 		<div class="shrink-0 rounded-lg border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
 			{error}
@@ -789,7 +851,7 @@
 						<Table.Head class="sticky top-0 z-10 bg-background will-change-transform [transform:translateZ(0)] [backface-visibility:hidden] text-right">
 							<button
 								type="button"
-								title="Active params (B) x bits-per-weight at this quant / 8 = GB. Only the active experts need to be resident here for fast inference."
+								title="Estimated total VRAM once loaded: active weights + KV cache at this model's default context size + a compute-buffer allowance. An estimate, not a guarantee - actual usage depends on backend and batch size."
 								onclick={() => sortBy('active')}
 								class="inline-flex w-full items-center justify-end gap-1 hover:text-foreground"
 							>
@@ -883,7 +945,12 @@
 								{/if}
 							</Table.Cell>
 							<Table.Cell class="text-xs text-muted-foreground">{m.quant}</Table.Cell>
-							<Table.Cell class="text-right tabular-nums">{m.active_gb.toFixed(1)} GB</Table.Cell>
+							<Table.Cell
+								class="text-right tabular-nums"
+								title="Active weights {m.active_gb.toFixed(1)} GB + KV cache {kvCacheGbForRow(m).toFixed(1)} GB (at {effectiveCtxForRow(m).toLocaleString()} ctx) + ~{COMPUTE_BUFFER_FUDGE_GB} GB compute buffer"
+							>
+								{estTotalGbForRow(m).toFixed(1)} GB
+							</Table.Cell>
 							<Table.Cell class="text-right tabular-nums">{m.total_gb.toFixed(1)} GB</Table.Cell>
 							<Table.Cell class="text-right tabular-nums">{m.ugi_score.toFixed(1)}</Table.Cell>
 							<Table.Cell class="text-center tabular-nums">{m.willingness.toFixed(1)}</Table.Cell>
@@ -949,9 +1016,6 @@
 														<Loader2 class="h-3.5 w-3.5 animate-spin" />
 													</Button>
 												{:else if state.phase === 'unloaded'}
-													{@const headroomGb = hardware
-														? Math.max(0, (hardware.vram_free_gb - m.active_gb) * 0.5)
-														: null}
 													<Button
 														size="icon-sm"
 														variant="outline"
@@ -961,20 +1025,6 @@
 													>
 														<Download class="h-3.5 w-3.5 text-blue-600 dark:text-blue-400" />
 													</Button>
-													<select
-														class="h-8 rounded-md border bg-background px-1.5 text-xs"
-														value={ctxSizeChoice[id] ?? DEFAULT_CTX}
-														onchange={(e) =>
-															(ctxSizeChoice[id] = Number((e.target as HTMLSelectElement).value))}
-														disabled={busy}
-														title={headroomGb !== null
-															? `Context size for this load only (not saved - pick again next time). ~${headroomGb.toFixed(1)} GB free for context/compute at current free VRAM, the other half of what's left after this model's ~${m.active_gb.toFixed(1)} GB active footprint (moe-stream-cache gets the rest). Pick more than that and auto-fit trims it down at load instead of failing.`
-															: 'Context size for this load only - not saved, pick again next time'}
-													>
-														{#each CTX_SIZE_OPTIONS as opt}
-															<option value={opt}>{opt >= 1024 ? `${opt / 1024}K` : opt} ctx</option>
-														{/each}
-													</select>
 													<Button
 														size="icon-sm"
 														variant="default"
@@ -1036,6 +1086,27 @@
 												<span class="block w-28 text-[10px] whitespace-normal break-words text-destructive" title={state.reason}>
 													{state.reason}
 												</span>
+											{:else if state?.phase === 'unloaded' || state?.phase === 'loaded'}
+												<div class="flex flex-col gap-0.5">
+													<select
+														class="w-24 rounded border bg-background text-[10px] leading-tight"
+														value={effectiveCtxForRow(m)}
+														onchange={(e) => {
+															ctxOverride = {
+																...ctxOverride,
+																[id]: Number((e.target as HTMLSelectElement).value)
+															};
+														}}
+														title="Context size for the next Load - does not affect an already-loaded instance"
+													>
+														{#each CTX_SIZE_OPTIONS as opt (opt)}
+															<option value={opt}>{opt.toLocaleString()} ctx</option>
+														{/each}
+													</select>
+													{#if state.phase === 'loaded'}
+														<span class="text-[10px] text-muted-foreground">Adjusting context requires reload</span>
+													{/if}
+												</div>
 											{/if}
 										</div>
 									{/if}

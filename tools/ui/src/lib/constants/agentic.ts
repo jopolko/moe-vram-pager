@@ -6,7 +6,7 @@ export const NEWLINE_SEPARATOR = '\n';
 
 export const DEFAULT_AGENTIC_CONFIG: AgenticConfig = {
 	enabled: true,
-	maxTurns: 100,
+	maxTurns: 0, // 0 = unlimited, see agentic.svelte.ts getConfig()
 	maxToolPreviewLines: 25
 } as const;
 

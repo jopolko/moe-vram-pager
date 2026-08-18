@@ -273,7 +273,10 @@ export class ChatService {
 
 		requestBody.chat_template_kwargs = {
 			...(requestBody.chat_template_kwargs ?? {}),
-			enable_thinking: enableThinking
+			enable_thinking: enableThinking,
+			// also send reasoning_effort for templates that key off it instead of enable_thinking
+			// (e.g. gpt-oss/harmony's low/medium/high); unrecognized kwargs are ignored by other templates
+			...(enableThinking && reasoningEffort ? { reasoning_effort: reasoningEffort } : {})
 		};
 
 		if (reasoningBudgetTokens >= 0) {

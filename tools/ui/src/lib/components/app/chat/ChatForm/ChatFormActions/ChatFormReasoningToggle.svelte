@@ -4,12 +4,13 @@
 	import * as Tooltip from '$lib/components/ui/tooltip';
 	import { ReasoningEffort, MessageRole } from '$lib/enums';
 	import { REASONING_EFFORT_TOKENS } from '$lib/constants/reasoning-effort-tokens';
-	import { REASONING_EFFORT_LEVELS } from '$lib/constants/reasoning-effort';
+	import { REASONING_EFFORT_LEVELS, REASONING_EFFORT_LEVELS_HARMONY } from '$lib/constants/reasoning-effort';
 	import type { ReasoningEffortLevel } from '$lib/types';
 	import {
 		modelsStore,
 		checkModelSupportsThinking,
 		supportsThinking,
+		reasoningEffortStyle,
 		propsCacheVersion,
 		loadedModelIds
 	} from '$lib/stores/models.svelte';
@@ -18,7 +19,18 @@
 	import { isRouterMode } from '$lib/stores/server.svelte';
 	import type { DatabaseMessage } from '$lib/types/database';
 
-	let thinkingEnabled = $derived(conversationsStore.getThinkingEnabled());
+	// 'levels' models (gpt-oss/harmony) always reason and only offer low/medium/high - no off.
+	let effortStyle = $derived.by(() => {
+		loadedModelIds();
+		propsCacheVersion();
+		return reasoningEffortStyle();
+	});
+	let levels = $derived(
+		effortStyle === 'levels' ? REASONING_EFFORT_LEVELS_HARMONY : REASONING_EFFORT_LEVELS
+	);
+	let thinkingEnabled = $derived(
+		effortStyle === 'levels' ? true : conversationsStore.getThinkingEnabled()
+	);
 	let currentEffort = $derived(conversationsStore.getReasoningEffort());
 	let isOff = $derived(!thinkingEnabled);
 	let tooltipText = $derived(thinkingEnabled ? `${currentEffort} Reasoning` : 'Disabled Reasoning');
@@ -105,7 +117,7 @@
 		>
 			<div class="mb-2 px-2.5 text-sm font-medium">Reasoning effort</div>
 
-			{#each REASONING_EFFORT_LEVELS as level (level.value)}
+			{#each levels as level (level.value)}
 				<button
 					type="button"
 					class="flex w-full cursor-pointer items-center gap-2 rounded-lg px-2.5 py-2 text-left text-sm transition-colors hover:bg-accent"

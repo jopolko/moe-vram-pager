@@ -1559,6 +1559,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.moe_stream_direct     = params.moe_stream_direct;
     mparams.moe_stream_cpu_cache  = params.moe_stream_cpu_cache;
     mparams.moe_stream_prefetch   = params.moe_stream_prefetch;
+    mparams.moe_stream_ram_cache  = params.moe_stream_ram_cache;
 
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;

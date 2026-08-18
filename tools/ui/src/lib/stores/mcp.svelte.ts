@@ -597,15 +597,13 @@ class MCPStore {
 	}
 
 	/**
-	 * MCP servers selectable in chat-add UIs and the settings page:
-	 * enabled in settings and either non-recommended or explicitly opted in.
+	 * MCP servers selectable in chat-add UIs and the settings page: enabled
+	 * in settings. Recommended servers behave like any other configured
+	 * server here once added; per-conversation enablement is still gated
+	 * separately by conversationsStore's per-chat overrides.
 	 */
 	get visibleMcpServers(): MCPServerSettingsEntry[] {
-		const optedIn = this.optedInRecommendationIds;
-		return this.getServersSorted().filter(
-			(server) =>
-				server.enabled && (!RECOMMENDED_MCP_SERVER_IDS.has(server.id) || optedIn.has(server.id))
-		);
+		return this.getServersSorted().filter((server) => server.enabled);
 	}
 
 	async ensureInitialized(perChatOverrides?: McpServerOverride[]): Promise<boolean> {

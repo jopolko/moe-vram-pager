@@ -4,10 +4,15 @@
 	import { mcpStore } from '$lib/stores/mcp.svelte';
 	import { conversationsStore } from '$lib/stores/conversations.svelte';
 	import { toolsStore } from '$lib/stores/tools.svelte';
-	import { ActionIcon, McpServerCard, McpServerCardSkeleton } from '$lib/components/app';
+	import {
+		ActionIcon,
+		McpServerCard,
+		McpServerCardSkeleton,
+		McpServerCardCompact
+	} from '$lib/components/app';
 	import { DialogMcpServerAddNew } from '$lib/components/app/dialogs';
 	import { HealthCheckStatus } from '$lib/enums';
-	import { ROUTES } from '$lib/constants';
+	import { ROUTES, RECOMMENDED_MCP_SERVERS } from '$lib/constants';
 	import { fade } from 'svelte/transition';
 	import { onMount } from 'svelte';
 	import McpLogo from '../mcp/McpLogo.svelte';
@@ -23,8 +28,28 @@
 
 	let servers = $derived(mcpStore.visibleMcpServers);
 
+	let addedServerIds = $derived(new Set(servers.map((server) => server.id)));
+	let quickAddServers = $derived(
+		RECOMMENDED_MCP_SERVERS.filter((server) => !addedServerIds.has(server.id))
+	);
+
 	let initialLoadComplete = $state(false);
 	let isAddingServer = $state(false);
+
+	function quickAddServer(server: (typeof RECOMMENDED_MCP_SERVERS)[number]) {
+		const existing = mcpStore.getServerById(server.id);
+		if (existing) {
+			mcpStore.updateServer(server.id, { enabled: true });
+		} else {
+			mcpStore.addServer({
+				id: server.id,
+				enabled: true,
+				url: server.url,
+				name: server.name
+			});
+		}
+		conversationsStore.setMcpServerOverride(server.id, true);
+	}
 
 	let previousRouteId = $state<string | null>(null);
 
@@ -106,6 +131,25 @@
 		{#if servers.length === 0 && !isAddingServer}
 			<div class="rounded-md border border-dashed p-4 text-sm text-muted-foreground">
 				No MCP Servers configured yet. Add one to enable agentic features.
+			</div>
+		{/if}
+
+		{#if quickAddServers.length > 0}
+			<div class="grid gap-3">
+				<h2 class="text-sm font-semibold text-muted-foreground">Quick add</h2>
+
+				<div
+					class="grid gap-3"
+					style="grid-template-columns: repeat(auto-fill, minmax(min(32rem, calc(100dvw - 2rem)), 1fr));"
+				>
+					{#each quickAddServers as server (server.id)}
+						<McpServerCardCompact
+							{server}
+							enabled={false}
+							onToggle={() => quickAddServer(server)}
+						/>
+					{/each}
+				</div>
 			</div>
 		{/if}
 

@@ -54,7 +54,7 @@ export const APPLE_ASSETS = {
 export const PWA_MANIFEST = {
 	name: APP_NAME,
 	short_name: APP_NAME,
-	description: 'Local AI chat interface powered by llama.cpp',
+	description: "Run MoE models that don't fit in your VRAM. Automatically matched with your hardware",
 	start_url: './',
 	display: 'standalone' as const,
 	background_color: THEME_COLORS.BACKGROUND_LIGHT,

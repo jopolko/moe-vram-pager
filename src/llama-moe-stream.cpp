@@ -138,7 +138,8 @@ bool llama_moe_stream_layer::matches(const ggml_tensor * gate, const ggml_tensor
 }
 
 // sizes the per-layer table and clamps the I/O thread count; workers are spawned lazily on first use
-llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n_io_threads, bool direct, uint32_t prefetch_top_k)
+llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n_io_threads, bool direct,
+                                    uint32_t prefetch_top_k, size_t ram_cache_bytes)
         : n_slots(n_slots), prefetch_top_k(prefetch_top_k) {
     layers.resize(n_layer);
 
@@ -147,6 +148,52 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
 
     debug         = std::getenv("LLAMA_MOE_STREAM_DEBUG") != nullptr;
     use_direct_io = direct;
+
+    if (ram_cache_bytes > 0) {
+        ram_cache = std::make_unique<llama_moe_ram_cache>(ram_cache_bytes);
+    }
+}
+
+bool llama_moe_ram_cache::try_get(uint64_t key, uint8_t * dst, size_t len) {
+    std::lock_guard<std::mutex> lock(mtx);
+    auto it = map.find(key);
+    if (it == map.end() || it->second.data.size() != len) {
+        stats.n_miss++;
+        return false;
+    }
+    std::memcpy(dst, it->second.data.data(), len);
+    lru.erase(it->second.lru_it);
+    lru.push_front(key);
+    it->second.lru_it = lru.begin();
+    stats.n_hit++;
+    return true;
+}
+
+void llama_moe_ram_cache::put(uint64_t key, const uint8_t * data, size_t len) {
+    if (len > capacity) {
+        return; // a single slab bigger than the whole cache can never fit
+    }
+    std::lock_guard<std::mutex> lock(mtx);
+    auto it = map.find(key);
+    if (it != map.end()) {
+        // already cached (e.g. a racing worker beat us to the same miss) - just refresh LRU order
+        lru.erase(it->second.lru_it);
+        lru.push_front(key);
+        it->second.lru_it = lru.begin();
+        return;
+    }
+    while (used + len > capacity && !lru.empty()) {
+        const uint64_t victim = lru.back();
+        lru.pop_back();
+        auto vit = map.find(victim);
+        if (vit != map.end()) {
+            used -= vit->second.data.size();
+            map.erase(vit);
+        }
+    }
+    lru.push_front(key);
+    map.emplace(key, entry{std::vector<uint8_t>(data, data + len), lru.begin()});
+    used += len;
 }
 
 // stop and join the I/O workers before the cache buffers and files they use are destroyed
@@ -358,10 +405,22 @@ void llama_moe_stream::worker_loop(bool demand_only) {
 
         bool ok = true;
         for (const auto & wt : sl.weights) {
-            const uint8_t * data = llama_moe_stream_pread(*files[wt.file_idx], staging, wt.nb_expert, wt.offs + (size_t) w.expert*wt.nb_expert, use_direct_io);
-            if (data == nullptr) {
-                ok = false;
-                break;
+            const size_t   file_offs = wt.offs + (size_t) w.expert*wt.nb_expert;
+            // file_idx (16 bits) in the high bits, offset (realistically << 2^48) in the low bits
+            const uint64_t cache_key = (((uint64_t) wt.file_idx) << 48) ^ (uint64_t) file_offs;
+
+            const uint8_t * data = nullptr;
+            if (ram_cache && ram_cache->try_get(cache_key, staging, wt.nb_expert)) {
+                data = staging;
+            } else {
+                data = llama_moe_stream_pread(*files[wt.file_idx], staging, wt.nb_expert, file_offs, use_direct_io);
+                if (data == nullptr) {
+                    ok = false;
+                    break;
+                }
+                if (ram_cache) {
+                    ram_cache->put(cache_key, data, wt.nb_expert);
+                }
             }
             ggml_backend_tensor_set(wt.cache, data, (size_t) w.slot*wt.nb_expert, wt.nb_expert);
         }
@@ -508,6 +567,12 @@ void llama_moe_stream::print_stats() const {
     if (prefetch_top_k > 0) {
         LLAMA_LOG_INFO("%s: moe stream: decode prefetch: top-%u, %" PRId64 " speculative loads issued\n",
                 __func__, prefetch_top_k, stats.n_prefetch_issued);
+    }
+    if (ram_cache) {
+        const int64_t n_ram = ram_cache->stats.n_hit + ram_cache->stats.n_miss;
+        LLAMA_LOG_INFO("%s: moe stream: ram cache: %.1f GiB budget, hits = %" PRId64 ", misses = %" PRId64 ", hit rate = %.2f%%\n",
+                __func__, ram_cache->capacity_bytes()/1073741824.0, ram_cache->stats.n_hit, ram_cache->stats.n_miss,
+                n_ram > 0 ? 100.0*ram_cache->stats.n_hit/n_ram : 0.0);
     }
 }
 

@@ -649,11 +649,12 @@ const SETTINGS_REGISTRY: Record<string, SettingsSectionEntry> = {
 			{
 				key: SETTINGS_KEYS.AGENTIC_MAX_TURNS,
 				label: 'Agentic turns',
-				help: 'Maximum number of tool execution cycles before stopping (prevents infinite loops).',
-				defaultValue: 10,
+				help: 'Maximum number of tool execution cycles before stopping. 0 = unlimited (no "Continue?" interruption).',
+				defaultValue: 0,
 				type: SettingsFieldType.INPUT,
 				section: SETTINGS_SECTION_SLUGS.AGENTIC,
 				isPositiveInteger: true,
+				allowZero: true,
 				sync: {
 					serverKey: SETTINGS_KEYS.AGENTIC_MAX_TURNS,
 					paramType: SyncableParameterType.NUMBER

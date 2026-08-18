@@ -1,4 +1,4 @@
-import { Cpu, Search, Settings, SquarePen } from '@lucide/svelte';
+import { Cpu, Search, Settings, ShieldAlert, SquarePen } from '@lucide/svelte';
 import McpLogo from '$lib/components/app/mcp/McpLogo.svelte';
 import type { Component } from 'svelte';
 import { ROUTES } from './routes';
@@ -33,6 +33,12 @@ export const SIDEBAR_ACTIONS_ITEMS: DesktopIconStripItem[] = [
 		tooltip: 'Models',
 		route: ROUTES.MODELS,
 		activeRouteId: '/models'
+	},
+	{
+		icon: ShieldAlert,
+		tooltip: 'Pentest',
+		route: ROUTES.PENTEST,
+		activeRouteId: '/pentest'
 	},
 	{
 		icon: Settings,

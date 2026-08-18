@@ -1518,6 +1518,8 @@ private:
             // 2. The chat template supports it
             const bool template_supports_thinking = params_base.use_jinja && common_chat_templates_support_enable_thinking(chat_templates.get());
             const bool enable_thinking = params_base.enable_reasoning != 0 && template_supports_thinking;
+            const bool template_supports_reasoning_effort = params_base.use_jinja && common_chat_templates_support_reasoning_effort(chat_templates.get());
+            const bool supports_reasoning_effort = params_base.enable_reasoning != 0 && template_supports_reasoning_effort;
             SRV_TRC("%s: chat template, thinking = %d\n", __func__, enable_thinking);
 
             // IMPORTANT: chat_params is reused across sleeping / resuming states,
@@ -1533,6 +1535,7 @@ private:
                 /* allow_audio           */ mctx ? mtmd_support_audio (mctx) : false,
                 /* allow_video           */ mctx ? mtmd_helper_support_video(mctx) : false,
                 /* enable_thinking       */ enable_thinking,
+                /* supports_reasoning_effort */ supports_reasoning_effort,
                 /* reasoning_budget      */ params_base.sampling.reasoning_budget_tokens,
                 /* reasoning_budget_msg  */ params_base.sampling.reasoning_budget_message,
                 /* media_path            */ params_base.media_path,
@@ -2460,6 +2463,28 @@ private:
                 {
                     auto res = std::make_unique<server_task_result_control>();
                     res->id = task.id;
+
+                    if (task.params.control_action == "cancel_active") {
+                        // Doesn't target a specific completion id - a caller that killed its
+                        // own client process (e.g. a stopped pentest_agent.py run) never got
+                        // to learn the id of the request it made, and by the time it can act
+                        // that client connection is already gone anyway. Just release whatever
+                        // is currently mid-generation so the GPU stops burning cycles on a
+                        // response nobody is waiting on, same as the normal disconnect-cancel
+                        // path but without waiting on httplib's polling interval to notice.
+                        int n_released = 0;
+                        for (auto & slot : slots) {
+                            if (slot.is_processing()) {
+                                SRV_WRN("cancel_active: releasing slot %d mid generation\n", slot.id);
+                                slot.release();
+                                n_released++;
+                            }
+                        }
+                        res->success = true;
+                        res->message = "released " + std::to_string(n_released) + " active slot(s)";
+                        queue_results.send(std::move(res));
+                        break;
+                    }
 
                     server_slot * slot = get_slot_by_cmpl_id(task.params.control_cmpl_id);
                     if (slot == nullptr) {
@@ -4590,6 +4615,9 @@ void server_routes::init_routes() {
             { "ui_settings",                 meta->json_ui_settings },
             { "chat_template",               tmpl_default },
             { "chat_template_caps",          meta->chat_template_caps },
+            { "reasoning_effort_style",      meta->chat_params.supports_reasoning_effort ? "levels"
+                                              : meta->chat_params.enable_thinking         ? "boolean"
+                                                                                           : "none" },
             { "bos_token",                   meta->bos_token_str },
             { "eos_token",                   meta->eos_token_str },
             { "build_info",                  meta->build_info },
@@ -4745,11 +4773,11 @@ void server_routes::init_routes() {
 
         const std::string cmpl_id = json_value(body, "id", std::string());
         const std::string action  = json_value(body, "action", std::string());
-        if (cmpl_id.empty()) {
+        if (action != "cancel_active" && cmpl_id.empty()) {
             res->error(format_error_response("missing completion id", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
-        if (action != "reasoning_end") {
+        if (action != "reasoning_end" && action != "cancel_active") {
             res->error(format_error_response("unknown control action", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }

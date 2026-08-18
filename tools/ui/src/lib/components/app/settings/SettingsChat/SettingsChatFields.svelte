@@ -80,7 +80,9 @@
 				<Input
 					id={field.key}
 					type={field.isPositiveInteger ? 'number' : 'text'}
-					{...field.isPositiveInteger ? { min: '1', step: '1' } : {}}
+					{...field.isPositiveInteger
+						? { min: field.allowZero ? '0' : '1', step: '1' }
+						: {}}
 					value={currentValue}
 					oninput={(e) => {
 						// Update local config immediately for real-time badge feedback

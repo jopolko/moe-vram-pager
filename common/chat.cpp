@@ -367,6 +367,20 @@ bool common_chat_templates_support_enable_thinking(const common_chat_templates *
     return params.supports_thinking;
 }
 
+bool common_chat_templates_support_reasoning_effort(const common_chat_templates * chat_templates) {
+    common_chat_templates_inputs inputs;
+    common_chat_msg msg;
+    msg.role    = "user";
+    msg.content = "test";
+    inputs.messages = { msg };
+    inputs.enable_thinking = true;
+    inputs.add_generation_prompt = true;
+    inputs.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+
+    auto params = common_chat_templates_apply(chat_templates, inputs);
+    return params.supports_reasoning_effort;
+}
+
 std::vector<common_chat_msg> common_chat_msgs_parse_oaicompat(const json & messages) {
     std::vector<common_chat_msg> msgs;
 
@@ -1147,6 +1161,7 @@ static common_chat_params common_chat_params_init_gpt_oss(const common_chat_temp
 
     data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
     data.supports_thinking = true;
+    data.supports_reasoning_effort = true;
 
     // These special tokens are required to parse properly, so we include them
     // even if parse_tool_calls is false.

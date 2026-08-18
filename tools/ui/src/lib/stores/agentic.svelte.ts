@@ -279,7 +279,13 @@ class AgenticStore {
 	}
 
 	getConfig(settings: SettingsConfigType, perChatOverrides?: McpServerOverride[]): AgenticConfig {
-		const maxTurns = Number(settings.agenticMaxTurns) || DEFAULT_AGENTIC_CONFIG.maxTurns;
+		// 0 means "unlimited" and must survive here - `Number(x) || default` would
+		// treat 0 as falsy and silently replace it with the default turn cap.
+		const rawMaxTurns = settings.agenticMaxTurns;
+		const maxTurns =
+			rawMaxTurns === undefined || rawMaxTurns === null || rawMaxTurns === ''
+				? DEFAULT_AGENTIC_CONFIG.maxTurns
+				: Number(rawMaxTurns);
 		const maxToolPreviewLines =
 			Number(settings.agenticMaxToolPreviewLines) || DEFAULT_AGENTIC_CONFIG.maxToolPreviewLines;
 		const hasTools =
@@ -516,7 +522,7 @@ class AgenticStore {
 
 		let turn = 0;
 		while (true) {
-			if (turn >= maxTurns) {
+			if (maxTurns > 0 && turn >= maxTurns) {
 				// Turn limit reached - ask user whether to continue
 				const shouldContinue = await this.requestContinue(conversationId, signal);
 

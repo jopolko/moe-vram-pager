@@ -29,6 +29,8 @@ export interface SettingsEntry {
 	options?: Array<{ value: string; label: string; icon: Component }>;
 	isExperimental?: boolean;
 	isPositiveInteger?: boolean;
+	/** Allow 0 as a valid value for isPositiveInteger fields (e.g. "0 = unlimited"). */
+	allowZero?: boolean;
 	sync?: {
 		serverKey: string;
 		paramType: SyncableParameterType;
@@ -49,6 +51,7 @@ export interface SettingsFieldConfig {
 	type: SettingsFieldType;
 	isExperimental?: boolean;
 	isPositiveInteger?: boolean;
+	allowZero?: boolean;
 	help?: string;
 	options?: Array<{ value: string; label: string; icon?: typeof Icon }>;
 }

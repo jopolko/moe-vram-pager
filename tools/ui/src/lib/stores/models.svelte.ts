@@ -296,6 +296,35 @@ class ModelsStore {
 	}
 
 	/**
+	 * How the selected model's chat template supports reasoning control.
+	 * Reads the server-computed `reasoning_effort_style` from /props ('levels' for
+	 * gpt-oss/harmony-style templates, 'boolean' for Qwen3/DeepSeek-style, 'none' for
+	 * templates with no reasoning support). Falls back to the regex-based heuristic
+	 * (boolean-only) for older servers that don't send the field yet.
+	 */
+	get reasoningEffortStyle(): 'none' | 'boolean' | 'levels' {
+		const modelId = this.selectedModelName;
+		let props: ApiLlamaCppServerProps | null;
+
+		if (!modelId) {
+			if (isRouterMode()) {
+				return 'none';
+			}
+			props = serverStore.props ?? null;
+		} else {
+			if (isRouterMode() && !this.modelPropsCache.get(modelId)) {
+				this.fetchModelProps(modelId);
+			}
+			props = this.getModelProps(modelId);
+		}
+
+		if (props?.reasoning_effort_style) {
+			return props.reasoning_effort_style;
+		}
+		return detectThinkingSupport(props?.chat_template ?? '') ? 'boolean' : 'none';
+	}
+
+	/**
 	 *
 	 *
 	 * Data Fetching
@@ -1031,3 +1060,4 @@ export const supportsThinking = () => modelsStore.supportsThinking;
 export const checkModelSupportsThinking = (modelId: string) =>
 	modelsStore.checkModelSupportsThinking(modelId);
 export const thinkingSupportDetails = () => modelsStore.thinkingSupportDetails;
+export const reasoningEffortStyle = () => modelsStore.reasoningEffortStyle;

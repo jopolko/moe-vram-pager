@@ -214,6 +214,10 @@ public:
         server_child_mode mode = SERVER_CHILD_MODE_NORMAL;
         // used for spawning a downloading child process
         std::optional<server_model_meta> custom_meta = std::nullopt;
+        // Which env var the download child's model spec is passed through as - LLAMA_ARG_HF_REPO
+        // (default, curated-list downloads) vs. LLAMA_ARG_MODEL/LLAMA_ARG_MODEL_URL for an ad-hoc
+        // local-file/direct-URL GGUF assessed via /model-picker/assess-gguf.
+        std::string download_source_env = "LLAMA_ARG_HF_REPO";
         // one-off launch-arg overrides (env-style keys, e.g. "LLAMA_ARG_CTX_SIZE") applied to
         // this instance only - not written back to the persisted preset, so the next load (or a
         // router restart) reverts to whatever's actually saved. Lets the context size for a
@@ -237,7 +241,7 @@ public:
     // update the status of a model instance (thread-safe)
     // also send SSE notification to /models/sse endpoint
     void update_status(const std::string & name, const update_status_args & args);
-    void update_download_progress(const std::string & name, const common_download_progress & progress, bool done, bool ok = true, const std::string & reason = "");
+    void update_download_progress(const std::string & name, const common_download_progress & progress, bool done, bool ok = true, const std::string & reason = "", bool silent = false);
 
     // remove a cache model from disk and update the list (thread-safe)
     // note: only cache models can be removed; returns false if the model doesn't exist or is not a cache model
@@ -248,6 +252,11 @@ public:
     // return when the model no longer in "loading" state
     void wait(const std::string & name, std::function<bool(const server_model_meta &)> predicate);
     void wait(std::unique_lock<std::mutex> & lk, const std::string & name, std::function<bool(const server_model_meta &)> predicate);
+
+    // same as wait(), but bounded - returns true if predicate became true within timeout_seconds,
+    // false if it timed out (in which case the model may still be in its prior state). Used by
+    // cancel/stop paths so a child that never reports back can't hang the request forever.
+    bool wait_for(std::unique_lock<std::mutex> & lk, const std::string & name, std::function<bool(const server_model_meta &)> predicate, int timeout_seconds);
 
     // ensure the model is in ready state (thread-safe)
     // return false if model is ready

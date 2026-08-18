@@ -906,7 +906,7 @@ void server_models::load(const std::string & name, const load_options & opts) {
         if (opts.mode == SERVER_CHILD_MODE_DOWNLOAD) {
             inst.meta.status = SERVER_MODEL_STATUS_DOWNLOADING;
             child_env.push_back("LLAMA_SERVER_CHILD_MODE=download");
-            child_env.push_back("LLAMA_ARG_HF_REPO=" + name);
+            child_env.push_back(opts.download_source_env + "=" + name);
         }
 
         SRV_INF("%s", "spawning server instance with args:\n");
@@ -1018,7 +1018,27 @@ void server_models::load(const std::string & name, const load_options & opts) {
 
         // update status and exit code
         if (child_mode == SERVER_CHILD_MODE_DOWNLOAD) {
-            // instance will be cleaned up on next load_models() call
+            // Normally handle_child_state() already moved status off DOWNLOADING when the child
+            // reported its terminal "download_finished"/"download_failed"/"download_cancelled"
+            // state (see update_download_progress(..., done=true, ...)), so there is nothing left
+            // to do here - the instance just gets cleaned up on the next load_models() call.
+            //
+            // But if the child dies before it gets a chance to send that message - killed via
+            // terminate() (force-cancel), crashed, or the download loop returned via a path that
+            // skipped notify_to_router - status is still DOWNLOADING at this point. Nobody else
+            // will ever move it off that: this is the last place remove()/unload()'s wait() for a
+            // status change will hear about the exit, and if it never fires their callers block
+            // forever (which is what a stuck Stop/Cancel button looked like in practice).
+            // Force a terminal status here as a safety net so those waiters always unblock.
+            std::lock_guard<std::mutex> lk(this->mutex);
+            auto it = mapping.find(name);
+            if (it != mapping.end() && it->second.meta.status == SERVER_MODEL_STATUS_DOWNLOADING) {
+                SRV_WRN("download child for name=%s exited without reporting a terminal state "
+                        "(exit_code=%d) - forcing status to downloaded so pending Stop/Cancel "
+                        "requests don't hang\n", name.c_str(), exit_code);
+                it->second.meta.status = SERVER_MODEL_STATUS_DOWNLOADED;
+                cv.notify_all();
+            }
         } else {
             this->update_status(name, {
                 SERVER_MODEL_STATUS_UNLOADED,
@@ -1049,17 +1069,34 @@ void server_models::load(const std::string & name, const load_options & opts) {
     cv.notify_all();
 }
 
+// Ask a downloading child to exit and wait up to DEFAULT_STOP_TIMEOUT seconds for it to
+// acknowledge (status leaving DOWNLOADING). request_exit() is cooperative - it writes an exit
+// command to the child's stdin and relies on the download loop noticing between chunks/attempts,
+// which is normally fast but is only bounded by the HTTP client's read timeout, not instant. If
+// the child hasn't budged by the time this returns, force-kill it directly instead of leaving the
+// caller (remove()/unload(), both of which wait() on this same status change) blocked
+// indefinitely - that indefinite block is what a "Cancel" button doing nothing looked like.
+static void cancel_download(server_models & models, std::unique_lock<std::mutex> & lk,
+                             const std::string & name, server_subproc * subproc) {
+    subproc->request_exit();
+    bool acknowledged = models.wait_for(lk, name, [](const server_model_meta & meta) {
+        return meta.status != SERVER_MODEL_STATUS_DOWNLOADING;
+    }, DEFAULT_STOP_TIMEOUT);
+    if (!acknowledged) {
+        SRV_WRN("download child for name=%s did not respond to cancel within %ds, force-killing\n",
+                name.c_str(), DEFAULT_STOP_TIMEOUT);
+        subproc->terminate();
+    }
+}
+
 void server_models::unload(const std::string & name) {
     std::unique_lock<std::mutex> lk(mutex);
     auto it = mapping.find(name);
     if (it != mapping.end()) {
         if (it->second.meta.status == SERVER_MODEL_STATUS_DOWNLOADING) {
             SRV_INF("cancelling download for model name=%s\n", name.c_str());
-            it->second.subproc->request_exit();
             // for convenience, we wait the status change here
-            wait(lk, name, [](const server_model_meta & new_meta) {
-                return new_meta.status != SERVER_MODEL_STATUS_DOWNLOADING;
-            });
+            cancel_download(*this, lk, name, it->second.subproc.get());
         } else if (it->second.meta.is_running()) {
             SRV_INF("stopping model instance name=%s\n", name.c_str());
             stopping_models.insert(name);
@@ -1135,7 +1172,7 @@ void server_models::update_status(const std::string & name, const update_status_
     cv.notify_all();
 }
 
-void server_models::update_download_progress(const std::string & name, const common_download_progress & progress, bool done, bool ok, const std::string & reason) {
+void server_models::update_download_progress(const std::string & name, const common_download_progress & progress, bool done, bool ok, const std::string & reason, bool silent) {
     json curr;
     {
         std::lock_guard<std::mutex> lk(mutex);
@@ -1160,8 +1197,13 @@ void server_models::update_download_progress(const std::string & name, const com
     }
     if (done) {
         cv.notify_all(); // notify in case unload() is waiting for download to be cancelled
-        notify_sse(ok ? "download_finished" : "download_failed", name,
-                   ok || reason.empty() ? json{} : json{{"reason", reason}});
+        // silent: a user-requested cancel, not a real failure - the follow-up "model_remove"
+        // event (fired by remove() right after this unblocks its wait) is all the frontend
+        // needs to drop the row, no "download_failed" toast/reason to show for it.
+        if (!silent) {
+            notify_sse(ok ? "download_finished" : "download_failed", name,
+                       ok || reason.empty() ? json{} : json{{"reason", reason}});
+        }
     } else {
         notify_sse("download_progress", name, curr);
     }
@@ -1185,7 +1227,11 @@ bool server_models::remove(const std::string & name) {
         // the cache-removal path below.
         if (it->second.meta.status == SERVER_MODEL_STATUS_DOWNLOADING) {
             SRV_INF("cancelling download for model name=%s\n", name.c_str());
-            it->second.subproc->request_exit();
+            cancel_download(*this, lk, name, it->second.subproc.get());
+            it = mapping.find(name); // cancel_download() released/reacquired the lock
+            if (it == mapping.end()) {
+                throw std::runtime_error("model name=" + name + " disappeared while cancelling download");
+            }
         } else if (it->second.meta.is_running()) {
             SRV_INF("stopping model instance name=%s\n", name.c_str());
             stopping_models.insert(name);
@@ -1214,7 +1260,7 @@ bool server_models::remove(const std::string & name) {
     if (it->second.meta.status == SERVER_MODEL_STATUS_DOWNLOADING) {
         // cancel in-flight download
         SRV_INF("cancelling download for model name=%s\n", name.c_str());
-        it->second.subproc->request_exit();
+        cancel_download(*this, lk, name, it->second.subproc.get());
     } else if (it->second.meta.is_running()) {
         // stop running instance
         SRV_INF("stopping model instance name=%s\n", name.c_str());
@@ -1273,6 +1319,16 @@ void server_models::wait(std::unique_lock<std::mutex> & lk, const std::string & 
         }
         // model was removed from mapping by another code path (e.g. load_models()).
         // nothing left to wait for - tell the caller to proceed.
+        return true;
+    });
+}
+
+bool server_models::wait_for(std::unique_lock<std::mutex> & lk, const std::string & name, std::function<bool(const server_model_meta &)> predicate, int timeout_seconds) {
+    return cv.wait_for(lk, std::chrono::seconds(timeout_seconds), [this, &name, &predicate]() {
+        auto it = mapping.find(name);
+        if (it != mapping.end()) {
+            return predicate(it->second.meta);
+        }
         return true;
     });
 }
@@ -1375,6 +1431,9 @@ void server_models::handle_child_state(const std::string & name, const std::stri
                 } else if (result == "download_failed") {
                     std::string reason = json_value(payload, "reason", std::string());
                     update_download_progress(name, {}, true, false, reason);
+                    request_exit();
+                } else if (result == "download_cancelled") {
+                    update_download_progress(name, {}, true, false, "", /* silent */ true);
                     request_exit();
                 } else if (!url.empty()) {
                     common_download_progress p;
@@ -1496,8 +1555,12 @@ int server_child::run_download(common_params & params) {
 
     bool ok = dl.run(params);
 
+    // a stop requested by the router (user clicked cancel/delete) aborts the in-flight
+    // transfer, which surfaces as a generic curl/HTTP error same as a real failure - tell
+    // the router apart so it doesn't report a cancel as a download error.
+    std::string result = ok ? "download_finished" : dl.should_stop() ? "download_cancelled" : "download_failed";
     notify_to_router(server_state_to_str(SERVER_STATE_DOWNLOADING), {
-        {"result", ok ? "download_finished" : "download_failed"},
+        {"result", result},
         {"reason", dl.error_reason},
     });
 
@@ -1872,9 +1935,19 @@ void server_models_routes::init_routes() {
         if (name.empty()) {
             throw std::invalid_argument("model must be a non-empty string");
         }
+        // "hf" (default) keeps `name` as an HF repo[:tag], same as always. "local"/"url" are
+        // for ad-hoc GGUFs assessed via /model-picker/assess-gguf, not in the curated UGI list -
+        // there `name` is the local path or direct URL itself, and doubles as the model's key.
+        std::string source = json_value(body, "source", std::string("hf"));
 
         common_params p;
-        p.model.hf_repo  = name;
+        if (source == "local") {
+            p.model.path = name;
+        } else if (source == "url") {
+            p.model.url = name;
+        } else {
+            p.model.hf_repo = name;
+        }
         p.hf_token       = params.hf_token;
 
         // validate by fetching metadata
@@ -1919,6 +1992,11 @@ void server_models_routes::init_routes() {
             load_opts.custom_meta = server_model_meta{};
             load_opts.custom_meta->source = SERVER_MODEL_SOURCE_CACHE;
             load_opts.custom_meta->name   = name;
+            if (source == "local") {
+                load_opts.download_source_env = "LLAMA_ARG_MODEL";
+            } else if (source == "url") {
+                load_opts.download_source_env = "LLAMA_ARG_MODEL_URL";
+            }
             models.load(name, load_opts);
         }
 

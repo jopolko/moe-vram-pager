@@ -7,6 +7,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -107,6 +108,41 @@ struct llama_moe_stream_layer {
                  const ggml_tensor * down, const ggml_tensor * gate_up) const;
 };
 
+// second-tier host-RAM cache for evicted experts, keyed by (file_idx, file offset). Independent
+// of the per-layer slot/generation state machine above - it is a plain content cache, not a
+// residency source of truth, so a worker thread consults it as a faster substitute for the file
+// read, nothing else changes. Absorbs re-reads of experts that cycle out of the (much smaller)
+// VRAM slot cache and back in, at RAM speed instead of an SSD seek+read.
+class llama_moe_ram_cache {
+public:
+    explicit llama_moe_ram_cache(size_t capacity_bytes) : capacity(capacity_bytes) {}
+
+    // true and copies len bytes into dst if key is cached; refreshes its LRU recency
+    bool try_get(uint64_t key, uint8_t * dst, size_t len);
+
+    // inserts (or refreshes) key -> [data, data+len), evicting LRU entries as needed to fit
+    void put(uint64_t key, const uint8_t * data, size_t len);
+
+    size_t capacity_bytes() const { return capacity; }
+
+    struct {
+        int64_t n_hit  = 0;
+        int64_t n_miss = 0;
+    } stats;
+
+private:
+    struct entry {
+        std::vector<uint8_t>          data;
+        std::list<uint64_t>::iterator lru_it;
+    };
+
+    mutable std::mutex mtx;
+    size_t capacity = 0;
+    size_t used     = 0;
+    std::list<uint64_t>                     lru; // front = most recently used
+    std::unordered_map<uint64_t, entry> map;
+};
+
 // one queued expert load
 struct llama_moe_stream_work {
     llama_moe_stream_layer * sl = nullptr;
@@ -127,9 +163,12 @@ struct llama_moe_stream {
     uint32_t prefetch_top_k = 0; // 0 = disabled; else speculatively prefetch this many of the
                                   // next layer's hottest experts while this layer computes
 
+    std::unique_ptr<llama_moe_ram_cache> ram_cache; // second-tier host-RAM cache, nullptr = disabled
+
     std::vector<std::unique_ptr<llama_moe_stream_layer>> layers; // [n_layer], null = not streamed
 
-    llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n_io_threads, bool direct, uint32_t prefetch_top_k);
+    llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n_io_threads, bool direct,
+                      uint32_t prefetch_top_k, size_t ram_cache_bytes = 0);
     ~llama_moe_stream();
 
     llama_moe_stream_layer * layer(int32_t il) const {

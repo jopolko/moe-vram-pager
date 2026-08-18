@@ -245,6 +245,8 @@ export interface ApiLlamaCppServerProps {
 		video: boolean;
 	};
 	chat_template: string;
+	/** How the loaded model's chat template supports reasoning: 'levels' (low/medium/high, e.g. gpt-oss/harmony), 'boolean' (on/off, e.g. Qwen3/DeepSeek), or 'none'. */
+	reasoning_effort_style?: 'none' | 'boolean' | 'levels';
 	bos_token: string;
 	eos_token: string;
 	build_info: string;

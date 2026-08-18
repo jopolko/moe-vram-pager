@@ -294,6 +294,7 @@ struct server_chat_params {
     bool allow_audio;
     bool allow_video;
     bool enable_thinking = true;
+    bool supports_reasoning_effort = false; // template reads a low/medium/high "reasoning_effort" var (e.g. gpt-oss/harmony)
     int  reasoning_budget = -1;
     std::string reasoning_budget_message;
     std::string media_path;

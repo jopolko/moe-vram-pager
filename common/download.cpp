@@ -18,6 +18,7 @@
 #include <future>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <regex>
 #include <unordered_set>
 #include <string>
@@ -25,6 +26,11 @@
 #include <vector>
 
 #include "http.h"
+
+#if defined(__linux__)
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 #ifndef __EMSCRIPTEN__
 #ifdef __linux__
@@ -216,31 +222,79 @@ public:
 static constexpr uint64_t PARALLEL_DOWNLOAD_MIN_BYTES = 200ull * 1000 * 1000;
 static constexpr int      PARALLEL_DOWNLOAD_MAX_CHUNKS = 8;
 
+#if defined(__linux__)
+// Returns the byte ranges within [0, total) that `path` has NOT actually written yet, seeing
+// through a sparse pre-sized file via SEEK_DATA/SEEK_HOLE instead of trusting
+// std::filesystem::file_size() - which reports the full pre-stretched length regardless of how
+// much data is really there (see common_pull_file_parallel below). Returns std::nullopt if the
+// file can't be introspected this way (open failure, or a filesystem without SEEK_DATA/HOLE
+// support), in which case the caller must not assume anything about which bytes are real.
+static std::optional<std::vector<std::pair<uint64_t, uint64_t>>> sparse_file_holes(
+        const std::string & path, uint64_t total) {
+    int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) {
+        return std::nullopt;
+    }
+    std::vector<std::pair<uint64_t, uint64_t>> extents;
+    off_t pos = 0;
+    bool unsupported = false;
+    while ((uint64_t) pos < total) {
+        off_t data_start = ::lseek(fd, pos, SEEK_DATA);
+        if (data_start < 0) {
+            if (errno != ENXIO) {
+                unsupported = true; // SEEK_DATA/SEEK_HOLE not supported on this filesystem
+            }
+            break; // ENXIO here means "no more data before EOF" - the rest is a hole
+        }
+        off_t hole_start = ::lseek(fd, data_start, SEEK_HOLE);
+        if (hole_start < 0) {
+            hole_start = (off_t) total;
+        }
+        extents.emplace_back((uint64_t) data_start, (uint64_t) hole_start);
+        pos = hole_start;
+    }
+    ::close(fd);
+    if (unsupported) {
+        return std::nullopt;
+    }
+    std::vector<std::pair<uint64_t, uint64_t>> holes;
+    uint64_t prev_end = 0;
+    for (const auto & [s, e] : extents) {
+        if (s > prev_end) {
+            holes.emplace_back(prev_end, s);
+        }
+        prev_end = e;
+    }
+    if (prev_end < total) {
+        holes.emplace_back(prev_end, total);
+    }
+    return holes;
+}
+#endif
+
 // Downloads one file as several concurrent Range-request connections instead of a single
 // stream, each writing directly to its own byte offset in path_tmp (pre-sized to the full
 // length up front, via resize_file - a sparse file on any filesystem that supports one, so this
 // costs no more disk space than the existing single-connection path: same final file, same peak
 // size, no separate per-chunk temp files to merge afterward).
 //
-// Only called for a from-scratch download (p.downloaded == 0) of a large, range-capable file -
-// a resume of a partial single-stream temp file always falls back to the sequential path in
-// common_pull_file below, since tracking exactly which byte ranges of a resumed file are already
-// complete (vs. just sized-but-empty/sparse) adds real correctness risk for comparatively little
-// benefit on what's normally a one-time resume.
+// Called both for a from-scratch download and to resume one that got interrupted uncleanly
+// (process killed, host rebooted) rather than through this function's own normal failure exit.
+// A clean-looking leftover path_tmp already sized to the full total is exactly what a killed
+// parallel download leaves behind - on Linux this function re-opens it and uses
+// SEEK_DATA/SEEK_HOLE (sparse_file_holes() above) to find out which byte ranges are real vs.
+// still-unwritten holes, then fetches only the holes instead of redownloading bytes already on
+// disk. On a platform/filesystem without SEEK_DATA/SEEK_HOLE, or for a genuine (non-pre-sized)
+// single-stream partial file, this function declines and common_pull_file's caller falls back to
+// the sequential Range-continue path instead.
 static bool common_pull_file_parallel(const common_http_url & parts,
                                       const std::string & resolve_path,
                                       const std::string & path_tmp,
                                       common_download_progress & p,
                                       common_download_callback * callback) {
-    // resize_file pre-stretches path_tmp to its final length so every worker can seek straight
-    // to its offset - but that also makes the file's on-disk size lie about how much real data
-    // is in it (std::filesystem::file_size() reports the full stretched length even though most
-    // of it may still be an unwritten hole). common_download_file_single_online's retry loop
-    // trusts file_size() as "bytes already downloaded" to decide whether/where to resume, so any
-    // failure exit from this function - including the early ones below, before a single byte was
-    // requested - MUST remove path_tmp first. Leaving the stretched file behind would make the
-    // next attempt believe the download is already complete (or resumable from the very end)
-    // instead of starting clean.
+    // Only used for the pre-flight failures below, before a single byte of this attempt was
+    // written - path_tmp is genuinely worthless at that point, unlike a real partial transfer
+    // (see the "keep path_tmp for next attempt" comment further down).
     auto fail = [&](const char * reason) {
         LOG_WRN("%s: %s, falling back / retrying from scratch\n", __func__, reason);
         std::error_code rm_ec;
@@ -249,34 +303,80 @@ static bool common_pull_file_parallel(const common_http_url & parts,
     };
 
     const uint64_t total = p.total;
-    int num_chunks = (int) std::min<uint64_t>(PARALLEL_DOWNLOAD_MAX_CHUNKS,
-                                               std::max<uint64_t>(1, total / PARALLEL_DOWNLOAD_MIN_BYTES));
 
-    {
-        std::ofstream touch(path_tmp, std::ios::binary | std::ios::trunc);
-        if (!touch.is_open()) {
-            LOG_ERR("%s: error opening local file for writing: %s\n", __func__, path_tmp.c_str());
-            return fail("could not create temp file");
+    std::error_code exists_ec;
+    bool tmp_exists = std::filesystem::exists(path_tmp, exists_ec);
+    uint64_t tmp_size = (tmp_exists && !exists_ec) ? std::filesystem::file_size(path_tmp, exists_ec) : 0;
+    bool resuming = tmp_exists && !exists_ec && tmp_size == total;
+
+    std::vector<std::pair<uint64_t, uint64_t>> ranges; // [start, end) segments still to fetch
+    if (resuming) {
+#if defined(__linux__)
+        auto holes = sparse_file_holes(path_tmp, total);
+        if (!holes) {
+            // can't tell real data from holes on this filesystem - safest is a clean restart,
+            // same as the old unconditional behavior.
+            return fail("could not inspect existing temp file for resume");
         }
-    }
-    std::error_code ec;
-    std::filesystem::resize_file(path_tmp, total, ec);
-    if (ec) {
-        return fail("failed to pre-size temp file for parallel download");
+        if (holes->empty()) {
+            // every byte is genuinely there already (verified, not just size-assumed) - done.
+            p.downloaded = total;
+            return true;
+        }
+        ranges = *holes;
+#else
+        return false; // let the caller's single-stream path handle it (declines, doesn't touch the file)
+#endif
+    } else if (!tmp_exists || tmp_size == 0) {
+        {
+            std::ofstream touch(path_tmp, std::ios::binary | std::ios::trunc);
+            if (!touch.is_open()) {
+                LOG_ERR("%s: error opening local file for writing: %s\n", __func__, path_tmp.c_str());
+                return fail("could not create temp file");
+            }
+        }
+        std::error_code ec;
+        std::filesystem::resize_file(path_tmp, total, ec);
+        if (ec) {
+            return fail("failed to pre-size temp file for parallel download");
+        }
+        int num_chunks = (int) std::min<uint64_t>(PARALLEL_DOWNLOAD_MAX_CHUNKS,
+                                                   std::max<uint64_t>(1, total / PARALLEL_DOWNLOAD_MIN_BYTES));
+        uint64_t chunk_size = total / num_chunks;
+        for (int i = 0; i < num_chunks; ++i) {
+            uint64_t start = (uint64_t) i * chunk_size;
+            uint64_t end   = (i == num_chunks - 1) ? total : start + chunk_size;
+            ranges.emplace_back(start, end);
+        }
+    } else {
+        // a real (non-pre-sized) single-stream partial file sitting at path_tmp - not this
+        // function's job, let common_pull_file's normal sequential Range-continue handle it.
+        return false;
     }
 
-    LOG_INF("%s: downloading %llu bytes as %d parallel chunks: %s\n",
-            __func__, (unsigned long long) total, num_chunks, path_tmp.c_str());
-
-    std::vector<uint64_t> starts(num_chunks), ends(num_chunks); // ends are inclusive
-    uint64_t chunk_size = total / num_chunks;
-    for (int i = 0; i < num_chunks; ++i) {
-        starts[i] = i * chunk_size;
-        ends[i]   = (i == num_chunks - 1) ? total - 1 : starts[i] + chunk_size - 1;
+    // a resume can leave more holes than PARALLEL_DOWNLOAD_MAX_CHUNKS (each worker only ever
+    // guarantees ONE contiguous gap on failure, but several can fail in the same attempt) - merge
+    // the closest-together ranges first rather than spawning unbounded worker threads.
+    while ((int) ranges.size() > PARALLEL_DOWNLOAD_MAX_CHUNKS) {
+        size_t   merge_at = 0;
+        uint64_t best_gap = UINT64_MAX;
+        for (size_t i = 0; i + 1 < ranges.size(); ++i) {
+            uint64_t gap = ranges[i + 1].first - ranges[i].second;
+            if (gap < best_gap) {
+                best_gap = gap;
+                merge_at = i;
+            }
+        }
+        ranges[merge_at].second = ranges[merge_at + 1].second;
+        ranges.erase(ranges.begin() + (long) merge_at + 1);
     }
 
-    std::atomic<uint64_t> chunk_done[PARALLEL_DOWNLOAD_MAX_CHUNKS];
-    for (int i = 0; i < num_chunks; ++i) chunk_done[i].store(0, std::memory_order_relaxed);
+    LOG_INF("%s: %s %llu bytes across %zu range(s): %s\n", __func__,
+            resuming ? "resuming" : "downloading", (unsigned long long) total, ranges.size(), path_tmp.c_str());
+
+    const int num_ranges = (int) ranges.size();
+    std::vector<std::atomic<uint64_t>> chunk_done(num_ranges);
+    for (auto & c : chunk_done) c.store(0, std::memory_order_relaxed);
     std::atomic<bool> failed{false};
     std::atomic<bool> cancelled{false};
 
@@ -289,16 +389,18 @@ static bool common_pull_file_parallel(const common_http_url & parts,
         if (!ofs.is_open()) {
             return false;
         }
-        ofs.seekp((std::streamoff) starts[idx]);
+        const uint64_t start = ranges[idx].first;
+        const uint64_t end   = ranges[idx].second; // exclusive
+        ofs.seekp((std::streamoff) start);
 
         httplib::Headers headers;
-        headers.emplace("Range", "bytes=" + std::to_string(starts[idx]) + "-" + std::to_string(ends[idx]));
+        headers.emplace("Range", "bytes=" + std::to_string(start) + "-" + std::to_string(end - 1));
 
         auto res = cli.Get(resolve_path, headers,
             [&](const char * data, size_t len) {
                 ofs.write(data, (std::streamsize) len);
                 if (!ofs) {
-                    LOG_ERR("%s: error writing chunk %d to file: %s\n", __func__, idx, path_tmp.c_str());
+                    LOG_ERR("%s: error writing range %d to file: %s\n", __func__, idx, path_tmp.c_str());
                     return false;
                 }
                 chunk_done[idx].fetch_add(len, std::memory_order_relaxed);
@@ -324,9 +426,13 @@ static bool common_pull_file_parallel(const common_http_url & parts,
     };
 
     std::vector<std::future<bool>> futures;
-    for (int i = 0; i < num_chunks; ++i) {
+    for (int i = 0; i < num_ranges; ++i) {
         futures.push_back(std::async(std::launch::async, worker, i));
     }
+
+    uint64_t holes_total = 0;
+    for (const auto & r : ranges) holes_total += (r.second - r.first);
+    const uint64_t base_done = total - holes_total; // bytes already on disk before this attempt
 
     // dedicated poller thread: the only caller of callback->on_update() for the whole parallel
     // download, so callback implementations never need to worry about concurrent invocation from
@@ -334,8 +440,8 @@ static bool common_pull_file_parallel(const common_http_url & parts,
     std::atomic<bool> all_done{false};
     std::thread poller([&]() {
         while (!all_done.load(std::memory_order_relaxed)) {
-            uint64_t sum = 0;
-            for (int i = 0; i < num_chunks; ++i) sum += chunk_done[i].load(std::memory_order_relaxed);
+            uint64_t sum = base_done;
+            for (auto & c : chunk_done) sum += c.load(std::memory_order_relaxed);
             p.downloaded = sum;
             if (callback) {
                 callback->on_update(p);
@@ -357,14 +463,20 @@ static bool common_pull_file_parallel(const common_http_url & parts,
     all_done.store(true, std::memory_order_relaxed);
     poller.join();
 
-    uint64_t sum = 0;
-    for (int i = 0; i < num_chunks; ++i) sum += chunk_done[i].load(std::memory_order_relaxed);
+    uint64_t sum = base_done;
+    for (auto & c : chunk_done) sum += c.load(std::memory_order_relaxed);
     p.downloaded = sum;
 
     if (!all_ok || cancelled.load(std::memory_order_relaxed)) {
-        // deliberately restart from scratch next attempt rather than resuming a partial
-        // parallel download - see the function comment above for why.
-        return fail(cancelled.load(std::memory_order_relaxed) ? "download cancelled" : "a chunk failed");
+        // unlike a pre-flight failure, keep path_tmp on disk - whatever ranges did complete this
+        // attempt are real, sparse-verified bytes (or were already there from a previous
+        // attempt), so the next call resumes from just what's still missing instead of redoing
+        // work. Cancellation is the one case the caller doesn't treat as retryable - it means the
+        // user explicitly stopped the download, not a transient failure.
+        LOG_WRN("%s: %s, %llu/%llu bytes kept for next attempt\n", __func__,
+                cancelled.load(std::memory_order_relaxed) ? "download cancelled" : "a range failed",
+                (unsigned long long) p.downloaded, (unsigned long long) total);
+        return false;
     }
     return true;
 }
@@ -376,15 +488,29 @@ static bool common_pull_file(const common_http_url & parts,
                              bool supports_ranges,
                              common_download_progress & p,
                              common_download_callback * callback) {
-    if (supports_ranges && p.downloaded == 0 && p.total >= PARALLEL_DOWNLOAD_MIN_BYTES) {
+    // A from-scratch large download always qualifies. So does resuming one: a pre-sized (sparse)
+    // leftover temp file from a previous parallel attempt is recognized by its size alone (equal
+    // to the expected total) rather than trusting the caller's p.downloaded, which - for exactly
+    // this kind of file - is derived from raw file_size() upstream and so already assumes the
+    // whole thing is real data. common_pull_file_parallel does its own SEEK_DATA/SEEK_HOLE check
+    // before believing that.
+    std::error_code tmp_stat_ec;
+    bool tmp_is_presized = supports_ranges && p.total > 0 &&
+        std::filesystem::exists(path_tmp, tmp_stat_ec) && !tmp_stat_ec &&
+        std::filesystem::file_size(path_tmp, tmp_stat_ec) == p.total && !tmp_stat_ec;
+
+    if (supports_ranges && p.total >= PARALLEL_DOWNLOAD_MIN_BYTES &&
+        (p.downloaded == 0 || tmp_is_presized)) {
         if (common_pull_file_parallel(parts, resolve_path, path_tmp, p, callback)) {
             return true;
         }
         // fall through to the single-stream path below - either the parallel attempt failed
-        // outright (in which case the retry loop in common_download_file_single_online will
-        // call us again from scratch next attempt) or pre-sizing the file failed and we
-        // returned early above without downloading anything, so p.downloaded is still 0 and a
-        // normal single-stream attempt right now is exactly correct, not a wasted redo.
+        // outright and left path_tmp's real bytes in place for next time (in which case the
+        // retry loop in common_download_file_single_online will call us again and land right
+        // back here to resume the parallel attempt instead of going sequential), or pre-sizing
+        // the file failed and we returned early above without downloading anything, so
+        // p.downloaded is still 0 and a normal single-stream attempt right now is exactly
+        // correct, not a wasted redo.
         if (p.downloaded > 0) {
             return false; // a real partial parallel failure - let the retry loop restart clean
         }

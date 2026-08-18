@@ -329,6 +329,8 @@ extern "C" {
                                          // where the rest of the layer's tensors live)
         uint32_t moe_stream_prefetch;   // 0 = disabled; else speculatively prefetch this many of the next
                                          // layer's hottest experts while the current layer's GEMM runs
+        uint64_t moe_stream_ram_cache;  // second-tier host-RAM cache byte budget for experts evicted
+                                         // from the VRAM-tier cache (0 = disabled)
 
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights

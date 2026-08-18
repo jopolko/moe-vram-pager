@@ -273,6 +273,7 @@ struct common_chat_params {
     bool                                grammar_lazy         = false;
     std::string                         generation_prompt;
     bool                                supports_thinking    = false;
+    bool                                supports_reasoning_effort = false; // template reads a low/medium/high "reasoning_effort" var (e.g. gpt-oss/harmony), not a boolean enable_thinking
     std::string                         thinking_start_tag;  // e.g., "<think>"
     std::string                         thinking_end_tag;    // e.g., "</think>"
     std::vector<common_grammar_trigger> grammar_triggers;
@@ -347,6 +348,7 @@ common_reasoning_format common_reasoning_format_from_name(const std::string & fo
 common_chat_tool_choice common_chat_tool_choice_parse_oaicompat(const std::string & tool_choice);
 
 bool common_chat_templates_support_enable_thinking(const common_chat_templates * chat_templates);
+bool common_chat_templates_support_reasoning_effort(const common_chat_templates * chat_templates);
 
 // Parses a JSON array of messages in OpenAI's chat completion API format.
 std::vector<common_chat_msg> common_chat_msgs_parse_oaicompat(const nlohmann::ordered_json & messages);

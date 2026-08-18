@@ -24,6 +24,7 @@ import { toast } from 'svelte-sonner';
 import { DatabaseService } from '$lib/services/database.service';
 import { MigrationService } from '$lib/services/migration.service';
 import { config, settingsStore } from '$lib/stores/settings.svelte';
+import { mcpStore } from '$lib/stores/mcp.svelte';
 import { filterByLeafNodeId, findLeafNode, generateConversationTitle } from '$lib/utils';
 import type { McpServerOverride } from '$lib/types/database';
 import { zipSync, unzipSync, strToU8, strFromU8 } from 'fflate';
@@ -680,12 +681,16 @@ class ConversationsStore {
 
 	/**
 	 * Checks if an MCP server is enabled for the active conversation.
+	 * Falls back to the server's global enabled setting when this chat has
+	 * no explicit override, so a server left on in MCP settings doesn't
+	 * silently start every new conversation disabled.
 	 * @param serverId - The server ID to check
 	 * @returns True if server is enabled for this conversation
 	 */
 	isMcpServerEnabledForChat(serverId: string): boolean {
 		const override = this.getMcpServerOverride(serverId);
-		return override?.enabled ?? false;
+		if (override) return override.enabled;
+		return mcpStore.getServerById(serverId)?.enabled ?? false;
 	}
 
 	/**

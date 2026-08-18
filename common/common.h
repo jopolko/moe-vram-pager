@@ -591,6 +591,8 @@ struct common_params {
                                              // layer (isolates RAM- vs VRAM-cache perf for benchmarking)
     uint32_t moe_stream_prefetch   = 0;     // 0 = disabled; else speculatively prefetch this many of the
                                              // next layer's hottest experts during decode
+    uint64_t moe_stream_ram_cache  = 0;     // second-tier host-RAM cache byte budget for evicted
+                                             // experts (0 = disabled)
 
     bool single_turn       = false; // single turn chat conversation
 

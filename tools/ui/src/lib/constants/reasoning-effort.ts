@@ -19,3 +19,13 @@ export const REASONING_EFFORT_LEVELS: ReasoningEffortLevel[] = [
 	{ value: ReasoningEffort.HIGH, label: 'High' },
 	{ value: ReasoningEffort.MAX, label: 'Max', hasInfo: true }
 ];
+
+/**
+ * Reasoning effort levels for "levels"-style templates (e.g. gpt-oss/harmony), which only
+ * accept low/medium/high and have no true "off" or level above "high".
+ */
+export const REASONING_EFFORT_LEVELS_HARMONY: ReasoningEffortLevel[] = [
+	{ value: ReasoningEffort.LOW, label: 'Low' },
+	{ value: ReasoningEffort.MEDIUM, label: 'Medium' },
+	{ value: ReasoningEffort.HIGH, label: 'High' }
+];
