@@ -291,7 +291,7 @@ Ordered from most passive (never touches the target) to most aggressive
 | Platform | Role | Reached via |
 |---|---|---|
 | [theHarvester](https://github.com/laramies/theHarvester) | Passive OSINT aggregator: emails, subdomains/hosts, IPs from Certificate Transparency, search engines, breach indexes, wayback history | local checkout, run via `uv` - no API key needed |
-| Google dorking | Curated Google Hacking Database-style queries (exposed admin panels, leaked config/backup files, directory listings, exposed `.git`, ...) | DuckDuckGo HTML search - never contacts google.com or the target |
+| Google dorking | Curated Google Hacking Database-style queries (exposed admin panels, leaked config/backup files, directory listings, exposed `.git`, ...) | Brave Search API if `BRAVE_API_KEY` is set (real operator precision), else DuckDuckGo HTML search (zero-config, looser matching) - never contacts google.com or the target |
 | [NIST NVD](https://nvd.nist.gov/) | CVE lookup by keyword or exact CPE 2.3 string | `services.nvd.nist.gov` REST API |
 | Passive origin OSINT | Find a real origin IP behind a CDN/WAF | Certificate Transparency logs (crt.sh) + DNS, cross-checked against Cloudflare's published ranges |
 | nmap | Port/service/OS scanning, NSE scripts | local binary, `cap_net_raw`/`cap_net_admin`/`cap_net_bind_service` via setcap (no root) |
