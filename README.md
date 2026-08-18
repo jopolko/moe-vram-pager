@@ -47,14 +47,12 @@ Early and actively changing. What works today:
 
 ## Hardware and system requirements
 
-Targets NVIDIA GPUs via CUDA. Built and tested against a GTX 1080 Ti
-(Pascal, compute capability 6.1). `CMAKE_CUDA_ARCHITECTURES` is
-auto-detected from whatever GPU is actually in the build machine
-(CMake's `native` mode, upstream ggml/CMake logic, requires CMake
->= 3.24 and CUDA >= 11.6) - don't set it by hand unless you're
-cross-compiling for different hardware than you're building on, in
-which case pass `-DCMAKE_CUDA_ARCHITECTURES=<your compute capability>`
-explicitly.
+Targets NVIDIA GPUs via CUDA. `CMAKE_CUDA_ARCHITECTURES` is auto-detected
+from whatever GPU is actually in the build machine (CMake's `native`
+mode, upstream ggml/CMake logic, requires CMake >= 3.24 and CUDA >= 11.6)
+- don't set it by hand unless you're cross-compiling for different
+hardware than you're building on, in which case pass
+`-DCMAKE_CUDA_ARCHITECTURES=<your compute capability>` explicitly.
 
 - **NVIDIA GPU + [CUDA toolkit](https://developer.nvidia.com/cuda-toolkit)**
   installed and on `PATH` before running `cmake -B build -DGGML_CUDA=ON`.
@@ -67,38 +65,35 @@ explicitly.
   the disk-streaming tier the same way more VRAM does.
 - **Fast local storage matters more than GPU class for the disk-streaming
   case this project targets.** A local NVMe SSD is the intended target;
-  a network-backed or virtualized disk (WSL2's virtual disk is a real
-  example from this project's own dev box) can dominate the bottleneck
+  a network-backed or virtualized disk can dominate the bottleneck
   regardless of GPU. `--moe-stream-io-threads` is disk-specific, not
-  GPU-specific - more threads measured *slower* on this project's own
-  WSL2 virtual disk (opposite of typical bare-metal NVMe advice); tune
-  it against your own disk instead of assuming a number.
+  GPU-specific - more threads isn't automatically faster on every disk
+  (virtualized/networked disks in particular can get *slower* with more
+  threads, the opposite of typical bare-metal NVMe advice); tune it
+  against your own disk instead of assuming a number.
 - **Disk space** for the model file itself - the whole point of this
   project is running models whose GGUF is hundreds of GB, so budget disk
   space accordingly (the picker flags a model "needs N GB more" instead
   of hiding it if it doesn't fit yet).
 
-### Performance: what's actually been measured, and what hasn't
+### Performance: general guidance, not benchmark numbers
 
-The only benchmark data that exists so far comes from this project's own
-dev box (GTX 1080 Ti, 11GB VRAM) against `Qwen3-30B-A3B-Q4_K_M` (~18.6GB) -
-a model chosen for fast iteration, not for being representative of the
-disk-streaming-tier case this project actually targets. Two numbers from
-that testing, both decode-phase tok/s, same config, differing only in
-Linux page-cache warmth between runs: 8.32 tok/s warm vs. 5.27 tok/s cold.
-That gap alone should tell you page-cache state matters as much as raw
-disk speed for anything short of `--moe-stream-direct` (which trades that
-variability away for consistently slower absolute numbers, useful for
-controlled A/B testing, not for real usage).
+No published benchmark numbers exist yet for this fork across GPUs, model
+sizes, or disk types - what follows is qualitative guidance about what
+drives performance, not a substitute for measuring your own setup.
+Page-cache warmth alone can swing decode speed substantially between two
+back-to-back runs of the identical config, so any single number you see
+quoted for this project is close to meaningless without also knowing the
+model size, cache size, disk type, and whether the page cache was warm.
+`--moe-stream-direct` (`O_DIRECT`) removes that page-cache variable for
+controlled A/B comparisons, at the cost of being slower in absolute terms
+than the page-cache-assisted path most real usage benefits from.
 
-**No numbers exist yet for other GPUs, or for a genuinely huge model
-(hundreds of GB, the actual target use case) exercising the real
-disk-streaming tier under sustained cache pressure.** Treat any specific
-tok/s figure for an RTX 3090/4090/5090/etc. as something nobody has
-measured on this fork - don't trust a number you see quoted for this
-project unless it cites its own model size, cache size, and disk type,
-because those three variables swing results far more than GPU generation
-does once the model doesn't fit in VRAM+RAM.
+**Don't trust a number you see quoted for this project** (an RTX
+3090/4090/5090/etc. tok/s figure, for example) unless it cites its own
+model size, cache size, and disk type - those three variables swing
+results far more than GPU generation does once the model doesn't fit in
+VRAM+RAM, which is the whole point of this project.
 
 **Warning on huge models specifically**: this is the regime the project
 targets but hasn't stress-tested end-to-end yet. Expect disk I/O, not GPU
