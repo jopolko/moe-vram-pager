@@ -252,6 +252,20 @@ panel in the web UI (`tools/pentest_ui_api.py` sidecar + SvelteKit
 frontend) starts, monitors, restarts, and stops runs, and compiles a PDF
 report when one finishes.
 
+> [!WARNING]
+> Only scan systems you own or have explicit legal/contractual
+> authorization to test. Unauthorized scanning and exploitation is illegal
+> in most jurisdictions regardless of intent - get written scope
+> confirmation before pointing this at anything.
+>
+> Remote exploits that need a reverse connection or a spawned shell
+> (Metasploit reverse/bind payloads, callback-based modules) require a
+> Linux host with a direct internet-routable connection - no NAT, no
+> firewall in the way of the callback path. Behind NAT/CGNAT or a firewall,
+> point exploitation at connectionless proof (check-only confirmation, or a
+> command-execution module that writes and independently reads back a
+> marker file) instead of a full session.
+
 ### Setup
 
 ```bash
