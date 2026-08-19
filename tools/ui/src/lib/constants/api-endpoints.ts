@@ -2,6 +2,8 @@ export const API_MODELS = {
 	LIST: '/v1/models',
 	LOAD: '/models/load',
 	UNLOAD: '/models/unload',
+	TUNING: '/models/tuning',
+	TUNING_DEFAULTS: '/model-picker/tuning-defaults',
 	SSE: '/models/sse'
 };
 

@@ -3,6 +3,7 @@ export const NEW_CHAT_PARAM = 'new_chat';
 /** Settings section slugs — used for routes and navigation. */
 export const SETTINGS_SECTION_SLUGS = {
 	GENERAL: 'general',
+	TUNING: 'tuning',
 	DISPLAY: 'display',
 	SAMPLING: 'sampling',
 	PENALTIES: 'penalties',

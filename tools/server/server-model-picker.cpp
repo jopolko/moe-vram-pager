@@ -26,6 +26,7 @@
 #include <regex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -1617,6 +1618,55 @@ void server_model_picker_register_routes(const server_http_context & ctx_http, c
         double free_gb = req.get_param("disk_free_gb").empty()
                               ? disk_free_gb(".") : std::stod(req.get_param("disk_free_gb"));
         res->data = json{{"disk_free_gb", free_gb}}.dump();
+        return res;
+    });
+
+    // Hardware-informed starting points for the Settings > Tuning tab, so a blank field shows a
+    // real recommendation instead of a generic placeholder. Deliberately hardware-only, not
+    // per-model: a proper active_gb-aware moe-stream-cache/ram-cache size (like prepare-download
+    // computes below) needs this model's GGUF hparams, which isn't worth re-probing just to
+    // populate a settings field for an already-downloaded model. These are same-spirit
+    // conservative defaults, not a substitute for the real download-time auto-tune.
+    ctx_http.get("/model-picker/tuning-defaults", [](const server_http_req &) -> server_http_res_ptr {
+        auto res = std::make_unique<server_http_res>();
+        res->content_type = "application/json; charset=utf-8";
+
+        hardware_info hw = detect_hardware();
+        unsigned int threads = std::max(1u, std::thread::hardware_concurrency());
+
+        // half the free VRAM/RAM, same CACHE_HEADROOM_FRACTION/RAM_CACHE_HEADROOM_FRACTION split
+        // prepare-download uses, just without an active_gb deduction (see comment above).
+        uint64_t moe_stream_cache_gb = std::max<uint64_t>(
+            1, (uint64_t) (std::max(0.0, hw.vram_free_gb) * CACHE_HEADROOM_FRACTION));
+        uint64_t moe_stream_ram_cache_gb =
+            (uint64_t) (std::max(0.0, hw.ram_free_gb) * RAM_CACHE_HEADROOM_FRACTION);
+
+        bool plenty_of_vram = hw.vram_free_gb > 8.0;
+        bool plenty_of_ram  = hw.ram_free_gb  > 8.0;
+
+        res->data = json{
+            {"hardware", {
+                {"vram_gb", hw.vram_gb}, {"vram_free_gb", hw.vram_free_gb},
+                {"ram_gb", hw.ram_gb}, {"ram_free_gb", hw.ram_free_gb},
+                {"cpu_threads", threads},
+            }},
+            {"defaults", {
+                {"ctx-size", std::to_string(DEFAULT_CTX_SIZE)},
+                {"gpu-layers", "999"}, // moe-stream is specifically for full offload without full VRAM
+                {"threads", std::to_string(threads)},
+                {"batch-size", plenty_of_vram ? "2048" : "1024"},
+                {"ubatch-size", plenty_of_vram ? "512" : "256"},
+                {"flash-attn", "auto"},
+                {"cache-type-k", plenty_of_vram ? "f16" : "q8_0"},
+                {"cache-type-v", plenty_of_vram ? "f16" : "q8_0"},
+                {"moe-stream-cache", std::to_string(moe_stream_cache_gb) + "G"},
+                {"moe-stream-io-threads", std::to_string(std::max(2u, threads / 4))},
+                {"moe-stream-ram-cache", std::to_string(moe_stream_ram_cache_gb)},
+                {"moe-stream-prefetch", "2"},
+                {"moe-stream-direct", "false"}, // only helps when the page cache is thrashing
+                {"moe-stream-cpu-cache", plenty_of_ram ? "true" : "false"},
+            }},
+        }.dump();
         return res;
     });
 

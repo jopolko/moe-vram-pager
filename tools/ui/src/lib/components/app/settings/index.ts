@@ -74,3 +74,12 @@ export { default as SettingsChatFields } from './SettingsChat/SettingsChatFields
  * server favicons and permission management controls.
  */
 export { default as SettingsChatToolsTab } from './SettingsChat/SettingsChatToolsTab.svelte';
+
+/**
+ * **SettingsChatTuningTab** - Server launch-time tuning tab for chat settings
+ *
+ * Exposes per-model MoE VRAM streaming and general llama.cpp hygiene flags
+ * (context size, GPU layers, batch sizes, flash attention, KV cache type, etc.)
+ * backed by the router's models-preset.ini, not browser localStorage.
+ */
+export { default as SettingsChatTuningTab } from './SettingsChat/SettingsChatTuningTab.svelte';

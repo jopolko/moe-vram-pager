@@ -71,6 +71,8 @@ export interface ApiModelStatus {
 	value: ServerModelStatus;
 	/** Command line arguments used when loading (only for loaded models) */
 	args?: string[];
+	/** Effective preset rendered as INI text (router mode only, reserved keys stripped) */
+	preset?: string;
 }
 
 /**

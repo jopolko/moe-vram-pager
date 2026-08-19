@@ -21,6 +21,8 @@
 #include <cstring>
 #include <cstdlib>
 #include <atomic>
+#include <set>
+#include <map>
 #include <chrono>
 #include <queue>
 #include <filesystem>
@@ -382,6 +384,28 @@ void server_models::load_models() {
             // removable (can_remove) instead of looking like a user-authored preset entry
             final_presets[name].merge(custom);
         } else {
+            // /model-picker/prepare-download writes a preset section (ctx-size, moe-stream-cache,
+            // etc) *before* the real download runs, so the actual GET /models download call can
+            // size those knobs correctly. If the follow-up download never happened (page closed,
+            // request failed, user picked a different quant instead), this section is an orphan:
+            // no model/model-url/hf-repo to ever load from. Left in place it silently blocks the
+            // real download forever (POST /models refuses "model already exists") and hangs any
+            // caller that tries to load it - a phantom row with nothing behind it. Since nothing
+            // was ever downloaded, there's nothing to preserve or resume - drop it here so the
+            // next real attempt at this model starts clean.
+            std::string unused;
+            bool has_source = custom.get_option("LLAMA_ARG_MODEL", unused)
+                || custom.get_option("LLAMA_ARG_MODEL_URL", unused)
+                || custom.get_option("LLAMA_ARG_HF_REPO", unused);
+            if (!has_source) {
+                SRV_WRN("dropping orphaned model-picker preset entry name=%s (no model source - "
+                        "the download that should have followed prepare-download never ran)\n",
+                        name.c_str());
+                if (!base_params.models_preset.empty()) {
+                    common_preset_remove_ini_section(base_params.models_preset, name);
+                }
+                continue;
+            }
             final_presets[name] = custom;
             source_map[name] = SERVER_MODEL_SOURCE_PRESET;
         }
@@ -1814,6 +1838,48 @@ void server_models_routes::init_routes() {
             load_opts.arg_overrides["LLAMA_ARG_CTX_SIZE"] = std::to_string(ctx_size);
         }
         models.load(meta->name, load_opts);
+        res_ok(res, {{"success", true}});
+        return res;
+    };
+
+    this->post_router_models_tuning = [this](const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        if (this->params.models_preset.empty()) {
+            res_err(res, format_error_response(
+                "tuning requires router mode with --models-preset", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        json body = json::parse(req.body);
+        std::string name = json_value(body, "model", std::string());
+        auto meta = models.get_meta(name);
+        if (!meta.has_value()) {
+            res_err(res, format_error_response("model is not found", ERROR_TYPE_NOT_FOUND));
+            return res;
+        }
+        // whitelist so the client can only touch known launch-time tuning keys, not arbitrary
+        // INI content (host/port/alias/tags etc. stay off limits)
+        static const std::set<std::string> allowed_keys = {
+            "ctx-size", "gpu-layers", "threads", "batch-size", "ubatch-size",
+            "flash-attn", "cache-type-k", "cache-type-v",
+            "moe-stream-cache", "moe-stream-io-threads", "moe-stream-direct",
+            "moe-stream-cpu-cache", "moe-stream-prefetch", "moe-stream-ram-cache",
+        };
+        json overrides = json_value(body, "overrides", json::object());
+        std::map<std::string, std::string> kv;
+        for (auto it = overrides.begin(); it != overrides.end(); ++it) {
+            if (allowed_keys.count(it.key()) == 0) {
+                continue;
+            }
+            kv[it.key()] = it.value().is_string() ? it.value().get<std::string>() : it.value().dump();
+        }
+        if (kv.empty()) {
+            res_err(res, format_error_response("no valid tuning keys given", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        common_preset_write_ini_section(this->params.models_preset, meta->name, kv);
+        // in-memory preset is stale until the next reload - same mechanism the download-complete
+        // and model-remove paths use to pick up on-disk changes
+        models.need_reload = true;
         res_ok(res, {{"success", true}});
         return res;
     };

@@ -10,6 +10,7 @@ import {
 	Sliders,
 	PencilRuler,
 	Database,
+	Cpu,
 	Monitor as MonitorIcon,
 	Sun,
 	Moon
@@ -28,10 +29,12 @@ import McpLogo from '$lib/components/app/mcp/McpLogo.svelte';
 import { SETTINGS_KEYS } from './settings-keys';
 import { ROUTES, SETTINGS_SECTION_SLUGS } from './routes';
 import { TITLE_GENERATION } from './title-generation';
+import { DEFAULT_SYSTEM_PROMPT } from './default-system-prompt';
 import { RECOMMENDED_MCP_SERVERS } from './recommended-mcp-servers';
 
 export const SETTINGS_SECTION_TITLES = {
 	GENERAL: 'General',
+	TUNING: 'Tuning',
 	DISPLAY: 'Display',
 	SAMPLING: 'Sampling',
 	PENALTIES: 'Penalties',
@@ -85,7 +88,7 @@ const SETTINGS_REGISTRY: Record<string, SettingsSectionEntry> = {
 				key: SETTINGS_KEYS.SYSTEM_MESSAGE,
 				label: 'System Message',
 				help: 'The starting message that defines how model should behave.',
-				defaultValue: '',
+				defaultValue: DEFAULT_SYSTEM_PROMPT,
 				type: SettingsFieldType.TEXTAREA,
 				section: SETTINGS_SECTION_SLUGS.GENERAL,
 				sync: {
@@ -847,22 +850,33 @@ export const SETTINGS_COLOR_MODES_CONFIG = COLOR_MODE_OPTIONS;
 export type { SettingsSectionTitle } from '$lib/types';
 export type { SettingsSection } from '$lib/types';
 
+const GENERIC_SECTIONS = Object.values(SETTINGS_REGISTRY).map((section) => ({
+	title: section.title,
+	slug: section.slug,
+	icon: section.icon,
+	fields: section.settings.map((s) => ({
+		key: s.key,
+		label: s.label,
+		type: s.type,
+		isExperimental: s.isExperimental,
+		isPositiveInteger: s.isPositiveInteger,
+		help: s.help,
+		options: s.options
+	}))
+}));
+
+// Tuning is a standalone (server-backed, not localStorage) section, but it belongs
+// with the launch-time model config, right after General - not tucked at the end
+// with Tools/Import-Export.
+const generalIndex = GENERIC_SECTIONS.findIndex(
+	(s) => s.slug === SETTINGS_SECTION_SLUGS.GENERAL
+);
+
 /** Sidebar sections + field configs (as consumed by UI). */
 export const SETTINGS_CHAT_SECTIONS: SettingsSection[] = [
-	...Object.values(SETTINGS_REGISTRY).map((section) => ({
-		title: section.title,
-		slug: section.slug,
-		icon: section.icon,
-		fields: section.settings.map((s) => ({
-			key: s.key,
-			label: s.label,
-			type: s.type,
-			isExperimental: s.isExperimental,
-			isPositiveInteger: s.isPositiveInteger,
-			help: s.help,
-			options: s.options
-		}))
-	})),
+	...GENERIC_SECTIONS.slice(0, generalIndex + 1),
+	{ title: SETTINGS_SECTION_TITLES.TUNING, slug: SETTINGS_SECTION_SLUGS.TUNING, icon: Cpu },
+	...GENERIC_SECTIONS.slice(generalIndex + 1),
 	...STANDALONE_SECTIONS
 ];
 

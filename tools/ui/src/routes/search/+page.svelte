@@ -9,6 +9,7 @@
 	import { conversationsStore, conversations } from '$lib/stores/conversations.svelte';
 	import { chatStore } from '$lib/stores/chat.svelte';
 	import { isMobile } from '$lib/stores/viewport.svelte';
+	import { APP_NAME } from '$lib/constants/app';
 
 	let searchQuery = $state('');
 	let searchInputRef = $state<HTMLInputElement | null>(null);
@@ -69,7 +70,7 @@
 </script>
 
 <svelte:head>
-	<title>Search · llama.cpp</title>
+	<title>Search - {APP_NAME}</title>
 </svelte:head>
 
 <div class="fixed top-0 z-10 left-0 right-0 p-2">

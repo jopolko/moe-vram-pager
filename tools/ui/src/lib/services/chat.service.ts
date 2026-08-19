@@ -2,6 +2,7 @@ import { getAuthHeaders, getJsonHeaders } from '$lib/utils/api-headers';
 import { formatAttachmentText } from '$lib/utils/formatters';
 import { isAbortError } from '$lib/utils/abort';
 import { streamIdentity } from '$lib/utils/stream-identity';
+import { sanitizeLlmText } from '$lib/utils/sanitize-llm-text';
 import {
 	ATTACHMENT_LABEL_PDF_FILE,
 	ATTACHMENT_LABEL_MCP_PROMPT,
@@ -873,8 +874,8 @@ export class ChatService {
 							try {
 								const parsed: ApiChatCompletionStreamChunk = JSON.parse(data);
 								const choice = parsed.choices?.[0];
-								const content = choice?.delta?.content;
-								const reasoningContent = choice?.delta?.reasoning_content;
+								const content = sanitizeLlmText(choice?.delta?.content ?? '') || undefined;
+								const reasoningContent = sanitizeLlmText(choice?.delta?.reasoning_content ?? '') || undefined;
 								const toolCalls = choice?.delta?.tool_calls;
 								const timings = parsed.timings;
 								const promptProgress = parsed.prompt_progress;
@@ -1046,8 +1047,8 @@ export class ChatService {
 				onModel?.(responseModel);
 			}
 
-			const content = data.choices[0]?.message?.content || '';
-			const reasoningContent = data.choices[0]?.message?.reasoning_content;
+			const content = sanitizeLlmText(data.choices[0]?.message?.content || '');
+			const reasoningContent = sanitizeLlmText(data.choices[0]?.message?.reasoning_content ?? '') || undefined;
 			const toolCalls = data.choices[0]?.message?.tool_calls;
 
 			let serializedToolCalls: string | undefined;

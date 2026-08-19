@@ -5,6 +5,7 @@
 		SettingsChatImportExportTab,
 		SettingsChatMobileHeader,
 		SettingsChatToolsTab,
+		SettingsChatTuningTab,
 		SettingsFooter
 	} from '$lib/components/app/settings';
 	import { config, settingsStore } from '$lib/stores/settings.svelte';
@@ -153,6 +154,8 @@
 
 					{#if currentSection.title === SETTINGS_SECTION_TITLES.TOOLS}
 						<SettingsChatToolsTab />
+					{:else if currentSection.title === SETTINGS_SECTION_TITLES.TUNING}
+						<SettingsChatTuningTab />
 					{:else if currentSection.title === SETTINGS_SECTION_TITLES.IMPORT_EXPORT}
 						<SettingsChatImportExportTab />
 					{:else if currentSection.fields}
@@ -176,12 +179,20 @@
 					{/if}
 				</div>
 
-				<div class="mt-8 border-t border-border/30 pt-6">
-					<p class="text-xs text-muted-foreground">Settings are saved in browser's localStorage</p>
-				</div>
+				{#if currentSection.fields}
+					<div class="mt-8 border-t border-border/30 pt-6">
+						<p class="text-xs text-muted-foreground">Settings are saved in browser's localStorage</p>
+					</div>
+				{/if}
 			</div>
 
-			<SettingsFooter onReset={handleReset} onSave={handleSave} />
+			{#if currentSection.fields}
+				<!-- Tools/Tuning/Import-Export tabs manage their own persistence (MCP config,
+				     models-preset.ini, settingsStore export/import respectively) and don't touch
+				     localConfig - showing this generic localStorage Save/Reset footer there is
+				     confusing dead UI stacked on top of a tab's own save action -->
+				<SettingsFooter onReset={handleReset} onSave={handleSave} />
+			{/if}
 		</div>
 	</div>
 </div>

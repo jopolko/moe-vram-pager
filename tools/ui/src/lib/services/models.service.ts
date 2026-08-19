@@ -84,6 +84,34 @@ export class ModelsService {
 	}
 
 	/**
+	 * Persist launch-time tuning overrides for a model's preset (ROUTER mode only).
+	 * Sends POST request to `/models/tuning`. Written to the models-preset.ini
+	 * section for this model; takes effect the next time it's loaded.
+	 *
+	 * @param modelId - Model identifier to update
+	 * @param overrides - Whitelisted key/value pairs (server-side whitelist enforced)
+	 * @returns Save response from the server
+	 */
+	static async setTuning(
+		modelId: string,
+		overrides: Record<string, string>
+	): Promise<{ success: boolean }> {
+		return apiPost<{ success: boolean }>(API_MODELS.TUNING, { model: modelId, overrides });
+	}
+
+	/**
+	 * Fetch hardware-informed recommended values for the tuning fields (ROUTER mode only).
+	 * Hardware-only (not per-model) - see the endpoint's own comment for why. Used to
+	 * prepopulate blank tuning fields instead of leaving them empty.
+	 */
+	static async getTuningDefaults(): Promise<{
+		hardware: Record<string, number>;
+		defaults: Record<string, string>;
+	}> {
+		return apiFetch(API_MODELS.TUNING_DEFAULTS);
+	}
+
+	/**
 	 *
 	 *
 	 * Status
