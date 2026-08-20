@@ -356,6 +356,14 @@ level, not just by prompt:
   a prompt instruction, and applies the same way whether the host came from
   `--target`, `find_origin_ip`, or a resumed prior run.
 
+- **Module-name ontology** - `run_exploit`/`run_auxiliary_module`/
+  `run_post_module` are gated by a live `validate_module` check against
+  `msfrpcd` before the real (slow, console-backed) call ever fires, with a
+  strike counter that permanently blocks a hallucinated module name after 2
+  identical failures. Fixes a failure mode where a local model retried a
+  nonexistent module (`auxiliary/scanner/http/dvwa_login`) for 2.5 hours
+  straight. See [ontology.md](ontology.md) for the full writeup.
+
 ### API keys / accounts
 
 The core appliance (model inference, the webui, expert streaming) needs
