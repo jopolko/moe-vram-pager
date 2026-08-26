@@ -17,6 +17,8 @@
 		kv_cache_gb: number;
 		n_ctx_train: number;
 		is_split: boolean;
+		split_count: number;
+		shards_found: number;
 		vram_free_gb: number;
 		disk_free_gb: number;
 		n_layer: number;
@@ -238,7 +240,9 @@
 				</div>
 				{#if assessment.is_split}
 					<p class="text-xs text-muted-foreground">
-						This is one part of a split GGUF - size estimate may be incomplete.
+						{assessment.shards_found === assessment.split_count
+							? `Split GGUF - size aggregated from all ${assessment.split_count} shards.`
+							: `Split GGUF - only found ${assessment.shards_found}/${assessment.split_count} shards, size estimate is incomplete.`}
 					</p>
 				{/if}
 				<div class="grid grid-cols-2 gap-x-4 gap-y-1 tabular-nums">

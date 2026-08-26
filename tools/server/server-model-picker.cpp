@@ -468,6 +468,38 @@ constexpr int MIN_USEFUL_CTX_TOKENS = 32768;
 // risking drift from) the formula itself.
 constexpr int CTX_SIZE_OPTIONS[] = {4096, 8192, 16384, 32768, 65536};
 
+// llama.cpp's own hard-floor for --moe-stream-cache, independent of and in addition to whatever
+// this picker configures: llama_moe_stream_resolve_slots (src/llama-model.cpp) requires at least
+// 3*n_expert_used resident slots ("multi-pass expert GEMMs need at least 3*n_expert_used resident
+// slots to make progress") and raises a too-small cache to that rather than erroring. Computed
+// here as informational data only (see its one call site, /model-picker/assess-gguf) - NOT fed
+// into classify_fit's fit/too-large gate. It was tried there once and reverted: on a real
+// fine-grained-MoE model (Qwen3.6-35B-A3B, 256 experts/8 used) the floor came out to ~2.5GB,
+// which combined with active_gb + the existing kv_cache_gb reservation pushed a model that
+// genuinely runs fine (GPU never exceeded ~8.2/11GB, no OOM) over VRAM_FIT_FRACTION's budget and
+// would have hidden it from the list entirely. VRAM was never the actual constraint that model
+// hit (see RAM_OS_RESERVE_GB below for what was) - stacking this floor on top of an already
+//-conservative fraction plus a fixed-context KV reservation triple-counts headroom that mostly
+// doesn't overlap in practice. Kept as a number the ad-hoc GGUF assessor can show the user, not
+// as a reason to exclude a model that would otherwise work.
+//
+// One expert's weight bytes across every streamable layer isn't tracked directly here (that's
+// gguf_probe's nb_expert_sum, only available once a GGUF header is actually opened - see
+// gguf_probe_from_ctx), but it's fully recoverable from the two numbers callers already have:
+// active_gb = dense_gb + moe_total_gb*(n_expert_used/n_expert), total_gb = dense_gb +
+// moe_total_gb. Solving both for moe_total_gb and scaling by n_expert_used/n_expert gives the
+// active (routed) share of active_gb, and 3x that is the forced floor - same units, same
+// quant, no extra network round trip.
+double estimate_min_expert_cache_gb(double active_gb, double total_gb, int n_expert, int n_expert_used) {
+    if (n_expert <= 0 || n_expert_used <= 0 || n_expert_used >= n_expert || total_gb <= active_gb) {
+        return 0.0; // not MoE, or bad/missing data - no floor to add
+    }
+    double r             = (double) n_expert_used / n_expert;
+    double moe_total_gb  = (total_gb - active_gb) / (1.0 - r);
+    double active_moe_gb = r * moe_total_gb;
+    return 3.0 * active_moe_gb;
+}
+
 std::string classify_fit(double active_gb, double total_gb, double vram_gb, double disk_free_gb, double kv_cache_gb = 0.0) {
     if (total_gb > disk_free_gb) return "no-disk-space"; // can't even be stored on SSD
     if (active_gb + kv_cache_gb <= vram_gb * VRAM_FIT_FRACTION) return "fits";
@@ -506,9 +538,23 @@ constexpr double CACHE_HEADROOM_FRACTION = 0.5;
 // "available for new allocations" figure - MemAvailable on Linux, which on WSL2 is capped by
 // .wslconfig's [wsl2] memory= setting, so this scales down automatically on a constrained
 // Windows host same as it scales up on a bare-metal Linux box with lots of RAM). The other half
-// stays free for the OS, the model's own mmap'd dense weights, and everything else already
-// competing for host memory - the RAM cache is a bonus tier, not the primary residency source.
+// stays free for the OS and everything else already competing for host memory - the RAM cache
+// is a bonus tier, not the primary residency source.
 constexpr double RAM_CACHE_HEADROOM_FRACTION = 0.5;
+
+// Flat floor subtracted from hw.ram_free_gb before RAM_CACHE_HEADROOM_FRACTION is applied, on
+// top of (not instead of) that 50/50 split. A pure percentage split degenerates on a small total
+// pool: on an 18GB WSL2 box "free" can read ~14GB right before a model loads, so a 50% cut still
+// hands ~7GB to the cache - fine on a 64GB workstation, but on 18GB total that plus the model's
+// own non-cache footprint (KV cache, ggml host buffers, moe-stream I/O staging) is enough to
+// blow past what's actually left, and it matters more here than on VRAM: MoE streaming disables
+// mmap entirely (llama_model_load logs "disabling mmap because MoE expert streaming is enabled"),
+// so unlike a normal load nothing here is lazily page-in/evictable by the OS under pressure -
+// every byte is real anonymous memory, and once that exceeds physical RAM the kernel swaps
+// instead of reclaiming, which on WSL2 means paging out to a VHDX on the Windows host: an order
+// of magnitude slower than real disk I/O, and exactly what turns "streaming is a bit slow" into
+// "0.4 tokens/sec with the CPU sitting 98% idle waiting on swap."
+constexpr double RAM_OS_RESERVE_GB = 2.0;
 
 bool text_matches_terms(const std::vector<std::string> & terms, const std::string & text) {
     std::string lower = to_lower(text);
@@ -753,6 +799,8 @@ struct kv_hparams {
     int n_ctx_train = 0;
     int sliding_window = 0;         // 0 = no SWA
     int sliding_window_pattern = 0; // every Nth layer is full attention; 0/1 = treat all layers as full
+    int n_expert = 0;               // 0 = not MoE / not found - doesn't affect h.ok, best-effort only
+    int n_expert_used = 0;
 };
 
 // Reads the handful of fields classify_fit's KV-cache estimate needs out of a parsed
@@ -777,6 +825,18 @@ kv_hparams parse_kv_hparams(const json & cfg) {
     h.n_ctx_train = cfg.value("max_position_embeddings", 0);
     h.sliding_window = cfg.value("sliding_window", 0);
     h.sliding_window_pattern = cfg.value("sliding_window_pattern", 0);
+
+    // MoE expert counts: field names vary by architecture family (Mixtral/gpt-oss use
+    // num_local_experts + num_experts_per_tok, DeepSeek-family uses n_routed_experts,
+    // Qwen-MoE uses num_experts) - try each in order, first one present wins. Absence just
+    // means n_expert stays 0 (estimate_min_expert_cache_gb treats that as "not MoE, no
+    // floor to add"), not a parse failure - doesn't affect h.ok.
+    for (const char * key : { "num_local_experts", "n_routed_experts", "num_experts" }) {
+        if (cfg.contains(key) && cfg[key].is_number()) { h.n_expert = cfg[key].get<int>(); break; }
+    }
+    for (const char * key : { "num_experts_per_tok", "moe_topk", "num_selected_experts" }) {
+        if (cfg.contains(key) && cfg[key].is_number()) { h.n_expert_used = cfg[key].get<int>(); break; }
+    }
 
     h.ok = h.n_layer > 0 && h.n_head_kv > 0 && h.head_dim > 0;
     return h;
@@ -834,6 +894,8 @@ kv_hparams get_kv_hparams_cached(const std::string & repo_id) {
                 h.n_ctx_train            = hj.value("n_ctx_train", 0);
                 h.sliding_window         = hj.value("sliding_window", 0);
                 h.sliding_window_pattern = hj.value("sliding_window_pattern", 0);
+                h.n_expert               = hj.value("n_expert", 0);
+                h.n_expert_used          = hj.value("n_expert_used", 0);
                 return h;
             }
         }
@@ -851,6 +913,7 @@ kv_hparams get_kv_hparams_cached(const std::string & repo_id) {
                 {"ok", h.ok}, {"n_layer", h.n_layer}, {"n_head_kv", h.n_head_kv},
                 {"head_dim", h.head_dim}, {"n_ctx_train", h.n_ctx_train},
                 {"sliding_window", h.sliding_window}, {"sliding_window_pattern", h.sliding_window_pattern},
+                {"n_expert", h.n_expert}, {"n_expert_used", h.n_expert_used},
             }},
         };
         write_file(cache_path, cache.dump());
@@ -895,6 +958,9 @@ struct gguf_probe {
     double active_gb = 0.0; // dense + (moe experts scaled by n_expert_used/n_expert)
     std::string quant_label;
     bool is_split = false; // "split.count" KV present - size may be understated, see caller
+    int split_no = 0;      // this shard's index, from "split.no" (0-based)
+    int split_count = 0;   // total shards, from "split.count"
+    int shards_found = 1;  // how many of split_count actually got aggregated into total_gb/active_gb
 };
 
 kv_hparams gguf_probe_to_kv_hparams(const gguf_probe & p) {
@@ -906,6 +972,8 @@ kv_hparams gguf_probe_to_kv_hparams(const gguf_probe & p) {
     h.n_ctx_train            = p.n_ctx_train;
     h.sliding_window         = p.sliding_window;
     h.sliding_window_pattern = p.sliding_window_pattern;
+    h.n_expert               = p.n_expert;
+    h.n_expert_used          = p.n_expert_used;
     return h;
 }
 
@@ -920,7 +988,14 @@ gguf_probe gguf_probe_from_ctx(struct gguf_context * ctx) {
 
     int64_t arch_id = gguf_find_key(ctx, "general.architecture");
     p.arch = arch_id >= 0 ? gguf_get_val_str(ctx, arch_id) : "";
-    p.is_split = gguf_find_key(ctx, "split.count") >= 0;
+
+    int64_t split_count_id = gguf_find_key(ctx, "split.count");
+    p.is_split = split_count_id >= 0;
+    if (p.is_split) {
+        p.split_count = gguf_get_val_u16(ctx, split_count_id);
+        int64_t split_no_id = gguf_find_key(ctx, "split.no");
+        if (split_no_id >= 0) p.split_no = gguf_get_val_u16(ctx, split_no_id);
+    }
 
     auto get_int = [&](const std::string & suffix, int def = 0) -> int {
         std::string key = p.arch + "." + suffix;
@@ -980,18 +1055,9 @@ gguf_probe gguf_probe_from_ctx(struct gguf_context * ctx) {
     return p;
 }
 
-gguf_probe probe_gguf_local(const std::string & path) {
-    gguf_init_params params;
-    params.no_alloc = true;
-    params.ctx = nullptr;
-    struct gguf_context * ctx = gguf_init_from_file(path.c_str(), params);
-    if (!ctx) return gguf_probe{};
-
-    gguf_probe p = gguf_probe_from_ctx(ctx);
-    gguf_free(ctx);
-
-    // Ground truth for a local file - trust the filesystem over the tensor-size sum (which
-    // omits header/KV/alignment overhead, a rounding error in practice but free to correct).
+// Ground truth for a local file - trust the filesystem over the tensor-size sum (which omits
+// header/KV/alignment overhead, a rounding error in practice but free to correct).
+void correct_gguf_probe_with_file_size(gguf_probe & p, const std::string & path) {
     std::error_code ec;
     auto file_size = std::filesystem::file_size(path, ec);
     if (!ec && file_size > 0) {
@@ -1002,6 +1068,56 @@ gguf_probe probe_gguf_local(const std::string & path) {
         }
         p.total_gb = real_total_gb;
     }
+}
+
+gguf_probe probe_gguf_local(const std::string & path) {
+    gguf_init_params params;
+    params.no_alloc = true;
+    params.ctx = nullptr;
+    struct gguf_context * ctx = gguf_init_from_file(path.c_str(), params);
+    if (!ctx) return gguf_probe{};
+
+    gguf_probe p = gguf_probe_from_ctx(ctx);
+    gguf_free(ctx);
+    correct_gguf_probe_with_file_size(p, path);
+    p.shards_found = 1;
+
+    // A split GGUF's tensors are spread across split_count files - this one alone only carries
+    // a fraction of the model's actual size. Locate the sibling shards next to it (same naming
+    // convention llama_split_prefix/llama_split_path use for the real model load, see
+    // llama_get_list_splits in src/llama-model-loader.cpp) and fold each one's header-derived
+    // size in, so total_gb/active_gb reflect the whole model instead of just this part.
+    if (p.is_split && p.split_count > 1) {
+        std::vector<char> buf(path.size() + 64, 0);
+        int ret = llama_split_prefix(buf.data(), buf.size(), path.c_str(), p.split_no, p.split_count);
+        if (ret > 0) {
+            std::string prefix(buf.data(), ret);
+            for (int idx = 0; idx < p.split_count; idx++) {
+                if (idx == p.split_no) continue;
+                int wret = llama_split_path(buf.data(), buf.size(), prefix.c_str(), idx, p.split_count);
+                if (wret <= 0) continue;
+                std::string sibling(buf.data(), wret);
+
+                std::error_code ec;
+                if (!std::filesystem::exists(sibling, ec) || ec) continue;
+
+                gguf_init_params sparams;
+                sparams.no_alloc = true;
+                sparams.ctx = nullptr;
+                struct gguf_context * sctx = gguf_init_from_file(sibling.c_str(), sparams);
+                if (!sctx) continue;
+
+                gguf_probe sp = gguf_probe_from_ctx(sctx);
+                gguf_free(sctx);
+                correct_gguf_probe_with_file_size(sp, sibling);
+
+                p.total_gb += sp.total_gb;
+                p.active_gb += sp.active_gb;
+                p.shards_found++;
+            }
+        }
+    }
+
     return p;
 }
 
@@ -1083,6 +1199,44 @@ gguf_probe probe_gguf_remote(const std::string & url) {
 
     gguf_probe p = gguf_probe_from_ctx(ctx);
     gguf_free(ctx);
+    p.shards_found = 1;
+
+    // Same aggregation as probe_gguf_local, but each sibling shard's header is fetched with its
+    // own ranged GET instead of a filesystem open - still never touches tensor data. No file-size
+    // ground truth available here (would need a HEAD request per shard), so this stays on the
+    // tensor-size sum like the single-shard remote case already did.
+    if (p.is_split && p.split_count > 1) {
+        std::vector<char> buf(url.size() + 64, 0);
+        int ret = llama_split_prefix(buf.data(), buf.size(), url.c_str(), p.split_no, p.split_count);
+        if (ret > 0) {
+            std::string prefix(buf.data(), ret);
+            for (int idx = 0; idx < p.split_count; idx++) {
+                if (idx == p.split_no) continue;
+                int wret = llama_split_path(buf.data(), buf.size(), prefix.c_str(), idx, p.split_count);
+                if (wret <= 0) continue;
+                std::string sibling_url(buf.data(), wret);
+
+                gguf_remote_reader sreader;
+                sreader.url = sibling_url;
+                if (!sreader.ensure(0, GGUF_REMOTE_PREFETCH_BYTES)) continue;
+
+                gguf_init_params sparams;
+                sparams.no_alloc = true;
+                sparams.ctx = nullptr;
+                struct gguf_context * sctx =
+                    gguf_init_from_callback(gguf_remote_read_cb, &sreader, 0, GGUF_REMOTE_MAX_HEADER_BYTES, sparams);
+                if (!sctx) continue;
+
+                gguf_probe sp = gguf_probe_from_ctx(sctx);
+                gguf_free(sctx);
+
+                p.total_gb += sp.total_gb;
+                p.active_gb += sp.active_gb;
+                p.shards_found++;
+            }
+        }
+    }
+
     return p;
 }
 
@@ -1638,8 +1792,8 @@ void server_model_picker_register_routes(const server_http_context & ctx_http, c
         // prepare-download uses, just without an active_gb deduction (see comment above).
         uint64_t moe_stream_cache_gb = std::max<uint64_t>(
             1, (uint64_t) (std::max(0.0, hw.vram_free_gb) * CACHE_HEADROOM_FRACTION));
-        uint64_t moe_stream_ram_cache_gb =
-            (uint64_t) (std::max(0.0, hw.ram_free_gb) * RAM_CACHE_HEADROOM_FRACTION);
+        uint64_t moe_stream_ram_cache_gb = (uint64_t) (
+            std::max(0.0, hw.ram_free_gb - RAM_OS_RESERVE_GB) * RAM_CACHE_HEADROOM_FRACTION);
 
         bool plenty_of_vram = hw.vram_free_gb > 8.0;
         bool plenty_of_ram  = hw.ram_free_gb  > 8.0;
@@ -1770,11 +1924,19 @@ void server_model_picker_register_routes(const server_http_context & ctx_http, c
 
             std::string cache_val = std::to_string(cache_gb) + "G";
 
-            // second-tier host-RAM cache: sized off hw.ram_free_gb alone (independent of VRAM/
-            // active_gb/kv_cache_gb above - it's a different physical pool), floored at 0 rather
-            // than 1 since unlike moe-stream-cache this tier is optional and fine to skip
-            // entirely on a RAM-starved box (e.g. WSL2 with a small .wslconfig memory= cap).
-            uint64_t ram_cache_gb = (uint64_t) (std::max(0.0, hw.ram_free_gb) * RAM_CACHE_HEADROOM_FRACTION);
+            // second-tier host-RAM cache: sized off hw.ram_free_gb, a different physical pool
+            // than VRAM/active_gb above, but not fully independent of kv_cache_gb - if this
+            // ctx_size's KV cache doesn't fit VRAM headroom it falls back to host RAM same as
+            // any other llama.cpp load, so it's subtracted here too before the cache gets its
+            // cut, same reasoning as cache_headroom_gb above. RAM_OS_RESERVE_GB comes off first
+            // (see its comment: MoE streaming disables mmap, so this tier's memory - and
+            // whatever else the load needs - is real anonymous RAM, not reclaimable page cache;
+            // a pure percentage split of "free" has no floor against exceeding a small total
+            // pool like an 18GB WSL2 box). Floored at 0 rather than 1 since unlike
+            // moe-stream-cache this tier is optional and fine to skip entirely when there's
+            // nothing left to give it.
+            double ram_headroom_gb = std::max(0.0, hw.ram_free_gb - kv_cache_gb - RAM_OS_RESERVE_GB);
+            uint64_t ram_cache_gb = (uint64_t) (ram_headroom_gb * RAM_CACHE_HEADROOM_FRACTION);
 
             common_preset_write_ini_section(models_preset_path, model_id, {
                 {"moe-stream-cache", cache_val},
@@ -1837,6 +1999,10 @@ void server_model_picker_register_routes(const server_http_context & ctx_http, c
             kv_hparams h = gguf_probe_to_kv_hparams(p);
             double kv_cache_gb = h.ok ? estimate_kv_cache_gb(h, MIN_USEFUL_CTX_TOKENS) : 0.0;
             std::string fit = classify_fit(p.active_gb, p.total_gb, hw.vram_free_gb, free_gb, kv_cache_gb);
+            // p.n_expert/p.n_expert_used come straight from this GGUF's own header (gguf_probe),
+            // the most accurate source available. Informational only (see estimate_min_expert_
+            // cache_gb's comment) - not part of the fit/too-large decision above.
+            double min_cache_gb = estimate_min_expert_cache_gb(p.active_gb, p.total_gb, p.n_expert, p.n_expert_used);
 
             res->status = 200;
             res->data = json{
@@ -1847,8 +2013,11 @@ void server_model_picker_register_routes(const server_http_context & ctx_http, c
                 {"active_gb", p.active_gb},
                 {"total_gb", p.total_gb},
                 {"kv_cache_gb", kv_cache_gb},
+                {"min_expert_cache_gb", min_cache_gb},
                 {"n_ctx_train", p.n_ctx_train},
                 {"is_split", p.is_split},
+                {"split_count", p.split_count},
+                {"shards_found", p.shards_found},
                 {"vram_free_gb", hw.vram_free_gb},
                 {"disk_free_gb", free_gb},
                 {"n_layer", p.n_layer},
