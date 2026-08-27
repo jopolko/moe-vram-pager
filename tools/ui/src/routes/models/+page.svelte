@@ -23,6 +23,7 @@
 	import * as Table from '$lib/components/ui/table';
 	import * as DropdownMenu from '$lib/components/ui/dropdown-menu';
 	import DialogLoadGguf from '$lib/components/app/dialogs/DialogLoadGguf.svelte';
+	import { routerModels } from '$lib/stores/models.svelte.ts';
 
 	interface ModelRow {
 		name: string;
@@ -100,18 +101,32 @@
 	const DEFAULT_CTX = 8192;
 	const CTX_SIZE_OPTIONS = [4096, 8192, 16384, 32768, 65536];
 
+	// Matches RAM_OS_RESERVE_GB in server-model-picker.cpp - see that constant's comment. Applied
+	// here too because bestCtxForRow's VRAM check alone isn't sufficient: a ctx size can clear
+	// the VRAM headroom check yet still be the thing that pushes total host RAM usage over the
+	// edge once it doesn't fit, since --moe-stream disables mmap (nothing is OS-evictable) and a
+	// KV cache that doesn't fit VRAM falls back to host RAM same as any other llama.cpp load. On
+	// a small-RAM box (e.g. an 18GB WSL2 .wslconfig cap) that's the difference between a normal
+	// load and one that swaps a VHDX to the Windows host and drops to well under 1 token/sec.
+	const RAM_SAFETY_RESERVE_GB = 2;
+
 	// Largest context size verified to fit this model's real KV-cache size within current free
-	// VRAM headroom (m.ctx_options_gb, computed server-side by estimate_kv_cache_gb). Falls back
-	// to DEFAULT_CTX when the row's KV hyperparameters couldn't be verified (config.json fetch
-	// failed, or an architecture parse_kv_hparams can't read cleanly) - unverifiable, not zero-cost.
+	// VRAM headroom AND leave a safe amount of system RAM (m.ctx_options_gb, computed
+	// server-side by estimate_kv_cache_gb, doubles as the worst-case host-RAM fallback size -
+	// see RAM_SAFETY_RESERVE_GB above). Falls back to DEFAULT_CTX when the row's KV
+	// hyperparameters couldn't be verified (config.json fetch failed, or an architecture
+	// parse_kv_hparams can't read cleanly) - unverifiable, not zero-cost.
 	function bestCtxForRow(m: ModelRow): number {
 		if (!hardware || !m.kv_verified || m.ctx_options_gb.length !== CTX_SIZE_OPTIONS.length) {
 			return DEFAULT_CTX;
 		}
-		const headroomGb = Math.max(0, hardware.vram_free_gb - m.active_gb);
+		const vramHeadroomGb = Math.max(0, hardware.vram_free_gb - m.active_gb);
+		const ramHeadroomGb = Math.max(0, hardware.ram_free_gb - RAM_SAFETY_RESERVE_GB);
 		let best = DEFAULT_CTX;
 		for (let i = 0; i < CTX_SIZE_OPTIONS.length; i++) {
-			if (m.ctx_options_gb[i] <= headroomGb) best = CTX_SIZE_OPTIONS[i];
+			if (m.ctx_options_gb[i] <= vramHeadroomGb && m.ctx_options_gb[i] <= ramHeadroomGb) {
+				best = CTX_SIZE_OPTIONS[i];
+			}
 		}
 		return best;
 	}
@@ -183,6 +198,16 @@
 	);
 
 	let dlEntries = $derived(Object.entries(dlState).sort(([a], [b]) => a.localeCompare(b)));
+
+	// id -> friendly alias, from the router's live /models response, so the "Loaded:"
+	// dropdown can show names instead of raw local/url/ollama paths (dlState only has id/phase)
+	let dlAliases = $derived(
+		Object.fromEntries(
+			routerModels()
+				.filter((m) => m.aliases?.[0])
+				.map((m) => [m.id, m.aliases[0]])
+		) as Record<string, string>
+	);
 
 	async function refreshRouterModels() {
 		if (!routerAvailable) return;
@@ -308,7 +333,16 @@
 			// router mode not available; the Actions column falls back silently
 		}
 		void refreshRouterModels();
-		return () => es?.close();
+		// Fallback reconciliation poll: an EventSource can go silently dead (WSL2/proxy
+		// idle timeout, tab backgrounded, etc.) without the browser ever firing onerror/
+		// onopen to trigger a resync - so a dropped terminal event (download_finished,
+		// status_change) can otherwise leave a row stuck showing stale progress forever.
+		// This poll is the self-healing backstop; the SSE feed stays the fast path.
+		const reconcileTimer = setInterval(() => void refreshRouterModels(), 5000);
+		return () => {
+			es?.close();
+			clearInterval(reconcileTimer);
+		};
 	});
 
 	async function downloadModel(m: ModelRow) {
@@ -707,7 +741,9 @@
 							class="-mx-1 inline-flex max-w-[20rem] items-center gap-1 rounded-sm px-1 hover:bg-muted-foreground/10"
 						>
 							<span class="text-muted-foreground">Loaded:</span>
-							<span class="min-w-0 truncate">{currentModelId ?? 'None'}</span>
+							<span class="min-w-0 truncate"
+								>{currentModelId ? (dlAliases[currentModelId] ?? currentModelId) : 'None'}</span
+							>
 							<ChevronDown class="h-3 w-3 shrink-0 text-muted-foreground" />
 						</button>
 					{/snippet}
@@ -735,7 +771,7 @@
 									{:else if state.phase === 'loading' || state.phase === 'downloading' || state.phase === 'downloaded'}
 										<Loader2 class="h-3.5 w-3.5 animate-spin" />
 									{/if}
-									<span class="min-w-0 truncate" title={id}>{id}</span>
+									<span class="min-w-0 truncate" title={id}>{dlAliases[id] ?? id}</span>
 								</DropdownMenu.Item>
 								{#if state.phase === 'loaded'}
 									<button

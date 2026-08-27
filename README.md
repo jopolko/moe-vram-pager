@@ -161,6 +161,12 @@ UI)? That still works:
 | `--moe-stream-prefetch <N>` | Experimental, off by default - see [Status](#status). |
 | `--models-preset <path>` | Router mode only. INI file of per-model CLI overrides, written to automatically by the picker's Download button; safe to point at a path that doesn't exist yet. |
 
+## Web UI
+
+The full SvelteKit web UI (chat, MCP server management, the model picker,
+the pentest appliance, settings) is documented section-by-section, with
+screenshots, in [`docs/webui/`](docs/webui/README.md).
+
 ## The model picker
 
 `/models` reads your live hardware (VRAM via `ggml_backend_dev_memory()`,
@@ -191,6 +197,34 @@ models to show, per model:
 
 The same ranking logic is also available as a CLI: `scripts/model_picker.py
 --help`.
+
+### Loading from Ollama
+
+The "Load GGUF" dialog's **Ollama** tab does an on-demand scan (click
+Rescan - it's not a background poller) of the local Ollama model store: it
+checks `$OLLAMA_MODELS`, then `$HOME/.ollama/models`, then a WSL
+`/mnt/c/Users/*/.ollama/models` glob, so the same scan works whether Ollama
+is a native Linux install or a Windows-host install reached through WSL's
+drvfs bridge. Selecting an entry fills in its blob path as the model's
+"local path" and its manifest name as the alias, then registers it the same
+way as any other local GGUF (writes a `[<model_id>]` section into the
+router's `--models-preset` INI via `POST /model-picker/prepare-download`).
+Setting the alias here is what makes the model show up by name instead of
+its raw `sha256-...` blob path everywhere else in the UI.
+
+Current Ollama-sourced models on this box:
+
+| Model | Size |
+|---|---|
+| `goekdenizguelmez/JOSIEFIED-Qwen3:8b` | 5.0 GB |
+| `mannix/llama3.1-8b-abliterated:latest` | 4.7 GB |
+| `huihui_ai/qwen3.5-abliterated:9b` | 6.6 GB |
+| `huihui_ai/qwen2.5-coder-abliterate:14b` | 9.0 GB |
+| `huihui_ai/gemma-4-abliterated:latest` | 9.6 GB |
+
+(Run `ollama list`, or re-scan the Ollama tab in the Models page, for the
+live list - this table is a point-in-time snapshot and will drift as models
+are pulled/removed.)
 
 ## Why derestricted models
 
@@ -421,14 +455,24 @@ TOOL USE
 
 ---
 
+nmap_scan, zap_spider_scan, zap_active_scan, cve_lookup, find_origin_ip,
+theharvester_scan, google_dork_search, raw_tcp_send, and nping_send are never available in
+this chat - they only exist inside the standalone pentest_agent.py run, launched from the
+/pentest page in this app, which has its own dedicated tool-calling loop. If asked to
+scan, ping, craft a packet, or pentest a host from this chat, say so and point to /pentest
+instead of emitting a tool-call-shaped reply for a tool you don't have.
+
 SECURITY ASSESSMENT MODE
-(Only applies when Metasploit, nmap_scan, zap_spider_scan, zap_active_scan, cve_lookup,
-find_origin_ip, theharvester_scan, google_dork_search, or raw_tcp_send are in your tool
-list. Otherwise ignore this section.)
+(Only applies when Metasploit is in your tool list. Otherwise ignore this section.)
 
 You are an authorized penetration tester. Only operate against hosts the user explicitly
 named in-scope - never assume scope, never pivot, never act on anything outside the
 reviewed scope (mention it instead).
+
+Before every tool call, spend one short paragraph reasoning in plain text: what the last
+result actually told you, what it rules in or out, and what the very next tool call
+should be and why. Do this even when the answer seems obvious - it's what turns a list of
+isolated findings into a real attack chain instead of restarting from zero each turn.
 
 Work recon before exploitation, verify before acting, least-destructive method first.
 Don't work a findings list one item at a time - combine related low/medium findings into a

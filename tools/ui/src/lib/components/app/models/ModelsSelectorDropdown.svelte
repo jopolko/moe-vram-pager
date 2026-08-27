@@ -155,6 +155,7 @@
 								{#if selectedOption}
 									<ModelId
 										modelId={selectedOption.model}
+										aliases={selectedOption.aliases}
 										class="min-w-0 overflow-hidden"
 										hideOrgName={false}
 										hideQuantization
@@ -178,7 +179,7 @@
 
 					{#if selectedOption}
 						<Tooltip.Content>
-							<p class="font-mono">{selectedOption.model}</p>
+							<p class="font-mono">{selectedOption.aliases?.[0] ?? selectedOption.model}</p>
 						</Tooltip.Content>
 					{/if}
 				</Tooltip.Root>
@@ -280,6 +281,7 @@
 							{#if selectedOption}
 								<ModelId
 									modelId={selectedOption.model}
+									aliases={selectedOption.aliases}
 									class="min-w-0 overflow-hidden"
 									hideOrgName={false}
 									hideQuantization
@@ -295,7 +297,7 @@
 
 				{#if selectedOption}
 					<Tooltip.Content>
-						<p class="font-mono">{selectedOption.model}</p>
+						<p class="font-mono">{selectedOption.aliases?.[0] ?? selectedOption.model}</p>
 					</Tooltip.Content>
 				{/if}
 			</Tooltip.Root>

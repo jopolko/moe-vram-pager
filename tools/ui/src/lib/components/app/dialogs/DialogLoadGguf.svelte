@@ -35,23 +35,57 @@
 		onLoaded: () => void;
 	}
 
+	interface OllamaModel {
+		name: string;
+		path: string;
+		size_gb: number;
+		modified_unix: number;
+	}
+
 	let { open = $bindable(), onLoaded }: Props = $props();
 
-	let mode = $state<'local' | 'url'>('url');
+	let mode = $state<'local' | 'url' | 'ollama'>('url');
 	let localPath = $state('');
 	let remoteUrl = $state('');
+	let ollamaModels = $state<OllamaModel[]>([]);
+	let ollamaLoading = $state(false);
+	let ollamaError = $state('');
+	let selectedOllamaModel = $state<OllamaModel | null>(null);
 	let assessing = $state(false);
 	let assessment = $state<Assessment | null>(null);
 	let assessError = $state('');
 	let override = $state(false);
 	let proceeding = $state(false);
 
-	const source = $derived(mode === 'local' ? localPath.trim() : remoteUrl.trim());
+	// Ollama models resolve to a local blob path - from here on they're loaded exactly like a
+	// hand-typed local path, just with a friendlier alias attached (see proceed()).
+	const source = $derived(
+		mode === 'url' ? remoteUrl.trim() : mode === 'ollama' ? (selectedOllamaModel?.path ?? '') : localPath.trim()
+	);
+
+	async function loadOllamaModels() {
+		ollamaLoading = true;
+		ollamaError = '';
+		try {
+			const resp = await fetch('./model-picker/ollama-models');
+			const body = await resp.json().catch(() => ({}));
+			if (!resp.ok) throw new Error(body.error || `Request failed (${resp.status})`);
+			ollamaModels = (body.models ?? []) as OllamaModel[];
+			ollamaModels.sort((a, b) => b.modified_unix - a.modified_unix);
+		} catch (e) {
+			ollamaError = e instanceof Error ? e.message : String(e);
+		} finally {
+			ollamaLoading = false;
+		}
+	}
 
 	function reset() {
 		mode = 'url';
 		localPath = '';
 		remoteUrl = '';
+		ollamaModels = [];
+		ollamaError = '';
+		selectedOllamaModel = null;
 		assessing = false;
 		assessment = null;
 		assessError = '';
@@ -94,7 +128,7 @@
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify(
-					mode === 'local' ? { source: 'local', path: source } : { source: 'url', url: source }
+					mode === 'url' ? { source: 'url', url: source } : { source: 'local', path: source }
 				)
 			});
 			const body = await resp.json().catch(() => ({}));
@@ -118,7 +152,8 @@
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({
-					[mode === 'local' ? 'path' : 'url']: source,
+					[mode === 'url' ? 'url' : 'path']: source,
+					...(mode === 'ollama' && selectedOllamaModel ? { alias: selectedOllamaModel.name } : {}),
 					active_gb: assessment.active_gb,
 					ctx_size: assessment.n_ctx_train,
 					n_layer: assessment.n_layer,
@@ -132,7 +167,7 @@
 			const resp = await fetch('./models', {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ model: source, source: mode })
+				body: JSON.stringify({ model: source, source: mode === 'url' ? 'url' : 'local' })
 			});
 			if (!resp.ok) {
 				const body = await resp.json().catch(() => ({}));
@@ -190,32 +225,90 @@
 			>
 				Local path
 			</Button>
-		</div>
-
-		<div class="flex flex-col gap-2">
-			<Label for="gguf-source">{mode === 'local' ? 'Path on disk' : 'URL'}</Label>
-			{#if mode === 'local'}
-				<Input
-					id="gguf-source"
-					bind:value={localPath}
-					oninput={handleLocalInput}
-					placeholder="/path/to/model.gguf"
-				/>
-			{:else}
-				<Input
-					id="gguf-source"
-					bind:value={remoteUrl}
-					oninput={invalidate}
-					placeholder="https://.../model.gguf"
-				/>
-			{/if}
-			<Button size="sm" variant="outline" disabled={!source || assessing} onclick={assess}>
-				{#if assessing}
-					<Loader2 class="h-3.5 w-3.5 animate-spin" />
-				{/if}
-				Assess
+			<Button
+				size="sm"
+				variant={mode === 'ollama' ? 'default' : 'outline'}
+				onclick={() => {
+					mode = 'ollama';
+					invalidate();
+					void loadOllamaModels();
+				}}
+			>
+				Ollama
 			</Button>
 		</div>
+
+		{#if mode === 'ollama'}
+			<div class="flex flex-col gap-2">
+				<div class="flex items-center justify-between">
+					<Label>Installed Ollama models</Label>
+					<Button size="sm" variant="ghost" disabled={ollamaLoading} onclick={loadOllamaModels}>
+						{#if ollamaLoading}
+							<Loader2 class="h-3.5 w-3.5 animate-spin" />
+						{/if}
+						Rescan
+					</Button>
+				</div>
+				{#if ollamaError}
+					<p class="text-sm text-destructive">{ollamaError}</p>
+				{:else if !ollamaLoading && ollamaModels.length === 0}
+					<p class="text-sm text-muted-foreground">
+						No Ollama models found (checked $OLLAMA_MODELS / ~/.ollama, and the Windows host's
+						profile under WSL).
+					</p>
+				{:else}
+					<div class="flex max-h-48 flex-col gap-1 overflow-y-auto">
+						{#each ollamaModels as m (m.path)}
+							<button
+								type="button"
+								class="flex items-center justify-between rounded-md border px-2 py-1.5 text-left text-sm hover:bg-accent {selectedOllamaModel?.path ===
+								m.path
+									? 'border-primary bg-accent'
+									: 'border-border/50'}"
+								onclick={() => {
+									selectedOllamaModel = m;
+									invalidate();
+								}}
+							>
+								<span>{m.name}</span>
+								<span class="text-muted-foreground">{m.size_gb.toFixed(1)} GB</span>
+							</button>
+						{/each}
+					</div>
+				{/if}
+				<Button size="sm" variant="outline" disabled={!source || assessing} onclick={assess}>
+					{#if assessing}
+						<Loader2 class="h-3.5 w-3.5 animate-spin" />
+					{/if}
+					Assess
+				</Button>
+			</div>
+		{:else}
+			<div class="flex flex-col gap-2">
+				<Label for="gguf-source">{mode === 'local' ? 'Path on disk' : 'URL'}</Label>
+				{#if mode === 'local'}
+					<Input
+						id="gguf-source"
+						bind:value={localPath}
+						oninput={handleLocalInput}
+						placeholder="/path/to/model.gguf"
+					/>
+				{:else}
+					<Input
+						id="gguf-source"
+						bind:value={remoteUrl}
+						oninput={invalidate}
+						placeholder="https://.../model.gguf"
+					/>
+				{/if}
+				<Button size="sm" variant="outline" disabled={!source || assessing} onclick={assess}>
+					{#if assessing}
+						<Loader2 class="h-3.5 w-3.5 animate-spin" />
+					{/if}
+					Assess
+				</Button>
+			</div>
+		{/if}
 
 		{#if assessError}
 			<p class="text-sm text-destructive">{assessError}</p>

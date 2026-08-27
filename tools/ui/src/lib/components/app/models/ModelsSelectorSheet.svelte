@@ -103,6 +103,7 @@
 					<ModelId
 						class="text-xs"
 						modelId={selectedOption?.model || ''}
+						aliases={selectedOption?.aliases}
 						hideQuantization
 						hideTags
 						hideOrgName
@@ -189,7 +190,12 @@
 			>
 				<Package class="h-3.5 w-3.5 shrink-0" />
 
-				<ModelId modelId={selectedOption?.model || ''} class="font-medium" hideQuantization />
+				<ModelId
+					modelId={selectedOption?.model || ''}
+					aliases={selectedOption?.aliases}
+					class="font-medium"
+					hideQuantization
+				/>
 
 				{#if ms.updating}
 					<Loader2 class="h-3 w-3.5 shrink-0 animate-spin" />

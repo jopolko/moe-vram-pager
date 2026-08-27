@@ -233,6 +233,7 @@ export interface RecommendedMCPServer extends MCPServerDisplayInfo {
 	description: string;
 	enabled: boolean;
 	requestTimeoutSeconds: number;
+	useProxy?: boolean;
 }
 
 export interface MCPHostManagerConfig {

@@ -206,7 +206,14 @@ void server_model_meta::update_args(common_preset_context & ctx_preset, std::str
     unset_reserved_args(preset, false);
     preset.set_option(ctx_preset, "LLAMA_ARG_HOST",  CHILD_ADDR);
     preset.set_option(ctx_preset, "LLAMA_ARG_PORT",  std::to_string(port));
-    preset.set_option(ctx_preset, "LLAMA_ARG_ALIAS", name);
+    // keep an already-configured friendly alias (e.g. from the preset ini) instead of
+    // clobbering it with the raw model id/path - that raw id is what local/url/ollama
+    // sources use as their unique name, so overwriting here made the spawned child
+    // advertise the sha256 blob path as its own model name everywhere downstream
+    std::string existing_alias;
+    if (!preset.get_option("LLAMA_ARG_ALIAS", existing_alias) || existing_alias.empty()) {
+        preset.set_option(ctx_preset, "LLAMA_ARG_ALIAS", name);
+    }
     // TODO: maybe validate preset before rendering ?
     // render args
     args = preset.to_args(bin_path);
@@ -2038,7 +2045,13 @@ void server_models_routes::init_routes() {
         // there so far). common_models_handler_apply() also guards against this when the actual
         // download runs, but catching it here means the UI gets an immediate, honest rejection
         // instead of the picker implying the download will work.
-        if (handler.plan.model_files.empty() && handler.plan.preset.local_path.empty()) {
+        //
+        // Only applies to source == "hf": common_models_handler_init() only calls
+        // common_download_get_hf_plan() when p.model.hf_repo is set, so for "local"/"url" (p.model.
+        // path or p.model.url instead) handler.plan is always empty here regardless of whether the
+        // file/URL is valid - there's nothing to download-plan in the first place, the file's
+        // existence was already confirmed by /model-picker/assess-gguf.
+        if (source == "hf" && handler.plan.model_files.empty() && handler.plan.preset.local_path.empty()) {
             throw std::invalid_argument(
                 "no downloadable GGUF model file found in repository '" + name + "' (it may only "
                 "contain non-model files such as an imatrix, or the requested quant/tag isn't "
@@ -2048,6 +2061,19 @@ void server_models_routes::init_routes() {
         // reject if model already exists
         if (models.has_model(name)) {
             throw std::invalid_argument("model '" + name + "' already exists");
+        }
+
+        // For "local"/"url", the "download" below is a no-op (nothing to fetch, the file/URL
+        // already exists) - unlike a real HF download, nothing else ever persists this model's
+        // source into the preset file. Without this, load_models()'s next reload (triggered
+        // right after the download-complete event below) finds a preset section with only
+        // /model-picker/prepare-download's ctx-size/moe-stream-cache keys and no model/model-url,
+        // and drops it as an orphan (see the "dropping orphaned model-picker preset entry"
+        // warning) before it's ever loadable.
+        if ((source == "local" || source == "url") && !this->params.models_preset.empty()) {
+            common_preset_write_ini_section(this->params.models_preset, name, {
+                {source == "local" ? "model" : "model-url", name},
+            });
         }
 
         // then, proceed with the actual download

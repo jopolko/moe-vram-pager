@@ -62,6 +62,13 @@
 			if (modelOptions().some((m) => m.model === conversationModel)) {
 				modelsStore.selectedModelName = conversationModel;
 				modelsStore.selectModelByName(conversationModel);
+				// Start the (possibly slow, disk-streamed MoE) VRAM load the moment a chat opens
+				// on this model, instead of leaving it to happen lazily on the first prompt send -
+				// loadModel() already no-ops if it's loaded or a load is already in flight, so this
+				// is safe to fire on every conversation open/switch, not just the manual picker.
+				if (isRouter) {
+					modelsStore.loadModel(conversationModel).catch(() => {});
+				}
 			} else {
 				modelsStore.selectedModelName = null;
 				modelsStore.clearSelection();

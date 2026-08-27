@@ -356,7 +356,13 @@ double nvidia_smi_vram_free_gb() {
 #ifdef _WIN32
     FILE * pipe = _popen("nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>NUL", "r");
 #else
-    FILE * pipe = popen("nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null", "r");
+    // Under WSL2, nvidia-smi lives at /usr/lib/wsl/lib/nvidia-smi, added to PATH only by
+    // WSL's interactive shell init - a systemd service (llama-moe-router.service) starts
+    // with the plain system PATH and won't find a bare "nvidia-smi", silently falling back
+    // to the unreliable ggml_backend_dev_memory() value above instead of ever reaching this
+    // function's result. Append the WSL path so this resolves regardless of PATH.
+    FILE * pipe = popen("PATH=\"$PATH:/usr/lib/wsl/lib\" nvidia-smi "
+                         "--query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null", "r");
 #endif
     if (!pipe) return -1.0;
 
@@ -1859,6 +1865,7 @@ void server_model_picker_register_routes(const server_http_context & ctx_http, c
             std::string quant     = body.value("quant", std::string());
             std::string path      = body.value("path", std::string()); // ad-hoc local-file source
             std::string url       = body.value("url", std::string());  // ad-hoc direct-URL source
+            std::string alias     = body.value("alias", std::string()); // optional friendly display name
             double      active_gb = body.value("active_gb", 0.0);
             int         ctx_size  = body.value("ctx_size", DEFAULT_CTX_SIZE);
 
@@ -1938,11 +1945,13 @@ void server_model_picker_register_routes(const server_http_context & ctx_http, c
             double ram_headroom_gb = std::max(0.0, hw.ram_free_gb - kv_cache_gb - RAM_OS_RESERVE_GB);
             uint64_t ram_cache_gb = (uint64_t) (ram_headroom_gb * RAM_CACHE_HEADROOM_FRACTION);
 
-            common_preset_write_ini_section(models_preset_path, model_id, {
+            std::map<std::string, std::string> ini_kv = {
                 {"moe-stream-cache", cache_val},
                 {"moe-stream-ram-cache", std::to_string(ram_cache_gb)},
                 {"ctx-size", std::to_string(ctx_size)},
-            });
+            };
+            if (!alias.empty()) ini_kv["alias"] = alias;
+            common_preset_write_ini_section(models_preset_path, model_id, ini_kv);
 
             res->status = 200;
             res->data = json{
@@ -1957,6 +1966,113 @@ void server_model_picker_register_routes(const server_http_context & ctx_http, c
             res->data = json{{"error", e.what()}}.dump();
         }
 
+        return res;
+    });
+
+    // Ollama stores each pulled model as a JSON "manifest" (named <registry>/<namespace>/<model>/
+    // <tag>) listing content-addressed "layers" by digest; the actual GGUF weights are whichever
+    // layer has mediaType "application/vnd.ollama.image.model" - the blob at
+    // <models_root>/blobs/sha256-<digest tail>, no ".gguf" extension. This walks that manifest
+    // tree and resolves each one straight to its blob path, purely from local JSON/filesystem
+    // metadata - no gguf header is opened here, so this stays cheap even with many models
+    // installed. Fed into the exact same assess-gguf -> prepare-download -> POST /models flow a
+    // manually-pasted local path already uses; picking one here just fills in that path.
+    ctx_http.get("/model-picker/ollama-models", [](const server_http_req &) -> server_http_res_ptr {
+        auto res = std::make_unique<server_http_res>();
+        res->content_type = "application/json; charset=utf-8";
+
+        std::vector<std::filesystem::path> roots;
+        if (const char * env = std::getenv("OLLAMA_MODELS"); env && *env) {
+            roots.emplace_back(env);
+        } else if (const char * home = std::getenv("HOME"); home && *home) {
+            roots.emplace_back(std::filesystem::path(home) / ".ollama" / "models");
+        }
+        // WSL fallback: Ollama is commonly installed on the Windows host rather than inside the
+        // WSL distro itself, in which case its models live under the Windows user profile,
+        // reachable at /mnt/c/Users/<name>/.ollama/models via the drvfs bridge. Only tried when
+        // the primary root above doesn't already exist, and only one Windows user directory
+        // needs to actually contain a manifests tree to be picked.
+        std::error_code root_ec;
+        if (roots.empty() || !std::filesystem::exists(roots[0], root_ec)) {
+            std::error_code ec;
+            for (const auto & user_dir : std::filesystem::directory_iterator("/mnt/c/Users", ec)) {
+                auto candidate = user_dir.path() / ".ollama" / "models";
+                if (std::filesystem::exists(candidate / "manifests", ec)) {
+                    roots.push_back(candidate);
+                }
+            }
+        }
+
+        json models = json::array();
+        for (const auto & root : roots) {
+            auto manifests_dir = root / "manifests";
+            std::error_code ec;
+            if (!std::filesystem::exists(manifests_dir, ec)) continue;
+
+            for (auto it = std::filesystem::recursive_directory_iterator(manifests_dir, ec);
+                 it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
+                if (ec || !it->is_regular_file()) continue;
+
+                std::ifstream f(it->path());
+                json manifest;
+                try {
+                    f >> manifest;
+                } catch (...) {
+                    continue; // not JSON - shouldn't happen under manifests/, skip defensively
+                }
+                if (!manifest.contains("layers")) continue;
+
+                std::string digest;
+                uint64_t size = 0;
+                for (auto & layer : manifest["layers"]) {
+                    if (layer.value("mediaType", "") == "application/vnd.ollama.image.model") {
+                        digest = layer.value("digest", "");
+                        size   = layer.value("size", (uint64_t) 0);
+                        break;
+                    }
+                }
+                if (digest.empty()) continue; // manifest with no model layer - shouldn't happen
+
+                std::replace(digest.begin(), digest.end(), ':', '-');
+                std::filesystem::path blob_path = root / "blobs" / digest;
+                if (!std::filesystem::exists(blob_path, ec)) continue; // manifest present, blob missing/pruned
+
+                // manifest path relative to manifests/, e.g. registry.ollama.ai/library/llama3/8b
+                // or registry.ollama.ai/mannix/llama3.1-8b-abliterated/latest -> name is every
+                // segment after the registry host joined with '/', tag is the last segment,
+                // reassembled the way `ollama list` displays it: "mannix/llama3.1-8b-abliterated:latest"
+                auto rel = std::filesystem::relative(it->path(), manifests_dir, ec);
+                std::vector<std::string> parts;
+                for (auto & part : rel) parts.push_back(part.string());
+                if (parts.size() < 2) continue;
+                std::string tag = parts.back();
+                std::string name;
+                for (size_t i = 1; i + 1 < parts.size(); i++) {
+                    if (!name.empty()) name += "/";
+                    name += parts[i];
+                }
+                if (name.empty()) continue;
+
+                // pre-C++20 file_time_type -> system_clock conversion (no clock_cast available)
+                auto ftime = std::filesystem::last_write_time(blob_path, ec);
+                int64_t mtime_unix = 0;
+                if (!ec) {
+                    auto sctp = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+                        ftime - std::filesystem::file_time_type::clock::now() + std::chrono::system_clock::now());
+                    mtime_unix = std::chrono::system_clock::to_time_t(sctp);
+                }
+
+                models.push_back({
+                    {"name", name + ":" + tag},
+                    {"path", blob_path.string()},
+                    {"size_gb", (double) size / 1e9},
+                    {"modified_unix", mtime_unix},
+                });
+            }
+        }
+
+        res->status = 200;
+        res->data = json{{"models", models}}.dump();
         return res;
     });
 

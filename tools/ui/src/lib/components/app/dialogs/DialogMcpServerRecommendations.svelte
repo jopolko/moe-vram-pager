@@ -71,7 +71,8 @@
 						id: server.id,
 						enabled: true,
 						url: server.url,
-						name: server.name
+						name: server.name,
+						useProxy: server.useProxy
 					});
 				}
 				conversationsStore.setMcpServerOverride(server.id, true);

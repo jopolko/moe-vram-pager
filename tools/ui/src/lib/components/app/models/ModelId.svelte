@@ -32,6 +32,11 @@
 		'inline-flex w-fit shrink-0 items-center justify-center whitespace-nowrap rounded-md border border-border/50 px-1 py-0 text-[10px] font-mono text-foreground [a&]:hover:bg-accent [a&]:hover:text-accent-foreground';
 
 	let parsed = $derived(ModelsService.parseModelId(modelId));
+	// local/url/ollama-sourced ids are filesystem paths or content-hash blobs, not HF-style
+	// repo ids - parsing one yields a meaningless "sha256-..." fragment as modelName, which
+	// must never be shown as if it were a real model name/badge once a friendly alias exists
+	const HASH_LIKE_RE = /^sha256-[0-9a-f]{16,}$/i;
+	let isHashLikeName = $derived(HASH_LIKE_RE.test(parsed.modelName ?? ''));
 	let resolvedShowRaw = $derived(showRaw ?? (config().showRawModelNames as boolean) ?? false);
 	let resolvedHideQuantization = $derived(hideQuantization ?? !config().showModelQuantization);
 	let resolvedHideTags = $derived(hideTags ?? !config().showModelTags);
@@ -40,7 +45,9 @@
 	let uniqueTags = $derived([...new Set([...(parsed.tags ?? []), ...(tags ?? [])])]);
 
 	let primaryAlias = $derived(uniqueAliases.length === 1 ? uniqueAliases[0] : null);
-	let displayName = $derived(primaryAlias ?? parsed.modelName ?? modelId);
+	let displayName = $derived(
+		primaryAlias ?? (isHashLikeName ? modelId : (parsed.modelName ?? modelId))
+	);
 </script>
 
 {#if resolvedShowRaw}
@@ -64,7 +71,7 @@
 		{/if}
 
 		{#if primaryAlias}
-			{#if primaryAlias !== parsed.modelName}
+			{#if primaryAlias !== parsed.modelName && !isHashLikeName}
 				<span class={badgeClass}>{parsed.modelName ?? modelId}</span>
 			{/if}
 		{:else if uniqueAliases.length > 1}

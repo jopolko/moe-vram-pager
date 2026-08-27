@@ -403,8 +403,15 @@ class ModelsStore {
 		return response.data.map((item: ApiModelDataEntry, index: number) => {
 			const details = response.models?.[index];
 			const rawCapabilities = Array.isArray(details?.capabilities) ? details?.capabilities : [];
+			// details.name comes from the GGUF's own embedded metadata (often missing or unhelpful
+			// for an ad-hoc/ollama-sourced model); item.aliases[0] is the router's own preset-level
+			// name (e.g. set via prepare-download's "alias" field for ollama picks) - prefer that
+			// over falling all the way back to item.id, which for a local/url/ollama model is the
+			// raw file path, not something a user picking from a dropdown can read.
 			const displayNameSource =
-				details?.name && details.name.trim().length > 0 ? details.name : item.id;
+				details?.name && details.name.trim().length > 0
+					? details.name
+					: (item.aliases?.[0] ?? item.id);
 			const modelId = details?.model || item.id;
 
 			return {
