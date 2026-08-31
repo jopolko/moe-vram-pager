@@ -32,6 +32,7 @@ import type {
 	MCPResourceIcon,
 	ToolCallParams,
 	ToolExecutionResult,
+	ToolProgressCallback,
 	Implementation,
 	ClientCapabilities,
 	MCPConnection,
@@ -911,7 +912,8 @@ export class MCPService {
 	static async callTool(
 		connection: MCPConnection,
 		params: ToolCallParams,
-		signal?: AbortSignal
+		signal?: AbortSignal,
+		onProgress?: ToolProgressCallback
 	): Promise<ToolExecutionResult> {
 		throwIfAborted(signal);
 
@@ -919,7 +921,16 @@ export class MCPService {
 			const result = await connection.client.callTool(
 				{ name: params.name, arguments: params.arguments },
 				undefined,
-				{ signal, timeout: connection.requestTimeoutMs }
+				{
+					signal,
+					timeout: connection.requestTimeoutMs,
+					...(onProgress
+						? {
+								onprogress: (p: { progress: number; total?: number; message?: string }) =>
+									onProgress(p.progress, p.total, p.message)
+							}
+						: {})
+				}
 			);
 
 			return {

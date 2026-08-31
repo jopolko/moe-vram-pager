@@ -3,7 +3,7 @@
 ## Reporting a vulnerability
 
 Open a [private security advisory](../../security/advisories/new) on this
-repo (`jopolko/moe-vram-pager`), not on upstream llama.cpp's. This is a
+repo (`jopolko/openbench-toolkit`), not on upstream llama.cpp's. This is a
 personal project maintained by one person, so skip the multi-week embargo
 process; a clear description and, if you have one, a minimal reproduction
 is enough. If GitHub advisories aren't working for you, open a regular

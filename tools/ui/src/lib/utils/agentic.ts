@@ -14,6 +14,7 @@ import { AttachmentType } from '$lib/enums';
 export interface AgenticSection {
 	type: AgenticSectionType;
 	content: string;
+	toolCallId?: string;
 	toolName?: string;
 	toolArgs?: string;
 	toolResult?: string;
@@ -78,6 +79,7 @@ function deriveSingleTurnSections(
 		sections.push({
 			type,
 			content: resultMsg?.content || '',
+			toolCallId: tc.id,
 			toolName: tc.function?.name,
 			toolArgs: tc.function?.arguments,
 			toolResult: resultMsg?.content,

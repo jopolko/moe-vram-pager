@@ -134,6 +134,7 @@ export type {
 	ServerStatus,
 	ToolCallParams,
 	ToolExecutionResult,
+	ToolProgressCallback,
 	ServerBuiltinToolInfo,
 	Tool,
 	Prompt,

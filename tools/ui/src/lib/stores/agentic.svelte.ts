@@ -23,6 +23,7 @@
 import { ChatService } from '$lib/services';
 import { config } from '$lib/stores/settings.svelte';
 import { mcpStore } from '$lib/stores/mcp.svelte';
+import { toolProgressStore } from '$lib/stores/tool-progress.svelte';
 import { modelsStore } from '$lib/stores/models.svelte';
 import { toolsStore } from '$lib/stores/tools.svelte';
 import { permissionsStore } from '$lib/stores/permissions.svelte';
@@ -804,9 +805,18 @@ class AgenticStore {
 								id: toolCall.id,
 								function: { name: toolName, arguments: toolCall.function.arguments }
 							};
-							const executionResult = await mcpStore.executeTool(mcpCall, signal);
+							try {
+								const executionResult = await mcpStore.executeTool(
+									mcpCall,
+									signal,
+									(progress, total, message) =>
+										toolProgressStore.set(toolCall.id, { progress, total, message })
+								);
 
-							result = executionResult.content;
+								result = executionResult.content;
+							} finally {
+								toolProgressStore.clear(toolCall.id);
+							}
 						}
 					} catch (error) {
 						if (isAbortError(error)) {

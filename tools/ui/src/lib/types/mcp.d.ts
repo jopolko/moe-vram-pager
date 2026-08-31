@@ -270,6 +270,9 @@ export interface ToolCallParams {
 	arguments: Record<string, unknown>;
 }
 
+/** Live progress callback for a single MCP tool call - see notifications/progress. */
+export type ToolProgressCallback = (progress: number, total?: number, message?: string) => void;
+
 export interface ToolExecutionResult {
 	content: string;
 	isError: boolean;

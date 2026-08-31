@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch models-preset.ini for new/changed models and auto-tune ctx-size + KV cache quant
+
+[Path]
+PathModified=/home/josh/.cache/llama-moe-pager/models-preset.ini
+Unit=auto-kv-tune.service
+
+[Install]
+WantedBy=multi-user.target

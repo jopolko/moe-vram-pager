@@ -6,7 +6,7 @@ history log.
 
 ## Where things live
 
-- Repo root / working directory for everything below: `/home/josh/moe-vram-pager`
+- Repo root / working directory for everything below: `/home/josh/openbench-toolkit`
   (no separate pentest folder - the appliance scripts, `tools/pentest_agent.py`,
   and `runs/` all live in this one repo).
 - Run logs: `runs/<UTC timestamp>-<phase>.json` (recon / exploit / osint).
@@ -32,7 +32,7 @@ history log.
   - `~/MetasploitMCP/MetasploitMCP.py` - added `validate_module` tool
     (ground-truth module-name check against the live MSF module tree, with
     close-match suggestions on miss).
-  - `~/moe-vram-pager/tools/pentest_agent.py` - dispatch-time gate on
+  - `~/openbench-toolkit/tools/pentest_agent.py` - dispatch-time gate on
     `run_exploit`/`run_auxiliary_module`/`run_post_module`: validates the
     module name before the real call, 2-strike counter permanently blocks a
     repeated bad name for the rest of the run.

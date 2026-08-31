@@ -87,7 +87,7 @@ const SETTINGS_REGISTRY: Record<string, SettingsSectionEntry> = {
 			{
 				key: SETTINGS_KEYS.SYSTEM_MESSAGE,
 				label: 'System Message',
-				help: 'The starting message that defines how model should behave.',
+				help: 'The starting message that defines how the model should behave, in both chat and the standalone pentest agent (the /pentest page).',
 				defaultValue: DEFAULT_SYSTEM_PROMPT,
 				type: SettingsFieldType.TEXTAREA,
 				section: SETTINGS_SECTION_SLUGS.GENERAL,
@@ -718,6 +718,24 @@ const SETTINGS_REGISTRY: Record<string, SettingsSectionEntry> = {
 					serverKey: SETTINGS_KEYS.EXCLUDE_REASONING_FROM_CONTEXT,
 					paramType: SyncableParameterType.BOOLEAN
 				}
+			},
+			{
+				key: SETTINGS_KEYS.FORCE_REASONING_CONTROL,
+				label: 'Always show reasoning control',
+				help: 'Show the Thinking / reasoning-effort control in the chat toolbar even when the model chat template does not advertise thinking support. Useful for abliterated or fine-tuned builds whose template was rewritten but that still honor /think, /no_think or reasoning_effort.',
+				defaultValue: false,
+				type: SettingsFieldType.CHECKBOX,
+				section: SETTINGS_SECTION_SLUGS.DEVELOPER
+			},
+			{
+				key: SETTINGS_KEYS.ROUTER_LOAD_CTX_SIZE,
+				label: 'Model load context size',
+				help: 'Context window in tokens requested when the chat loads a model in router mode. 0 uses the server default. Larger values need more VRAM/RAM and take effect the next time a model is loaded.',
+				defaultValue: 0,
+				type: SettingsFieldType.INPUT,
+				section: SETTINGS_SECTION_SLUGS.DEVELOPER,
+				isPositiveInteger: true,
+				allowZero: true
 			},
 			{
 				key: SETTINGS_KEYS.SHOW_RAW_OUTPUT_SWITCH,

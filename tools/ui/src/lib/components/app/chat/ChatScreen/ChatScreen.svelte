@@ -68,6 +68,38 @@
 			(config().keepStatsVisible && !!page.params.id) ||
 			activeProcessingState() !== null
 	);
+	let bottomClusterEl: HTMLDivElement | undefined = $state();
+	let bottomClusterHeight = $state(0);
+
+	// The bottom cluster holds more than just the input (greeting, server error,
+	// stream-resume status, the scroll-down button, and - critically -
+	// ChatScreenProcessingInfo, which only appears once the model starts responding).
+	// It's `fixed` (out of flow) on mobile only - on desktop it's `md:sticky`, so it
+	// already reserves its own space in the flex column and needs no extra padding;
+	// adding padding-bottom there too would reserve the space twice. Only the form's
+	// own height was ever reserved via --chat-form-height on mobile, so as soon as the
+	// processing-info banner showed up there, its extra height wasn't accounted for and
+	// the tail of the streaming response rendered underneath it. Reserve the whole
+	// cluster's real height instead of a fixed pb-48 guess, mobile only.
+	$effect(() => {
+		if (!bottomClusterEl) return;
+
+		// getBoundingClientRect (not ResizeObserver's own contentRect, which is
+		// content-box only and excludes padding) - this cluster gets a 6rem
+		// padding-top applied via --chat-form-padding-top whenever a conversation
+		// is active, and contentRect silently dropped that from the measurement,
+		// undercounting the true reserved height by exactly that padding.
+		const measure = () => {
+			if (bottomClusterEl) bottomClusterHeight = bottomClusterEl.getBoundingClientRect().height;
+		};
+
+		const observer = new ResizeObserver(measure);
+		observer.observe(bottomClusterEl);
+		measure();
+
+		return () => observer.disconnect();
+	});
+
 	let chatFormBottomPosition = $derived.by(() => {
 		if (!isMobile.current) return '1rem';
 		if (device.isStandalone) return '1.5rem';
@@ -250,6 +282,9 @@
 {:else}
 	<div
 		class="chat-screen flex grow flex-col min-h-[calc(100dvh-1rem)] md:min-h-full px-4 md:py-0 pt-12 pb-48 md:pb-4"
+		style:padding-bottom={isMobile.current && bottomClusterHeight > 0
+			? `calc(${bottomClusterHeight}px + 1rem)`
+			: undefined}
 		style:--chat-form-bottom-position={chatFormBottomPosition}
 		ondragenter={dragAndDrop.dragHandlers.dragenter}
 		ondragleave={dragAndDrop.dragHandlers.dragleave}
@@ -267,6 +302,7 @@
 		{/if}
 
 		<div
+			bind:this={bottomClusterEl}
 			class={[
 				'pointer-events-none md:sticky fixed  mt-auto transition-all duration-200',
 				device.isStandalone

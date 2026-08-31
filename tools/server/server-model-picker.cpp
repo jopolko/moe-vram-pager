@@ -44,8 +44,8 @@ using json = nlohmann::json;
 namespace {
 
 const char * UGI_CSV_URL              = "https://huggingface.co/spaces/DontPlanToEnd/UGI-Leaderboard/resolve/main/ugi-leaderboard-data.csv";
-const char * DERESTRICTED_FILTER_URL  = "https://raw.githubusercontent.com/jopolko/moe-vram-pager/main/derestricted-filter.json";
-const char * ARCH_MAP_URL             = "https://raw.githubusercontent.com/jopolko/moe-vram-pager/main/arch-map.json";
+const char * DERESTRICTED_FILTER_URL  = "https://raw.githubusercontent.com/jopolko/openbench-toolkit/main/derestricted-filter.json";
+const char * ARCH_MAP_URL             = "https://raw.githubusercontent.com/jopolko/openbench-toolkit/main/arch-map.json";
 
 constexpr long DEFAULT_TTL_SECONDS = 24 * 3600;
 // HF tags rarely change once a repo is published, so this is cached far longer than

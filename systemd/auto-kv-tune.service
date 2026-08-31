@@ -1,0 +1,9 @@
+[Unit]
+Description=Auto-tune ctx-size and KV cache quantization for models in models-preset.ini
+After=llama-moe-router.service
+
+[Service]
+Type=oneshot
+User=josh
+WorkingDirectory=/home/josh/openbench-toolkit
+ExecStart=/usr/bin/python3 /home/josh/openbench-toolkit/tools/auto_kv_tune.py --apply

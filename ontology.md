@@ -211,7 +211,7 @@ found fake.
 
 - `~/MetasploitMCP/MetasploitMCP.py` - added `import difflib` and the
   `validate_module` tool (after `list_exploits`).
-- `~/moe-vram-pager/tools/pentest_agent.py` - added `MODULE_NAME_TOOLS`,
+- `~/openbench-toolkit/tools/pentest_agent.py` - added `MODULE_NAME_TOOLS`,
   `MODULE_NAME_FAILURE_LIMIT`, the `module_name_failures` tracker, and the
   dispatch-time gate (new `elif` branch, sits between the
   `send_session_command` destructive-pattern check and the `cve_lookup`

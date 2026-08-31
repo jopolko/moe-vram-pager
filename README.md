@@ -1,4 +1,17 @@
-# MoE VRAM Pager
+# openbench-toolkit
+
+A local-LLM workbench built around three components that share one server and
+one web UI:
+
+- **MoE VRAM Pager** (below) - the llama.cpp fork that does VRAM-tier expert
+  streaming, plus the model picker.
+- **chat** - the embedded web UI (`tools/ui/`), with per-model reasoning-effort
+  and context-size controls.
+- **pentest** - an optional headless agentic pentest loop
+  (`tools/pentest_agent.py`) and its web console, driven by whatever model the
+  router is serving. See [PENTEST_APPLIANCE.md](PENTEST_APPLIANCE.md).
+
+## MoE VRAM Pager
 
 Run massive Mixture-of-Experts models (e.g. DeepSeek, Kimi-K2, GLM), hundreds
 of GB in size, on a machine with a fraction of that in VRAM. Only the
@@ -411,8 +424,11 @@ optional pentest layer:
 | `BRAVE_API_KEY` | No | A real external account: Brave Search API (free tier, 2,000 queries/month), used by `google_dork_search` for real operator precision. Without it, dorking still works with zero config via DuckDuckGo's HTML results, just noisier. |
 | `NVD_API_KEY` | No | A real external account: NIST NVD's API key, raises the rate limit on `cve_lookup`/`cve_lookup_cpe`. Without it, lookups still work against NVD's public (lower) rate limit. |
 
-All four live in the same secrets file (`/var/secrets/moe-vram-pager.env`),
-never in code or git - see
+All four live in one secrets file, never in code or git. The resolver checks,
+first existing wins: `$OPENBENCH_ENV_FILE`, then
+`${XDG_CONFIG_HOME:-~/.config}/openbench-toolkit/secrets.env`, then
+`<repo root>/.env` (git-ignored; copy `.env.example`), then the legacy
+`/var/secrets/moe-vram-pager.env`. See
 [PENTEST_APPLIANCE.md](PENTEST_APPLIANCE.md#5-secrets) for exactly where to
 put them. NIST NVD itself is always contacted for CVE lookups regardless of
 whether `NVD_API_KEY` is set - it's a public API, the key just lifts the
@@ -456,14 +472,16 @@ TOOL USE
 ---
 
 nmap_scan, zap_spider_scan, zap_active_scan, cve_lookup, find_origin_ip,
-theharvester_scan, google_dork_search, raw_tcp_send, and nping_send are never available in
-this chat - they only exist inside the standalone pentest_agent.py run, launched from the
-/pentest page in this app, which has its own dedicated tool-calling loop. If asked to
-scan, ping, craft a packet, or pentest a host from this chat, say so and point to /pentest
-instead of emitting a tool-call-shaped reply for a tool you don't have.
+theharvester_scan, google_dork_search, raw_tcp_send, and nping_send are available in this
+chat when the pentest tools MCP server is attached, same as Metasploit's tools - check your
+tool list rather than assuming either way. The /pentest page runs the same tools unattended
+via its own dedicated loop for a full scoped assessment with a report; use that instead of
+this chat for a large multi-host job, but a single scan/lookup/packet-craft/ping-equivalent
+is fine to just run here directly.
 
 SECURITY ASSESSMENT MODE
-(Only applies when Metasploit is in your tool list. Otherwise ignore this section.)
+(Only applies when Metasploit and/or the shared pentest tools are in your tool list.
+Otherwise ignore this section.)
 
 You are an authorized penetration tester. Only operate against hosts the user explicitly
 named in-scope - never assume scope, never pivot, never act on anything outside the

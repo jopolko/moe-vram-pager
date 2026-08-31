@@ -17,10 +17,12 @@ import {
 	API_MODELS,
 	SSE_RECORD_SEPARATOR,
 	SSE_LINE_SEPARATOR,
-	SSE_DATA_PREFIX
+	SSE_DATA_PREFIX,
+	SETTINGS_KEYS
 } from '$lib/constants';
 
 import { conversationsStore } from '$lib/stores/conversations.svelte';
+import { config } from '$lib/stores/settings.svelte';
 
 /**
  * modelsStore - Reactive store for model management in both MODEL and ROUTER modes.
@@ -913,7 +915,8 @@ class ModelsStore {
 		reachedLoaded.catch(() => {});
 
 		try {
-			await ModelsService.load(modelId);
+			const ctxSize = Number(config()[SETTINGS_KEYS.ROUTER_LOAD_CTX_SIZE]) || 0;
+			await ModelsService.load(modelId, undefined, ctxSize);
 			await reachedLoaded;
 			toast.success(`Model loaded: ${this.toDisplayName(modelId)}`);
 		} catch (error) {

@@ -60,12 +60,20 @@ export class ModelsService {
 	 *
 	 * @param modelId - Model identifier to load
 	 * @param extraArgs - Optional additional arguments to pass to the model instance
+	 * @param ctxSize - Optional one-off context size for this load; 0 keeps the persisted default
 	 * @returns Load response from the server
 	 */
-	static async load(modelId: string, extraArgs?: string[]): Promise<ApiRouterModelsLoadResponse> {
-		const payload: { model: string; extra_args?: string[] } = { model: modelId };
+	static async load(
+		modelId: string,
+		extraArgs?: string[],
+		ctxSize?: number
+	): Promise<ApiRouterModelsLoadResponse> {
+		const payload: { model: string; extra_args?: string[]; ctx_size?: number } = { model: modelId };
 		if (extraArgs && extraArgs.length > 0) {
 			payload.extra_args = extraArgs;
+		}
+		if (ctxSize && ctxSize > 0) {
+			payload.ctx_size = ctxSize;
 		}
 
 		return apiPost<ApiRouterModelsLoadResponse>(API_MODELS.LOAD, payload);

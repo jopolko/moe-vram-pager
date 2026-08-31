@@ -49,7 +49,7 @@ TAGS_CACHE_TTL_SECONDS = 14 * 24 * 3600
 # Public repo, public file: no auth needed on either WSL or the Windows-native
 # client. Edit derestricted-filter.json on GitHub and every client picks it
 # up within a day (or immediately with --refresh), no rebuild/resync needed.
-DERESTRICTED_FILTER_URL = "https://raw.githubusercontent.com/jopolko/moe-vram-pager/main/derestricted-filter.json"
+DERESTRICTED_FILTER_URL = "https://raw.githubusercontent.com/jopolko/openbench-toolkit/main/derestricted-filter.json"
 DERESTRICTED_FILTER_CACHE_PATH = Path(__file__).parent / ".cache" / "derestricted-filter.json"
 DERESTRICTED_FILTER_TTL_SECONDS = 24 * 3600
 

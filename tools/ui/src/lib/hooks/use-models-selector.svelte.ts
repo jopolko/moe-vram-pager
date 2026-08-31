@@ -68,15 +68,24 @@ export function useModelsSelector(opts: UseModelsSelectorOptions): UseModelsSele
 	const currentModel = $derived(opts.currentModel());
 	const onModelChange = $derived(opts.onModelChange?.());
 
+	// A chat message's stored `model` is often an alias (e.g. the ollama-style
+	// "namespace/name:tag" the user actually picked), not the router's own
+	// canonical `option.model` id - matching only on option.model spuriously
+	// marked an already-loaded model as "not in cache" whenever it was
+	// referenced by alias.
+	function optionMatchesModel(option: ModelOption, model: string): boolean {
+		return option.model === model || (option.aliases?.includes(model) ?? false);
+	}
+
 	const isHighlightedCurrentModelActive = $derived.by(() => {
 		if (!isRouter || !currentModel) return false;
-		const currentOption = options.find((option) => option.model === currentModel);
+		const currentOption = options.find((option) => optionMatchesModel(option, currentModel));
 		return currentOption ? currentOption.id === activeId : false;
 	});
 
 	const isCurrentModelInCache = $derived.by(() => {
 		if (!isRouter || !currentModel) return true;
-		return options.some((option) => option.model === currentModel);
+		return options.some((option) => optionMatchesModel(option, currentModel));
 	});
 
 	let isLoadingModel = $state(false);
@@ -183,7 +192,7 @@ export function useModelsSelector(opts: UseModelsSelectorOptions): UseModelsSele
 				};
 			}
 
-			return options.find((option) => option.model === currentModel);
+			return options.find((option) => optionMatchesModel(option, currentModel));
 		}
 
 		if (activeId) {

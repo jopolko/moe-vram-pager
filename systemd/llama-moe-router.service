@@ -5,9 +5,10 @@ After=network.target
 [Service]
 Type=simple
 User=josh
-WorkingDirectory=/home/josh/moe-vram-pager
-ExecStart=/home/josh/moe-vram-pager/build/bin/llama-server \
+WorkingDirectory=/home/josh/openbench-toolkit
+ExecStart=/home/josh/openbench-toolkit/build/bin/llama-server \
     --models-preset /home/josh/.cache/llama-moe-pager/models-preset.ini \
+    --models-max 1 \
     --moe-stream --moe-stream-io-threads 2 --ui-mcp-proxy \
     --host 0.0.0.0 --port 8080
 Restart=on-failure

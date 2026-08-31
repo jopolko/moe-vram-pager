@@ -44,9 +44,18 @@
 	let uniqueAliases = $derived([...new Set(aliases ?? [])]);
 	let uniqueTags = $derived([...new Set([...(parsed.tags ?? []), ...(tags ?? [])])]);
 
+	// Ollama-style aliases are "namespace/model:tag" - the namespace isn't an HF org that
+	// parsed.orgName/hideOrgName ever applies to (that pair only splits raw HF-style modelIds),
+	// so without this the namespace showed up unconditionally glued onto every alias-based
+	// display name. Just the model name is what's wanted here, always.
+	function stripNamespace(name: string): string {
+		const slash = name.indexOf('/');
+		return slash === -1 ? name : name.slice(slash + 1);
+	}
+
 	let primaryAlias = $derived(uniqueAliases.length === 1 ? uniqueAliases[0] : null);
 	let displayName = $derived(
-		primaryAlias ?? (isHashLikeName ? modelId : (parsed.modelName ?? modelId))
+		stripNamespace(primaryAlias ?? (isHashLikeName ? modelId : (parsed.modelName ?? modelId)))
 	);
 </script>
 
@@ -55,7 +64,7 @@
 {:else}
 	<span class="flex min-w-0 flex-wrap items-center gap-1 {className}" {...rest}>
 		<span class="min-w-0 truncate font-medium">
-			{#if !hideOrgName && parsed.orgName}{parsed.orgName}/{/if}{displayName}
+			{displayName}
 		</span>
 
 		{#if parsed.params}
@@ -76,7 +85,7 @@
 			{/if}
 		{:else if uniqueAliases.length > 1}
 			{#each uniqueAliases as alias (alias)}
-				<span class={badgeClass}>{alias}</span>
+				<span class={badgeClass}>{stripNamespace(alias)}</span>
 			{/each}
 		{/if}
 

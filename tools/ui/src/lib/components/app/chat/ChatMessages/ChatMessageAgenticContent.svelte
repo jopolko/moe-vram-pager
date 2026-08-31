@@ -35,6 +35,7 @@
 		agenticLastError
 	} from '$lib/stores/agentic.svelte';
 	import { config } from '$lib/stores/settings.svelte';
+	import { toolProgressStore } from '$lib/stores/tool-progress.svelte';
 
 	interface Props {
 		message: DatabaseMessage;
@@ -54,8 +55,6 @@
 
 	let expandedStates: Record<number, boolean> = $state({});
 
-	const showToolCallInProgress = $derived(config().showToolCallInProgress as boolean);
-	const showThoughtInProgress = $derived(config().showThoughtInProgress as boolean);
 	const renderThinkingAsMarkdown = $derived(config().renderThinkingAsMarkdown as boolean);
 
 	const hasReasoningError = $derived(
@@ -150,19 +149,11 @@
 		return turns;
 	});
 
-	function getDefaultExpanded(section: AgenticSection): boolean {
-		if (
-			section.type === AgenticSectionType.TOOL_CALL_PENDING ||
-			section.type === AgenticSectionType.TOOL_CALL_STREAMING
-		) {
-			return showToolCallInProgress;
-		}
-
-		if (section.type === AgenticSectionType.REASONING_PENDING) {
-			return showThoughtInProgress;
-		}
-
-		return false;
+	function getDefaultExpanded(_section: AgenticSection): boolean {
+		// Every step (tool calls, args, results, reasoning) is expanded by default so the
+		// whole run is visible without clicking through each one - the per-section toggle
+		// still lets an individual step be collapsed by hand if it's noisy.
+		return true;
 	}
 
 	function isExpanded(index: number, section: AgenticSection): boolean {
@@ -241,6 +232,10 @@
 		{@const isPending = section.type === AgenticSectionType.TOOL_CALL_PENDING}
 		{@const toolIcon = isPending ? Loader2 : Wrench}
 		{@const toolIconClass = isPending ? 'h-4 w-4 animate-spin' : 'h-4 w-4'}
+		{@const liveProgress = isPending && section.toolCallId
+			? toolProgressStore.get(section.toolCallId)
+			: undefined}
+		{@const liveProgressDeterminate = liveProgress?.total !== undefined}
 
 		<CollapsibleContentBlock
 			open={isExpanded(index, section)}
@@ -248,10 +243,34 @@
 			icon={toolIcon}
 			iconClass={toolIconClass}
 			title={section.toolName || ''}
-			subtitle={isPending ? 'executing...' : undefined}
+			subtitle={isPending
+				? liveProgress
+					? liveProgressDeterminate
+						? `executing... ${Math.round(liveProgress.progress)}/${Math.round(liveProgress.total ?? 0)}%`
+						: 'executing... (no progress % yet)'
+					: 'executing...'
+				: undefined}
 			isStreaming={isPending}
 			onToggle={() => toggleExpanded(index, section)}
 		>
+			{#if isPending && liveProgress}
+				<div class="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-muted">
+					{#if liveProgressDeterminate}
+						<div
+							class="h-full bg-primary transition-all duration-300"
+							style="width: {Math.min(100, (liveProgress.progress / (liveProgress.total ?? 100)) * 100)}%"
+						></div>
+					{:else}
+						<!-- No percent to report yet (e.g. nmap's pre-scan phase) - an
+						     animated segment shows the tool is still alive instead of a
+						     bar frozen at empty, which reads as hung. -->
+						<div class="progress-indeterminate h-full w-1/3 rounded-full bg-primary"></div>
+					{/if}
+				</div>
+				{#if liveProgress.message}
+					<div class="mt-1 truncate text-xs text-muted-foreground">{liveProgress.message}</div>
+				{/if}
+			{/if}
 			{#if section.toolArgs && section.toolArgs !== '{}'}
 				<div class="pt-3">
 					<div class="my-3 text-xs text-muted-foreground">Arguments:</div>

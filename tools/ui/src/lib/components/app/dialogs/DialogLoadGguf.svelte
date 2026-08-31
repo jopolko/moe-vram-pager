@@ -98,6 +98,19 @@
 		if (!newOpen) reset();
 	}
 
+	// Ollama is the actual day-to-day source (models get pulled on the Windows host,
+	// not hand-fed as URLs/paths) - defaulting to the URL tab meant every open needed
+	// an extra click into Ollama, then Rescan, before anything useful showed up. Land
+	// straight on Ollama and kick off the scan as soon as the dialog opens, regardless
+	// of whether it was opened via handleOpenChange or by the parent flipping the
+	// bound `open` prop directly.
+	$effect(() => {
+		if (open) {
+			mode = 'ollama';
+			void loadOllamaModels();
+		}
+	});
+
 	// Any edit to the source invalidates the last assessment - it was for a different file.
 	function invalidate() {
 		assessment = null;

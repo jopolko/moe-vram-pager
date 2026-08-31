@@ -17,6 +17,8 @@
 	import { chatStore } from '$lib/stores/chat.svelte';
 	import { conversationsStore, activeMessages } from '$lib/stores/conversations.svelte';
 	import { isRouterMode } from '$lib/stores/server.svelte';
+	import { config } from '$lib/stores/settings.svelte';
+	import { SETTINGS_KEYS } from '$lib/constants';
 	import type { DatabaseMessage } from '$lib/types/database';
 
 	// 'levels' models (gpt-oss/harmony) always reason and only offer low/medium/high - no off.
@@ -55,6 +57,8 @@
 	let modelSupportsThinking = $derived.by(() => {
 		loadedModelIds();
 		propsCacheVersion();
+
+		if (config()[SETTINGS_KEYS.FORCE_REASONING_CONTROL]) return true;
 
 		if (isRouterMode()) {
 			const modelId = modelsStore.selectedModelName || conversationModel;
