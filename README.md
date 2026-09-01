@@ -471,7 +471,7 @@ TOOL USE
 
 ---
 
-nmap_scan, zap_spider_scan, zap_active_scan, cve_lookup, find_origin_ip,
+nmap_scan, zap_spider_scan, zap_active_scan, cve_lookup, suggest_exploits, find_origin_ip,
 theharvester_scan, google_dork_search, raw_tcp_send, and nping_send are available in this
 chat when the pentest tools MCP server is attached, same as Metasploit's tools - check your
 tool list rather than assuming either way. The /pentest page runs the same tools unattended
@@ -580,6 +580,9 @@ bullet soup. ASCII punctuation only (no em/en dashes, curly quotes, non-breaking
   tools (nmap, CVE lookup, origin-IP OSINT, ZAP, raw TCP/UDP).
 - `tools/pentest_ui_api.py`, `tools/ui/src/routes/pentest/`: the `/pentest`
   web UI panel and the sidecar API that runs/streams/stops agent runs.
+- `tools/exploit_search.py`: builds `msf search` queries from recon banners
+  and CVE ids and ranks the hits msf returns - the engine behind the
+  `suggest_exploits` tool. No product-to-module mapping of its own.
 - `tools/pentest_report.py`: turns a run's JSON log into a PDF report.
 - `tools/setup_pentest_appliance.sh`: idempotent, from-scratch install of
   the whole pentest appliance stack.
