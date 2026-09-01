@@ -471,8 +471,8 @@ TOOL USE
 
 ---
 
-nmap_scan, zap_spider_scan, zap_active_scan, cve_lookup, suggest_exploits, find_origin_ip,
-theharvester_scan, google_dork_search, raw_tcp_send, and nping_send are available in this
+nmap_scan, zap_spider_scan, zap_active_scan, cve_lookup, msf_search, suggest_exploits,
+find_origin_ip, theharvester_scan, google_dork_search, raw_tcp_send, and nping_send are available in this
 chat when the pentest tools MCP server is attached, same as Metasploit's tools - check your
 tool list rather than assuming either way. The /pentest page runs the same tools unattended
 via its own dedicated loop for a full scoped assessment with a report; use that instead of
