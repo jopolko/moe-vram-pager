@@ -98,14 +98,14 @@ kind. Coverage:
 
 | tool | min phase | preconditions | effects |
 |---|---|---|---|
-| `run_exploit` | exploit | target in scope, module exists, payload exists, payload compatible, required options present, reverse-route (warn) | parse `session N opened` -> add Session |
+| `run_exploit` | exploit | target in scope, RPORT matches recon (block on a closed port when nmap has mapped the host / warn when RPORT unset), module exists, payload exists, payload compatible, required options present, reverse-route (warn) | parse `session N opened` -> add Session |
 | `run_auxiliary_module` | recon | module exists, recon-safe auxiliary, target in scope | upsert Module |
 | `run_post_module` | exploit | module exists, session exists | upsert Module |
 | `generate_payload` | exploit | payload exists, required options present | upsert Payload |
 | `send_session_command` | exploit | session exists, not destructive (`DESTRUCTIVE_COMMAND_RE`) | - |
 | `terminate_session` | exploit | session exists | remove Session |
 | `start_listener` | exploit | lhost sane (warn) | - |
-| `nmap_scan` / `raw_tcp_send` / `nping_send` | recon | scan target in scope, not CDN edge | nmap: parse ports -> add Service |
+| `nmap_scan` / `raw_tcp_send` / `nping_send` | recon | scan target in scope, not CDN edge | nmap: parse ports -> add Service (attributed to the scanned host, recorded as `graph.last_scan_host`) |
 | `zap_spider_scan` | recon | scan url in scope | - |
 | `zap_active_scan` | exploit | scan url in scope | - |
 | `cve_lookup` | any | - | parse CVE lines -> add Finding |
