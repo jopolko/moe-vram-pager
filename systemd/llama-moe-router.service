@@ -6,10 +6,19 @@ After=network.target
 Type=simple
 User=josh
 WorkingDirectory=/home/josh/openbench-toolkit
+# NOTE: no global --moe-stream here on purpose. The router merges its own CLI
+# args over every child preset (server-models.cpp), router flag winning, so a
+# global --moe-stream would force moe_stream=true on dense fully-VRAM children
+# too. It reserves no VRAM there (resolve_slots() returns 0 when n_expert==0)
+# but it still force-disables mmap and skips warmup for every model - slower
+# cold load (worst for Ollama blobs on the /mnt/c 9p mount) and a slower first
+# token after each load. Instead, `moe-stream-cache = <N>` in a model's own
+# preset section implies --moe-stream for just that child (common/arg.cpp), so
+# the MoE sections opt in and dense models keep mmap + warmup.
 ExecStart=/home/josh/openbench-toolkit/build/bin/llama-server \
     --models-preset /home/josh/.cache/llama-moe-pager/models-preset.ini \
     --models-max 1 \
-    --moe-stream --moe-stream-io-threads 2 --ui-mcp-proxy \
+    --ui-mcp-proxy \
     --host 0.0.0.0 --port 8080
 Restart=on-failure
 RestartSec=5
