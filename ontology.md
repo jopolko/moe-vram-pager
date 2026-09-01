@@ -98,13 +98,13 @@ kind. Coverage:
 
 | tool | min phase | preconditions | effects |
 |---|---|---|---|
-| `run_exploit` | exploit | target in scope, RPORT matches recon (block on a closed port when nmap has mapped the host / warn when RPORT unset), module exists, payload exists, payload compatible, required options present, reverse-route (warn) | parse `session N opened` -> add Session |
+| `run_exploit` | exploit | target in scope, RPORT matches recon (block on a closed port when nmap has mapped the host / warn when RPORT unset), module exists, payload exists, target/payload platform match (warn when the payload platform disagrees with recon's OS and no explicit TARGET - the "not a compatible payload" trap), payload compatible (block message calls out a stale module TARGET when the compatible list is all one wrong platform), required options present, reverse-route (warn), listener ports free (warn when LPORT/SRVPORT/FETCH_SRVPORT is already bound on this host - stale handler or local service, with free-port suggestions) | parse `session N opened` -> add Session |
 | `run_auxiliary_module` | recon | module exists, recon-safe auxiliary, target in scope | upsert Module |
 | `run_post_module` | exploit | module exists, session exists | upsert Module |
 | `generate_payload` | exploit | payload exists, required options present | upsert Payload |
 | `send_session_command` | exploit | session exists, not destructive (`DESTRUCTIVE_COMMAND_RE`) | - |
 | `terminate_session` | exploit | session exists | remove Session |
-| `start_listener` | exploit | lhost sane (warn) | - |
+| `start_listener` | exploit | lhost sane (warn), listener ports free (warn) | - |
 | `nmap_scan` / `raw_tcp_send` / `nping_send` | recon | scan target in scope, not CDN edge | nmap: parse ports -> add Service (attributed to the scanned host, recorded as `graph.last_scan_host`) |
 | `zap_spider_scan` | recon | scan url in scope | - |
 | `zap_active_scan` | exploit | scan url in scope | - |
