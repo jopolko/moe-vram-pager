@@ -525,6 +525,7 @@ llama_model_loader::llama_model_loader(
         bool use_direct_io,
         bool check_tensors,
         bool no_alloc,
+        bool moe_stream,
         const llama_model_kv_override * param_overrides_p,
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p)
         : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud) {
@@ -820,6 +821,19 @@ llama_model_loader::llama_model_loader(
     if (!llama_mmap::SUPPORTED) {
         LLAMA_LOG_WARN("%s: mmap is not supported on this platform\n", __func__);
         use_mmap = false;
+    }
+
+    if (moe_stream && use_mmap) {
+        // mmap prefetches the whole file (MAP_POPULATE / MADV_WILLNEED), which pulls in the
+        // streamed expert tensors too and defeats streaming - an OOM on a model >> RAM. This
+        // only applies when the model is actually MoE: on a dense GGUF --moe-stream is inert
+        // (llama_moe_stream_resolve_slots returns 0 for n_expert <= 1), so keep mmap for it.
+        uint32_t n_expert = 0;
+        get_key(LLM_KV_EXPERT_COUNT, n_expert, false);
+        if (n_expert > 1) {
+            LLAMA_LOG_WARN("%s: disabling mmap because MoE expert streaming is active for this model\n", __func__);
+            use_mmap = false;
+        }
     }
 
     this->use_mmap = use_mmap;

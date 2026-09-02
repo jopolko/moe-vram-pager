@@ -138,6 +138,8 @@ struct llama_model_loader {
         bool use_direct_io,
         bool check_tensors,
         bool no_alloc,
+        bool moe_stream, // if set AND this GGUF is actually MoE, mmap is force-disabled (it would
+                         // prefetch the streamed experts and defeat streaming); a no-op on a dense GGUF
         const llama_model_kv_override * param_overrides_p,
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p);
 
