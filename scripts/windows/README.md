@@ -52,3 +52,45 @@ tells you exactly what to install and stops. It auto-selects the right CUDA
 toolkit for the GPU in the machine - a **CUDA 12.x** toolkit for pre-Turing cards
 (e.g. GTX 10-series `sm_61`), since CUDA 13 dropped offline codegen below
 `sm_75`.
+
+## Pentest MCP (Metasploit)
+
+The webui's **Metasploit** MCP entry (`http://127.0.0.1:8085/sse`) needs a local
+`MetasploitMCP` server, which needs Metasploit Framework and its RPC daemon.
+`setup-pentest-mcp.ps1` does the whole install; it self-elevates for the parts
+that need Administrator.
+
+```powershell
+# install Metasploit + Defender exclusion + firewall rules + MetasploitMCP venv + msfdb init
+powershell -ExecutionPolicy Bypass -File scripts\windows\setup-pentest-mcp.ps1
+# also open :8080/:8085/:55553/... to other machines on the LAN
+powershell -ExecutionPolicy Bypass -File scripts\windows\setup-pentest-mcp.ps1 -AllowLocalSubnet
+```
+
+What it does, all idempotent:
+
+| Step | Detail |
+|---|---|
+| Metasploit Framework | from `%USERPROFILE%\Downloads\metasploitframework-latest.msi` if present, else downloads it; `msiexec /passive` |
+| Defender | `-ExclusionPath` for the MSF dir (before install, so it isn't quarantined mid-flight) + the `MetasploitMCP` checkout + `ruby.exe` process |
+| Firewall | rules grouped `OpenBench Pentest MCP`: inbound for `ruby.exe` (reverse-shell handlers) + TCP 4444-4460 on Private/Domain; with `-AllowLocalSubnet`, inbound TCP 8080/8085/8087/8086/55553 from `LocalSubnet` |
+| MetasploitMCP | `py -3.12 -m venv`, `pip install -r requirements.txt`, writes `.env` with `MSF_PASSWORD` from `%USERPROFILE%\secrets\moe-vram-pager.env` (generates one if absent) |
+| Database | `msfdb init` (bundled PostgreSQL) |
+
+> Pure loopback (`127.0.0.1` ↔ `127.0.0.1`) is never filtered by Windows
+> Firewall, so if everything stays local you don't strictly need the firewall
+> step - it's for reverse shells coming back from a target and `-AllowLocalSubnet`.
+> Remove the rules any time: `Get-NetFirewallRule -Group 'OpenBench Pentest MCP' | Remove-NetFirewallRule`
+
+Then start the stack (no elevation):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\windows\start-pentest-mcp.ps1
+# add -Bind 0.0.0.0 to reach it from the LAN (needs setup ... -AllowLocalSubnet)
+# add -Detach to leave it running and get the shell back
+```
+
+`start-pentest-mcp.ps1` brings up `msfrpcd` (127.0.0.1:55553, no SSL) then
+`MetasploitMCP.py --transport http` (SSE on :8085). In the webui: **MCP Servers
+→ Metasploit → Connect** - it routes through `llama-server`'s CORS proxy
+(`useProxy: true` is already set on that entry).
