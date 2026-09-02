@@ -11,6 +11,59 @@ one web UI:
   (`tools/pentest_agent.py`) and its web console, driven by whatever model the
   router is serving. See [PENTEST_APPLIANCE.md](PENTEST_APPLIANCE.md).
 
+## Installation and system requirements
+
+**System:** an NVIDIA GPU with an up-to-date driver, plus fast local storage
+(NVMe) for the model files. See [Hardware and system
+requirements](#hardware-and-system-requirements) below for detail on VRAM/RAM
+tiers and the legacy-GPU note. Windows and Linux are supported; the Windows
+helpers live in [`scripts/windows/`](scripts/windows/README.md).
+
+### Run a prebuilt binary (Windows)
+
+The download ships **small** - only our own DLLs and `llama-server.exe`. The
+large vendor runtimes are **not** bundled; they are fetched on demand from their
+official sources. Just launch:
+
+```bat
+scripts\windows\llama-server.cmd --moe-stream --host 0.0.0.0 --port 8080
+```
+
+On first run this preflights three runtime tiers and remediates anything missing
+from the official source, no manual downloads:
+
+| Tier | What | Source |
+|---|---|---|
+| NVIDIA driver | `nvcuda.dll` | you keep the GPU driver current |
+| CUDA runtime | `cudart64_12` / `cublas64_12` / `cublasLt64_12` | fetched from NVIDIA's official redist server |
+| MSVC runtime | `vcruntime140*` / `msvcp140` / `vcomp140` | Microsoft `vc_redist.x64.exe` (installs as needed) |
+
+Run the check by itself with `scripts\windows\preflight.ps1` (add `-AutoFix` to
+fetch). Details: [`scripts/windows/README.md`](scripts/windows/README.md).
+
+### Build from source (Windows)
+
+Building needs a **different** toolchain than running: VS 2022 C++ Build Tools,
+a CUDA Toolkit, CMake >= 3.24, Ninja, and (for the web UI) Node.js. You don't
+have to gather these by hand - `build.ps1` checks for them and, with
+`-InstallDeps`, installs whatever is missing via `winget` (prompting per
+package):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\windows\build.ps1 -InstallDeps -WithUI
+```
+
+It auto-selects the right CUDA toolkit for the GPU in the machine - a **CUDA
+12.x** toolkit for pre-Turing cards (e.g. GTX 10-series `sm_61`), since CUDA 13
+dropped offline codegen below `sm_75`. Without `-InstallDeps` it reports exactly
+what's missing and stops. The raw CMake commands are under [Quick
+start](#quick-start).
+
+### Build from source (Linux)
+
+See [Quick start](#quick-start) and `setup.sh`. Same toolchain (GCC/Clang, CUDA,
+CMake, Ninja, Node for the UI); install via your package manager.
+
 ## MoE VRAM Pager
 
 Run massive Mixture-of-Experts models (e.g. DeepSeek, Kimi-K2, GLM), hundreds
@@ -66,6 +119,17 @@ mode, upstream ggml/CMake logic, requires CMake >= 3.24 and CUDA >= 11.6)
 - don't set it by hand unless you're cross-compiling for different
 hardware than you're building on, in which case pass
 `-DCMAKE_CUDA_ARCHITECTURES=<your compute capability>` explicitly.
+
+> **Legacy GPUs (pre-Turing: Maxwell/Pascal/Volta, sm_5x/6x/7.0).** CUDA 13
+> removed offline codegen for every architecture below Turing (sm_75). A current
+> GPU (Turing sm_75 or newer) with a current CUDA toolkit needs nothing special -
+> the autodetect above just works. But an older card like a GTX 10-series
+> (Pascal, sm_61) or Titan V (Volta, sm_70) **must** be built with a **CUDA 12.x**
+> toolkit - 12.9 is the last 12-line release and still supports these arches.
+> Install it alongside any newer CUDA and point the build at it, e.g.
+> `CUDACXX="C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9\bin\nvcc.exe"`
+> (or the Linux equivalent) before `cmake`. The build fails fast with a clear
+> message if it detects this legacy-GPU / too-new-toolkit mismatch.
 
 - **NVIDIA GPU + [CUDA toolkit](https://developer.nvidia.com/cuda-toolkit)**
   installed and on `PATH` before running `cmake -B build -DGGML_CUDA=ON`.
@@ -562,8 +626,32 @@ calling tools. No markdown headers for a short list - plain paragraphs read bett
 bullet soup. ASCII punctuation only (no em/en dashes, curly quotes, non-breaking spaces).
 ```
 
+## Interpretability
+
+A parallel, fully decoupled research tool in [`interpretability/`](interpretability/README.md).
+It does **not** touch the llama.cpp / CUDA / GGUF path: separate venv, separate
+dependency tree (TransformerLens / SAELens / nnsight), no shared build steps or
+runtime. It runs a model via HuggingFace `transformers` in fp16 (not the
+quantized GGUF build, which would distort the activation patterns this analysis
+depends on) to study three questions about a locally-run model: shared concept
+representations across languages, planning ahead vs. pure next-token, and
+chain-of-thought faithfulness.
+
+Confirmed target: `google/gemma-2-2b` + DeepMind Gemma Scope SAEs.
+
+```bash
+cd interpretability && uv venv .venv && uv pip install -e ".[dev]"
+./interp doctor
+./interp pull
+./interp run exp1        # multilingual concept sharing (phase 1)
+```
+
+Phases 2-3 (activation patching for planning and CoT faithfulness) and any
+frontend visualization are not built yet.
+
 ## Repo layout
 
+- `interpretability/`: decoupled mechanistic-interpretability pipeline (see above).
 - `src/llama-moe-stream.{cpp,h}`: the expert-streaming cache itself.
 - `tools/server/server-model-picker.{cpp,h}`: the `/model-picker/*` API
   backing the web picker (hardware-fit ranking, and preparing a per-model

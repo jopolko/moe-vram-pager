@@ -99,6 +99,29 @@ if (CUDAToolkit_FOUND)
     endif()
     message(STATUS "Using CMAKE_CUDA_ARCHITECTURES=${CMAKE_CUDA_ARCHITECTURES} CMAKE_CUDA_ARCHITECTURES_NATIVE=${CMAKE_CUDA_ARCHITECTURES_NATIVE}")
 
+    # Preflight: legacy GPU vs. too-new toolkit.
+    # CUDA 13 removed offline codegen for every arch below Turing (sm_75) - Maxwell,
+    # Pascal and Volta. When the resolved architecture list (whether from `native`
+    # autodetect or an explicit -DCMAKE_CUDA_ARCHITECTURES=) contains such an arch and
+    # the toolkit is >= 13, nvcc dies with a cryptic "Unsupported gpu architecture"
+    # fatal deep in the build. Modern GPUs (Turing and newer) are unaffected and take
+    # the normal path. Catch the legacy case here with an actionable message instead.
+    if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "13")
+        foreach(ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
+            string(REGEX MATCH "^([0-9]+)" ARCH_NUM "${ARCH}")
+            if (ARCH_NUM AND ARCH_NUM LESS 75)
+                message(FATAL_ERROR
+                    "This GPU/target needs CUDA compute capability sm_${ARCH_NUM} "
+                    "(pre-Turing: Maxwell/Pascal/Volta), but CUDA Toolkit "
+                    "${CUDAToolkit_VERSION} dropped offline support for architectures "
+                    "below sm_75. Install a CUDA 12.x toolkit (12.9 is the last 12-line "
+                    "release and still supports sm_${ARCH_NUM}) and point the build at it, "
+                    "e.g. set CUDACXX to that toolkit's nvcc. New GPUs (Turing sm_75 and "
+                    "newer) work with any recent CUDA and need no special handling.")
+            endif()
+        endforeach()
+    endif()
+
     file(GLOB   GGML_HEADERS_CUDA "*.cuh")
     list(APPEND GGML_HEADERS_CUDA "../../include/ggml-cuda.h")
 
