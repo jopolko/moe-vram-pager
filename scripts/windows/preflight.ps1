@@ -103,6 +103,27 @@ foreach ($d in $vcDlls) {
 }
 if ($vcMissing.Count -gt 0) { $missing['vcredist'] = $true }
 
+# ---- Tier D: OpenSSL (only if this build was linked against it) -----------
+# The server's HTTP client needs libssl/libcrypto for HTTPS (Models page,
+# -hf downloads). Only flag them missing if llama-server.exe actually imports
+# them - a build without HTTPS won't, and shouldn't be nagged about it.
+$needsSsl = $false
+foreach ($exe in 'llama-server.exe', 'llama-server-impl.dll', 'llama-common.dll') {
+    $p = Join-Path $AppDir $exe
+    if ((Test-Path $p) -and (Select-String -Path $p -Pattern 'libssl-\d+-x64\.dll' -Quiet -ErrorAction SilentlyContinue)) {
+        $needsSsl = $true; break
+    }
+}
+if ($needsSsl) {
+    Write-Head "OpenSSL runtime (this build does HTTPS):"
+    $sslMissing = @()
+    foreach ($d in 'libssl', 'libcrypto') {
+        if (Get-ChildItem $AppDir -Filter "$d-*-x64.dll" -ErrorAction SilentlyContinue) { Write-Ok "$d-*-x64.dll" }
+        else { Write-Miss "$d-*-x64.dll"; $sslMissing += $d }
+    }
+    if ($sslMissing.Count -gt 0) { $missing['openssl'] = $true }
+}
+
 # ---- Remediation ----------------------------------------------------------
 if ($missing.Count -eq 0) {
     Write-Host "`nAll runtime dependencies satisfied." -ForegroundColor Green
@@ -127,6 +148,17 @@ if ($missing['vcredist']) {
         Invoke-WebRequest -Uri $vcRedistUrl -OutFile $tmp -UseBasicParsing
         Write-Host "    launching Microsoft installer (installs as needed) ..."
         Start-Process -FilePath $tmp -ArgumentList '/install', '/passive', '/norestart' -Wait
+    }
+}
+
+if ($missing['openssl']) {
+    Write-Host "  - OpenSSL: install ShiningLight OpenSSL and copy its 2 DLLs next to llama-server.exe"
+    if ($AutoFix) {
+        winget install --id ShiningLight.OpenSSL.Light --accept-source-agreements --accept-package-agreements
+        foreach ($d in 'libssl-*-x64.dll', 'libcrypto-*-x64.dll') {
+            Get-ChildItem 'C:\Program Files\OpenSSL-Win64' -Filter $d -ErrorAction SilentlyContinue |
+                Copy-Item -Destination $AppDir -Force
+        }
     }
 }
 

@@ -138,9 +138,26 @@ if ($WithUI -and -not (Have 'node')) {
     if ($InstallDeps) { Winget-Install 'OpenJS.NodeJS.LTS' } else { throw "-WithUI needs Node.js. Re-run with -InstallDeps or install Node LTS." }
 }
 
+# ---- OpenSSL: the server's HTTP client needs it for HTTPS (model picker,
+#      -hf downloads, GGUF metadata). LLAMA_OPENSSL defaults ON but silently
+#      no-ops if the headers aren't found - the Models page then comes up empty.
+function Find-OpenSSL {
+    foreach ($p in @($env:OPENSSL_ROOT_DIR, 'C:\Program Files\OpenSSL-Win64', 'C:\OpenSSL-Win64')) {
+        if ($p -and (Test-Path (Join-Path $p 'include\openssl\ssl.h'))) { return $p }
+    }
+    return $null
+}
+$openssl = Find-OpenSSL
+if (-not $openssl) {
+    if ($InstallDeps) { Winget-Install 'ShiningLight.OpenSSL.Dev'; $openssl = Find-OpenSSL }
+    else { Write-Warning "OpenSSL not found - building without HTTPS (Models page / -hf downloads won't work). Re-run with -InstallDeps or 'winget install ShiningLight.OpenSSL.Dev'." }
+}
+if ($openssl) { Write-Host "OpenSSL: $openssl" }
+
 # ---- Configure + build via a vcvars-initialized child cmd -----------------
 $uiFlag = if ($WithUI) { 'ON' } else { 'OFF' }
 $ninjaDir = Split-Path (Get-Command ninja -ErrorAction SilentlyContinue).Source -ErrorAction SilentlyContinue
+$sslArg = if ($openssl) { "-DLLAMA_OPENSSL=ON -DOPENSSL_ROOT_DIR=`"$($openssl -replace '\\','/')`"" } else { "-DLLAMA_OPENSSL=OFF" }
 
 $bat = @"
 @echo off
@@ -150,7 +167,7 @@ set "CUDAToolkit_ROOT=%CUDA_PATH%"
 set "CUDACXX=%CUDA_PATH%\bin\nvcc.exe"
 set "PATH=%CUDA_PATH%\bin;$ninjaDir;%PATH%"
 cd /d "$repo"
-cmake -B build -G Ninja -DGGML_CUDA=ON -DLLAMA_BUILD_UI=$uiFlag -DCMAKE_BUILD_TYPE=Release || exit /b 1
+cmake -B build -G Ninja -DGGML_CUDA=ON -DLLAMA_BUILD_UI=$uiFlag $sslArg -DCMAKE_BUILD_TYPE=Release || exit /b 1
 cmake --build build --target $Target -j $Jobs || exit /b 1
 "@
 $tmp = Join-Path $env:TEMP ("obk_build_" + [guid]::NewGuid().ToString('N') + '.bat')
@@ -159,6 +176,14 @@ try {
     & cmd /c $tmp
     if ($LASTEXITCODE -ne 0) { throw "Build failed (exit $LASTEXITCODE)." }
 } finally { Remove-Item $tmp -ErrorAction SilentlyContinue }
+
+# OpenSSL runtime DLLs are not bundled by the build - ship them next to the exe
+if ($openssl) {
+    foreach ($dll in 'libssl-*-x64.dll', 'libcrypto-*-x64.dll') {
+        Get-ChildItem $openssl -Filter $dll -ErrorAction SilentlyContinue |
+            Copy-Item -Destination (Join-Path $repo 'build\bin') -Force
+    }
+}
 
 Write-Host "`nBuild complete. Binaries in build\bin\." -ForegroundColor Green
 Write-Host "Before running, satisfy runtime deps:  scripts\windows\preflight.ps1 -AutoFix" -ForegroundColor Cyan
