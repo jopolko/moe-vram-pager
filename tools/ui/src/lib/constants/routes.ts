@@ -30,5 +30,7 @@ export const ROUTES = {
 	/** Search — mobile-only full-page conversation search. */
 	SEARCH: '#/search',
 	/** Pentest appliance — fire-and-forget recon/exploit runs, bypasses chat tool-calling. */
-	PENTEST: '#/pentest'
+	PENTEST: '#/pentest',
+	/** Interpretability — viewer for the obench-interp experiment results (needs tools/interp_ui_api.py). */
+	INTERP: '#/interp'
 } as const;

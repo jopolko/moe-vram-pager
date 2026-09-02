@@ -127,3 +127,19 @@ Each experiment's method and how to read its output: `experiments/exp1_multiling
 Confirmed model (2026-09-01): **`google/gemma-2-2b`**, layer 12 residual stream,
 Gemma Scope `gemma-scope-2b-pt-res-canonical` width-16k SAE. See
 `docs/model-choice.md` for the reasoning.
+
+## Viewer (webui `#/interp`)
+
+The chat webui (`tools/ui/`) has an **Interpretability** tab that renders these
+runs — cosine heatmaps for exp1, per-couplet baseline/patched/control panels for
+exp2, side-by-side chains of thought with the faithfulness verdict for exp3.
+
+It reads the results through a tiny stdlib-only sidecar (no `pip install`, same
+pattern as the pentest tab's `pentest_ui_api.py`):
+
+```bash
+python tools/interp_ui_api.py          # serves interpretability/results/ on :8087
+```
+
+Then open the webui and click the flask icon. The sidecar is read-only and
+loopback-only; it just serves the `results.json` files this CLI writes.

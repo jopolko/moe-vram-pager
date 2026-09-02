@@ -1,4 +1,4 @@
-import { Cpu, Search, Settings, ShieldAlert, SquarePen } from '@lucide/svelte';
+import { Cpu, FlaskConical, Search, Settings, ShieldAlert, SquarePen } from '@lucide/svelte';
 import McpLogo from '$lib/components/app/mcp/McpLogo.svelte';
 import type { Component } from 'svelte';
 import { ROUTES } from './routes';
@@ -39,6 +39,12 @@ export const SIDEBAR_ACTIONS_ITEMS: DesktopIconStripItem[] = [
 		tooltip: 'Pentest',
 		route: ROUTES.PENTEST,
 		activeRouteId: '/pentest'
+	},
+	{
+		icon: FlaskConical,
+		tooltip: 'Interpretability',
+		route: ROUTES.INTERP,
+		activeRouteId: '/interp'
 	},
 	{
 		icon: Settings,
