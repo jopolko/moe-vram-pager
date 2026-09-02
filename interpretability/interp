@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Friendly wrapper: activates the isolated venv, sources the HF token for `pull`,
+# pins the HF cache into this dir, then runs `obench-interp`.
+#
+#   ./interp doctor
+#   ./interp pull                 # gemma-2-2b + Gemma Scope SAE (layer 12)
+#   ./interp pull --instruct      # also gemma-2-2b-it (phase 3)
+#   ./interp list
+#   ./interp run exp1             # multilingual concept sharing
+#   ./interp run exp1 --layer 10 --top-k 48 --languages en fr de es
+#   ./interp run exp2             # planning ahead (rhyming couplets)
+#   ./interp run exp3             # chain-of-thought faithfulness (needs --instruct pull)
+set -euo pipefail
+here="$(cd "$(dirname "$0")" && pwd)"
+
+if [[ ! -d "$here/.venv" ]]; then
+  echo "No venv. Create it:  cd $here && uv venv .venv && uv pip install -e ." >&2
+  exit 1
+fi
+# shellcheck disable=SC1091
+# Linux venv: bin/activate ; Windows venv (Git Bash): Scripts/activate
+if [[ -f "$here/.venv/bin/activate" ]]; then
+  source "$here/.venv/bin/activate"
+else
+  source "$here/.venv/Scripts/activate"
+fi
+export HF_HOME="$here/hf_cache"
+# Windows: os.symlink needs admin or Developer Mode; without it snapshot_download
+# dies with WinError 1314. Copy blobs instead (costs disk, always works). No-op on Linux.
+export HF_HUB_DISABLE_SYMLINKS=1
+export HF_HUB_DISABLE_SYMLINKS_WARNING=1
+
+# gemma-2-2b is a gated repo: transformers re-checks tokenizer files on the hub
+# even when weights are cached, so every subcommand that loads the model needs
+# the token, not just `pull`. Sourced here, never printed.
+# First existing wins: Linux /var/secrets, then the Windows-migration secrets dir.
+for _envf in /var/secrets/nowservingto.env "$HOME/secrets/openbench.env" "$HOME/secrets/nowservingto.env"; do
+  if [[ -f "$_envf" ]]; then
+    set -a; source "$_envf"; set +a
+    break
+  fi
+done
+
+exec obench-interp "$@"

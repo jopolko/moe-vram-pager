@@ -1,0 +1,54 @@
+{
+  "_comment": "Phase 2 (planning-ahead). Each item is a rhyming-couplet setup. `line1_clean` primes rhyme family A; `line1_corrupt` is a length-matched variant that primes rhyme family B. The prompt handed to the model is `line1 + newline` and the model must generate the second line. We probe the residual stream at the newline position (before any of line 2 exists). If patching that position from corrupt->clean flips the *final word* of the generated second line from family A to family B, the model had already chosen the line-ending word at the newline, i.e. it planned ahead. `rhyme_a` / `rhyme_b` list acceptable end words (and near-rhymes) for the string check; `probe_words` are the specific words we track logit probability for at the planning position.",
+  "task": "rhyming_couplet_completion",
+  "items": [
+    {
+      "id": "rabbit_carrot",
+      "line1_clean": "He saw the carrot and he had to grab it,",
+      "line1_corrupt": "He saw the garden and he walked around it,",
+      "rhyme_a": ["rabbit", "habit", "grab it", "nab it"],
+      "rhyme_b": ["around it", "found it", "ground", "mound"],
+      "probe_words": ["rabbit", "ground"]
+    },
+    {
+      "id": "night_light",
+      "line1_clean": "The stars came out to fill the sky at night,",
+      "line1_corrupt": "The waves came in and swept across the sand,",
+      "rhyme_a": ["light", "bright", "sight", "flight", "white"],
+      "rhyme_b": ["hand", "land", "band", "stand", "grand"],
+      "probe_words": ["light", "hand"]
+    },
+    {
+      "id": "sea_free",
+      "line1_clean": "The little boat went sailing on the sea,",
+      "line1_corrupt": "The little boat went drifting toward the shore,",
+      "rhyme_a": ["free", "me", "tree", "be", "key"],
+      "rhyme_b": ["more", "door", "roar", "before", "store"],
+      "probe_words": ["free", "more"]
+    },
+    {
+      "id": "snow_glow",
+      "line1_clean": "The winter wind was blowing through the snow,",
+      "line1_corrupt": "The summer sun was beating on the plain,",
+      "rhyme_a": ["glow", "slow", "low", "go", "flow"],
+      "rhyme_b": ["rain", "again", "pain", "train", "chain"],
+      "probe_words": ["glow", "rain"]
+    },
+    {
+      "id": "day_way",
+      "line1_clean": "She woke before the breaking of the day,",
+      "line1_corrupt": "She woke before the coming of the night,",
+      "rhyme_a": ["way", "say", "play", "away", "grey"],
+      "rhyme_b": ["light", "sight", "bright", "flight", "right"],
+      "probe_words": ["way", "light"]
+    },
+    {
+      "id": "hill_still",
+      "line1_clean": "The old man slowly climbed the grassy hill,",
+      "line1_corrupt": "The old man slowly crossed the frozen lake,",
+      "rhyme_a": ["still", "will", "chill", "mill", "fill"],
+      "rhyme_b": ["make", "wake", "sake", "break", "shake"],
+      "probe_words": ["still", "make"]
+    }
+  ]
+}

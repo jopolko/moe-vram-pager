@@ -1,0 +1,46 @@
+{
+  "_comment": "Hand-written semantically-parallel prompts for Phase 1. Each item is the same antonym task across languages. The model should predict the antonym as the next token(s). We capture the residual stream at the final prompt token. Expand/adjust once the model is confirmed (tokenization of the target word matters).",
+  "task": "antonym_completion",
+  "items": [
+    {
+      "concept": "small->big",
+      "prompts": {
+        "en": "The opposite of \"small\" is \"",
+        "fr": "Le contraire de « petit » est « ",
+        "de": "Das Gegenteil von „klein“ ist „",
+        "es": "Lo contrario de «pequeño» es «",
+        "zh": "“小”的反义词是“"
+      }
+    },
+    {
+      "concept": "hot->cold",
+      "prompts": {
+        "en": "The opposite of \"hot\" is \"",
+        "fr": "Le contraire de « chaud » est « ",
+        "de": "Das Gegenteil von „heiß“ ist „",
+        "es": "Lo contrario de «caliente» es «",
+        "zh": "“热”的反义词是“"
+      }
+    },
+    {
+      "concept": "fast->slow",
+      "prompts": {
+        "en": "The opposite of \"fast\" is \"",
+        "fr": "Le contraire de « rapide » est « ",
+        "de": "Das Gegenteil von „schnell“ ist „",
+        "es": "Lo contrario de «rápido» es «",
+        "zh": "“快”的反义词是“"
+      }
+    },
+    {
+      "concept": "happy->sad",
+      "prompts": {
+        "en": "The opposite of \"happy\" is \"",
+        "fr": "Le contraire de « heureux » est « ",
+        "de": "Das Gegenteil von „glücklich“ ist „",
+        "es": "Lo contrario de «feliz» es «",
+        "zh": "“快乐”的反义词是“"
+      }
+    }
+  ]
+}

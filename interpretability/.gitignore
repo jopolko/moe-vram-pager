@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+uv.lock
+*.egg-info/
+
+# local model / SAE cache if pointed here
+hf_cache/
+sae_cache/
+models/
+
+# experiment outputs (keep the dir, ignore the runs)
+results/**
+!results/.gitkeep
