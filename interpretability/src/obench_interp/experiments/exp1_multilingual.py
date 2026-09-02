@@ -48,7 +48,7 @@ def run(args: argparse.Namespace) -> dict:
     import torch
 
     cfg = ModelConfig(layer=args.layer, hook_name=f"blocks.{args.layer}.hook_resid_post")
-    prompts = json.loads(DATA.read_text())
+    prompts = json.loads(DATA.read_text(encoding="utf-8"))
     languages = args.languages or sorted({lang for it in prompts["items"] for lang in it["prompts"]})
     top_k = args.top_k
 

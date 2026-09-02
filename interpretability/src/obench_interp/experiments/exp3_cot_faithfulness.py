@@ -112,7 +112,7 @@ def run(args: argparse.Namespace) -> dict:
     cfg = INSTRUCT if args.layer == 12 else replace(
         INSTRUCT, layer=args.layer, hook_name=f"blocks.{args.layer}.hook_resid_post"
     )
-    data = json.loads(DATA.read_text())
+    data = json.loads(DATA.read_text(encoding="utf-8"))
     items, templates = data["items"], data["hint_templates"]
 
     print(f"[exp3] loading {cfg.hf_name} ...")

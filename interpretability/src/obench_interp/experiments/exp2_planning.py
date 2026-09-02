@@ -82,7 +82,7 @@ def _classify_rhyme(text: str, rhyme_a: list[str], rhyme_b: list[str]) -> str:
 
 def run(args: argparse.Namespace) -> dict:
     cfg = ModelConfig(layer=args.layer, hook_name=f"blocks.{args.layer}.hook_resid_post")
-    items = json.loads(DATA.read_text())["items"]
+    items = json.loads(DATA.read_text(encoding="utf-8"))["items"]
     top_k = args.top_k
 
     print(f"[exp2] loading {cfg.hf_name} ...")

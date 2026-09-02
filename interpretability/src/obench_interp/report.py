@@ -26,8 +26,10 @@ def new_run_dir(experiment: str) -> Path:
 
 def write(run_dir: Path, results: dict, summary_md: str) -> None:
     """Low-level primitive: write results.json + summary.md, refresh `latest`."""
-    (run_dir / "results.json").write_text(json.dumps(results, indent=2, ensure_ascii=False))
-    (run_dir / "summary.md").write_text(summary_md)
+    (run_dir / "results.json").write_text(
+        json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    (run_dir / "summary.md").write_text(summary_md, encoding="utf-8")
     latest = run_dir.parent / "latest"
     latest.unlink(missing_ok=True)
     try:
