@@ -86,6 +86,22 @@ def _list_runs() -> dict:
     return {"results_dir": str(RESULTS_DIR), "runs": runs}
 
 
+def _all_runs() -> dict:
+    """Every run's full results.json, each tagged with its `_timestamp` dir name.
+
+    One call, so the webui's folder / drop / sidecar paths all load the same way.
+    """
+    out = []
+    for experiment, timestamp, results in _run_files():
+        try:
+            data = json.loads(results.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        data["_timestamp"] = timestamp
+        out.append(data)
+    return {"results_dir": str(RESULTS_DIR), "runs": out}
+
+
 def _get_run(experiment: str, timestamp: str) -> dict | None:
     if experiment not in EXPERIMENTS or not _TS_RE.match(timestamp):
         return None
@@ -124,6 +140,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"ok": True, "results_dir": str(RESULTS_DIR), "runs": len(files)})
         if path == "/runs":
             return self._send(200, _list_runs())
+        if path == "/all":
+            return self._send(200, _all_runs())
         parts = path.strip("/").split("/")
         if len(parts) == 3 and parts[0] == "runs":
             run = _get_run(parts[1], parts[2])

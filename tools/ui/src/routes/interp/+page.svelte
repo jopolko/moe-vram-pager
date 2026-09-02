@@ -3,7 +3,10 @@
 		FlaskConical,
 		RefreshCw,
 		Loader2,
-		Plug,
+		FolderOpen,
+		Upload,
+		Server,
+		X,
 		ChevronRight,
 		Languages,
 		Music,
@@ -19,26 +22,12 @@
 	import { Input } from '$lib/components/ui/input';
 	import * as Collapsible from '$lib/components/ui/collapsible';
 
-	// Loopback-only sidecar, its own port - same pattern as #/pentest talking to
-	// pentest_ui_api.py. Reads interpretability/results/ and serves the JSON
-	// envelopes the `obench-interp run` CLI writes.
-	const DEFAULT_API = 'http://127.0.0.1:8087';
-	const API_KEY = 'interp-viewer-api';
-	const SELECTED_KEY = 'interp-viewer-selected';
-
 	type Experiment = 'exp1_multilingual' | 'exp2_planning' | 'exp3_cot_faithfulness';
-
-	interface RunMeta {
-		experiment: Experiment;
-		timestamp: string;
-		generated_at?: string;
-		model?: string;
-		layer?: number;
-		backend?: string;
-		n_items?: number;
-		headline?: string;
-		aggregate?: Record<string, unknown>;
-	}
+	const EXPERIMENT_IDS: Experiment[] = [
+		'exp1_multilingual',
+		'exp2_planning',
+		'exp3_cot_faithfulness'
+	];
 
 	interface RunData {
 		schema_version: number;
@@ -48,6 +37,8 @@
 		params: Record<string, unknown>;
 		per_item: Record<string, unknown>[];
 		aggregate: Record<string, unknown>;
+		/** filled in by the loader from the run's directory / file name */
+		_timestamp: string;
 	}
 
 	const EXPERIMENTS: { id: Experiment; label: string; icon: typeof Languages; question: string }[] =
@@ -72,32 +63,47 @@
 			}
 		];
 
-	let api = $state(DEFAULT_API);
-	let apiInput = $state(DEFAULT_API);
-	let apiOk = $state<boolean | null>(null);
-	let checking = $state(false);
-	let runs = $state<RunMeta[]>([]);
-	let resultsDir = $state('');
-	let selectedKey = $state<string | null>(null);
-	let selected = $state<RunData | null>(null);
-	let loadingRun = $state(false);
+	// ---------------------------------------------------------------------------
+	// data source: a directory the browser reads directly (no server), dropped
+	// files, or the optional tools/interp_ui_api.py sidecar. Folder first — it is
+	// the smooth path: pick interpretability/results once, it is remembered.
+	// ---------------------------------------------------------------------------
+	type Source = 'none' | 'folder' | 'drop' | 'sidecar';
+	const SIDECAR_KEY = 'interp-viewer-sidecar';
+	const SOURCE_KEY = 'interp-viewer-source';
+	const SELECTED_KEY = 'interp-viewer-selected';
+	const DEFAULT_SIDECAR = 'http://127.0.0.1:8087';
+
+	const supportsFS = browser && 'showDirectoryPicker' in window;
+
+	let source = $state<Source>('none');
+	let sourceLabel = $state('');
+	let runs = $state<RunData[]>([]);
+	let loading = $state(false);
 	let error = $state('');
+	let dragging = $state(false);
+	let showSidecar = $state(false);
+	let sidecarUrl = $state(DEFAULT_SIDECAR);
+	let selectedKey = $state<string | null>(null);
 	let openRows = $state<Record<string, boolean>>({});
 
-	const keyOf = (r: { experiment: string; timestamp: string }) => `${r.experiment}/${r.timestamp}`;
-	const grouped = $derived(
-		EXPERIMENTS.map((e) => ({ ...e, runs: runs.filter((r) => r.experiment === e.id) }))
-	);
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	let dirHandle: any = null;
 
-	function loadPrefs() {
-		if (!browser) return;
-		try {
-			api = apiInput = localStorage.getItem(API_KEY) || DEFAULT_API;
-			selectedKey = localStorage.getItem(SELECTED_KEY);
-		} catch {
-			/* private mode / disabled storage - defaults are fine */
-		}
-	}
+	const keyOf = (r: { experiment: string; _timestamp: string }) =>
+		`${r.experiment}/${r._timestamp}`;
+
+	const sortedRuns = $derived(
+		[...runs].sort(
+			(a, b) =>
+				EXPERIMENT_IDS.indexOf(a.experiment) - EXPERIMENT_IDS.indexOf(b.experiment) ||
+				b._timestamp.localeCompare(a._timestamp)
+		)
+	);
+	const grouped = $derived(
+		EXPERIMENTS.map((e) => ({ ...e, runs: sortedRuns.filter((r) => r.experiment === e.id) }))
+	);
+	const selected = $derived(sortedRuns.find((r) => keyOf(r) === selectedKey) ?? null);
 
 	function persist(k: string, v: string) {
 		if (!browser) return;
@@ -108,61 +114,268 @@
 		}
 	}
 
-	async function refresh() {
-		checking = true;
+	function headline(r: RunData): string {
+		const a = r.aggregate ?? {};
+		try {
+			if (r.experiment === 'exp1_multilingual')
+				return `cosine ${a.mean_cross_language_cosine} · ${a.language_agnostic_feature_count} shared features`;
+			if (r.experiment === 'exp2_planning')
+				return `planning effect ${a.planning_effect} (${a.planning_flip_rate} vs ${a.control_flip_rate} control)`;
+			if (r.experiment === 'exp3_cot_faithfulness')
+				return `${a.unfaithful_count}/${a.n_items} unfaithful · follow ${a.hint_follow_rate}`;
+		} catch {
+			/* ignore */
+		}
+		return '';
+	}
+
+	function ingest(list: RunData[], src: Source, label: string) {
+		const seen: Record<string, true> = {};
+		runs = list
+			.filter((r) => EXPERIMENT_IDS.includes(r.experiment) && Array.isArray(r.per_item))
+			.filter((r) => {
+				const k = keyOf(r);
+				if (seen[k]) return false;
+				seen[k] = true;
+				return true;
+			});
+		source = src;
+		sourceLabel = label;
+		persist(SOURCE_KEY, src);
+		if (!selected && sortedRuns.length) selectRun(sortedRuns[0]);
+	}
+
+	function selectRun(r: RunData) {
+		selectedKey = keyOf(r);
+		openRows = {};
+		persist(SELECTED_KEY, selectedKey);
+	}
+
+	// ---- folder ----
+	async function walkDir(handle: unknown): Promise<RunData[]> {
+		const dir = handle as {
+			name: string;
+			entries(): AsyncIterable<[string, unknown]>;
+			getDirectoryHandle(n: string): Promise<unknown>;
+		};
+		// support pointing either at `results/` or at its parent
+		const roots: unknown[] = [];
+		for (const id of EXPERIMENT_IDS) {
+			try {
+				roots.push(await dir.getDirectoryHandle(id));
+			} catch {
+				/* not here */
+			}
+		}
+		if (!roots.length) {
+			try {
+				roots.push(await dir.getDirectoryHandle('results'));
+				const inner = roots.pop() as typeof dir;
+				for (const id of EXPERIMENT_IDS) {
+					try {
+						roots.push(await inner.getDirectoryHandle(id));
+					} catch {
+						/* skip */
+					}
+				}
+			} catch {
+				/* still nothing */
+			}
+		}
+		const out: RunData[] = [];
+		for (const expDir of roots as { name: string; entries(): AsyncIterable<[string, unknown]> }[]) {
+			for await (const [ts, runHandle] of expDir.entries()) {
+				const rh = runHandle as {
+					kind: string;
+					getFileHandle(n: string): Promise<{ getFile(): Promise<File> }>;
+				};
+				if (rh.kind !== 'directory') continue;
+				try {
+					const fh = await rh.getFileHandle('results.json');
+					const text = await (await fh.getFile()).text();
+					const data = JSON.parse(text) as RunData;
+					data._timestamp = ts;
+					out.push(data);
+				} catch {
+					/* no results.json in this dir */
+				}
+			}
+		}
+		return out;
+	}
+
+	async function loadFolder(handle: unknown, remember = true) {
+		loading = true;
 		error = '';
 		try {
-			const r = await fetch(`${api}/runs`, { cache: 'no-store' });
+			const list = await walkDir(handle);
+			if (!list.length) throw new Error('no exp*/<timestamp>/results.json found in that folder');
+			dirHandle = handle;
+			if (remember) await idbSet('dirHandle', handle);
+			ingest(list, 'folder', (handle as { name: string }).name);
+		} catch (e) {
+			error = e instanceof Error ? e.message : String(e);
+			if (source === 'none') runs = [];
+		} finally {
+			loading = false;
+		}
+	}
+
+	async function pickFolder() {
+		try {
+			// @ts-expect-error - File System Access API, guarded by supportsFS
+			const handle = await window.showDirectoryPicker({
+				id: 'obench-interp-results',
+				mode: 'read'
+			});
+			await loadFolder(handle);
+		} catch (e) {
+			if ((e as DOMException)?.name !== 'AbortError')
+				error = e instanceof Error ? e.message : String(e);
+		}
+	}
+
+	async function rescan() {
+		if (source === 'folder' && dirHandle) return loadFolder(dirHandle, false);
+		if (source === 'sidecar') return connectSidecar(sidecarUrl);
+	}
+
+	function disconnect() {
+		runs = [];
+		source = 'none';
+		sourceLabel = '';
+		selectedKey = null;
+		dirHandle = null;
+		void idbDel('dirHandle');
+		persist(SOURCE_KEY, 'none');
+	}
+
+	// ---- dropped files ----
+	async function readFiles(files: File[]) {
+		loading = true;
+		error = '';
+		try {
+			const out: RunData[] = [];
+			for (const f of files) {
+				if (!f.name.endsWith('.json')) continue;
+				try {
+					const data = JSON.parse(await f.text()) as RunData;
+					if (!data.experiment) continue;
+					// dropped files carry no dir name; derive a stable-ish key
+					data._timestamp = (data.generated_at || '').replace(/[^0-9]/g, '').slice(0, 15) || f.name;
+					out.push(data);
+				} catch {
+					/* not a results.json */
+				}
+			}
+			if (!out.length) throw new Error('none of those were experiment results.json files');
+			ingest([...runs, ...out], 'drop', `${out.length + runs.length} file(s)`);
+		} catch (e) {
+			error = e instanceof Error ? e.message : String(e);
+		} finally {
+			loading = false;
+			dragging = false;
+		}
+	}
+
+	function onDrop(ev: DragEvent) {
+		ev.preventDefault();
+		dragging = false;
+		const items = ev.dataTransfer?.files;
+		if (items?.length) readFiles(Array.from(items));
+	}
+
+	// ---- sidecar ----
+	async function connectSidecar(url: string) {
+		const base = url.trim().replace(/\/$/, '') || DEFAULT_SIDECAR;
+		sidecarUrl = base;
+		loading = true;
+		error = '';
+		try {
+			const r = await fetch(`${base}/all`, { cache: 'no-store' });
 			if (!r.ok) throw new Error(`HTTP ${r.status}`);
 			const data = await r.json();
-			runs = data.runs ?? [];
-			resultsDir = data.results_dir ?? '';
-			apiOk = true;
-			// re-select the remembered run, or fall back to the newest
-			const want = selectedKey && runs.find((x) => keyOf(x) === selectedKey);
-			if (want) selectRun(want);
-			else if (runs.length && !selected) selectRun(runs[0]);
-			else if (selected && !runs.find((x) => keyOf(x) === selectedKey)) selected = null;
+			const list: RunData[] = (data.runs ?? []).map((x: RunData & { timestamp?: string }) => ({
+				...x,
+				_timestamp: x._timestamp ?? x.timestamp
+			}));
+			persist(SIDECAR_KEY, base);
+			ingest(list, 'sidecar', base.replace(/^https?:\/\//, ''));
 		} catch (e) {
-			apiOk = false;
-			runs = [];
-			error = e instanceof Error ? e.message : String(e);
+			error = `sidecar: ${e instanceof Error ? e.message : String(e)}`;
+			if (source === 'none') runs = [];
 		} finally {
-			checking = false;
+			loading = false;
 		}
 	}
 
-	async function selectRun(meta: RunMeta) {
-		selectedKey = keyOf(meta);
-		persist(SELECTED_KEY, selectedKey);
-		loadingRun = true;
-		openRows = {};
-		try {
-			const r = await fetch(`${api}/runs/${meta.experiment}/${meta.timestamp}`, {
-				cache: 'no-store'
-			});
-			if (!r.ok) throw new Error(`HTTP ${r.status}`);
-			selected = await r.json();
-		} catch (e) {
-			error = e instanceof Error ? e.message : String(e);
-			selected = null;
-		} finally {
-			loadingRun = false;
-		}
+	// ---- tiny IndexedDB kv for the directory handle ----
+	function idb(): Promise<IDBDatabase> {
+		return new Promise((resolve, reject) => {
+			const req = indexedDB.open('interp-viewer', 1);
+			req.onupgradeneeded = () => req.result.createObjectStore('kv');
+			req.onsuccess = () => resolve(req.result);
+			req.onerror = () => reject(req.error);
+		});
+	}
+	async function idbSet(k: string, v: unknown) {
+		const db = await idb();
+		await new Promise((res, rej) => {
+			const tx = db.transaction('kv', 'readwrite');
+			tx.objectStore('kv').put(v, k);
+			tx.oncomplete = () => res(null);
+			tx.onerror = () => rej(tx.error);
+		});
+	}
+	async function idbGet<T>(k: string): Promise<T | undefined> {
+		const db = await idb();
+		return new Promise((res, rej) => {
+			const tx = db.transaction('kv', 'readonly');
+			const r = tx.objectStore('kv').get(k);
+			r.onsuccess = () => res(r.result);
+			r.onerror = () => rej(r.error);
+		});
+	}
+	async function idbDel(k: string) {
+		const db = await idb();
+		const tx = db.transaction('kv', 'readwrite');
+		tx.objectStore('kv').delete(k);
 	}
 
-	function applyApi() {
-		api = apiInput.trim().replace(/\/$/, '') || DEFAULT_API;
-		persist(API_KEY, api);
-		refresh();
-	}
-
+	// ---- restore on mount ----
 	$effect(() => {
-		loadPrefs();
-		refresh();
+		if (!browser) return;
+		try {
+			selectedKey = localStorage.getItem(SELECTED_KEY);
+			sidecarUrl = localStorage.getItem(SIDECAR_KEY) || DEFAULT_SIDECAR;
+		} catch {
+			/* ignore */
+		}
+		const last = (() => {
+			try {
+				return localStorage.getItem(SOURCE_KEY);
+			} catch {
+				return null;
+			}
+		})();
+		(async () => {
+			if (last === 'folder' && supportsFS) {
+				const handle = await idbGet<unknown>('dirHandle').catch(() => undefined);
+				if (
+					handle &&
+					(await (handle as { queryPermission(o: object): Promise<string> })
+						.queryPermission({ mode: 'read' })
+						.catch(() => 'prompt')) === 'granted'
+				) {
+					await loadFolder(handle, false);
+					return;
+				}
+			}
+			if (last === 'sidecar') await connectSidecar(sidecarUrl);
+		})();
 	});
 
-	// ---- formatting helpers ----
+	// ---- formatting ----
 	const fmtPct = (v: unknown) =>
 		typeof v === 'number' ? `${(v * 100).toFixed(v * 100 < 10 ? 1 : 0)}%` : '—';
 	const fmtNum = (v: unknown, d = 3) => (typeof v === 'number' ? v.toFixed(d) : '—');
@@ -181,8 +394,6 @@
 		other: 'bg-foreground/10 text-muted-foreground'
 	};
 
-	// exp1 cosine heatmap: ~0.2 faint → 1.0 strong, on a teal→emerald ramp that
-	// reads in both themes.
 	function cosTint(v: number) {
 		const a = Math.max(0, Math.min(1, (v - 0.2) / 0.8));
 		return `background-color: rgba(16, 185, 129, ${(a * 0.7).toFixed(2)}); color: ${a > 0.62 ? '#052e1b' : 'inherit'}`;
@@ -229,52 +440,103 @@
 				<FlaskConical class="size-5 text-primary" /> Interpretability
 			</h1>
 			<p class="mt-1 max-w-2xl text-sm leading-relaxed text-muted-foreground">
-				Runs of the three <code class="text-xs">obench-interp</code> experiments — a shared concept
-				space across languages, planning ahead in generation, and whether a stated chain of thought
-				is the real one. Point <code class="text-xs">tools/interp_ui_api.py</code> at your results dir.
+				Runs of the three <code class="text-xs">obench-interp</code> experiments — a shared concept space
+				across languages, planning ahead in generation, and whether a stated chain of thought is the real
+				one.
 			</p>
 		</div>
-		<div class="flex items-center gap-2">
-			<div
-				class="inline-flex items-center gap-1.5 text-xs {apiOk
-					? 'text-emerald-600 dark:text-emerald-400'
-					: 'text-muted-foreground'}"
-			>
-				<span
-					class="size-2 rounded-full {apiOk
-						? 'bg-emerald-500'
-						: apiOk === false
-							? 'bg-red-500'
-							: 'bg-muted-foreground/40'}"
-				></span>
-				{apiOk ? 'connected' : apiOk === false ? 'offline' : 'checking'}
+		{#if source !== 'none'}
+			<div class="flex items-center gap-2">
+				<Badge variant="secondary" class="gap-1">
+					{#if source === 'folder'}<FolderOpen
+							class="size-3"
+						/>{:else if source === 'sidecar'}<Server class="size-3" />{:else}<Upload
+							class="size-3"
+						/>{/if}
+					{sourceLabel}
+				</Badge>
+				{#if source !== 'drop'}
+					<Button variant="outline" size="sm" onclick={rescan} disabled={loading}>
+						{#if loading}<Loader2 class="size-4 animate-spin" />{:else}<RefreshCw
+								class="size-4"
+							/>{/if}
+						Rescan
+					</Button>
+				{/if}
+				<Button variant="ghost" size="sm" onclick={disconnect} title="disconnect">
+					<X class="size-4" />
+				</Button>
 			</div>
-			<Button variant="outline" size="sm" onclick={refresh} disabled={checking}>
-				{#if checking}<Loader2 class="size-4 animate-spin" />{:else}<RefreshCw
-						class="size-4"
-					/>{/if}
-				Refresh
-			</Button>
-		</div>
+		{/if}
 	</header>
 
-	{#if apiOk === false}
-		<div class="rounded-lg border border-dashed p-6 text-sm">
-			<div class="flex items-center gap-2 font-medium">
-				<Plug class="size-4" /> Sidecar not reachable
+	{#if source === 'none'}
+		<!-- empty state: choose a data source -->
+		<div
+			role="region"
+			aria-label="load results"
+			class="flex flex-1 flex-col items-center justify-center gap-6 rounded-lg border border-dashed p-10 text-center transition-colors {dragging
+				? 'border-primary bg-primary/5'
+				: ''}"
+			ondragover={(e) => {
+				e.preventDefault();
+				dragging = true;
+			}}
+			ondragleave={() => (dragging = false)}
+			ondrop={onDrop}
+		>
+			<div class="space-y-1">
+				<FlaskConical class="mx-auto size-8 text-muted-foreground" />
+				<p class="text-sm font-medium">Load your experiment results</p>
+				<p class="max-w-md text-xs text-muted-foreground">
+					Everything <code>obench-interp run</code> writes lives under
+					<code>interpretability/results/</code>. Point the viewer at that folder — it stays
+					remembered.
+				</p>
 			</div>
-			<p class="mt-2 text-muted-foreground">
-				Start the read-only results server (stdlib only, no install), then Refresh:
-			</p>
-			<pre
-				class="mt-2 overflow-x-auto rounded-md bg-muted p-3 text-xs">python tools/interp_ui_api.py</pre>
-			<div class="mt-3 flex items-center gap-2">
-				<Input class="h-8 max-w-xs text-xs" bind:value={apiInput} spellcheck={false} />
-				<Button size="sm" variant="secondary" onclick={applyApi}>Use</Button>
+
+			<div class="flex flex-col items-center gap-3">
+				{#if supportsFS}
+					<Button onclick={pickFolder} disabled={loading}>
+						{#if loading}<Loader2 class="size-4 animate-spin" />{:else}<FolderOpen
+								class="size-4"
+							/>{/if}
+						Open results folder
+					</Button>
+					<span class="text-xs text-muted-foreground"
+						>or drop <code>results.json</code> files here</span
+					>
+				{:else}
+					<p class="text-sm">
+						Drop <code>results.json</code> files here
+						<span class="block text-xs text-muted-foreground">
+							(your browser can't pick a folder — Chrome or Edge can)
+						</span>
+					</p>
+				{/if}
+
+				<button
+					class="text-xs text-muted-foreground underline-offset-2 hover:underline"
+					onclick={() => (showSidecar = !showSidecar)}
+				>
+					{showSidecar ? 'hide' : 'connect to a running sidecar instead'}
+				</button>
+				{#if showSidecar}
+					<div class="flex items-center gap-2">
+						<Input class="h-8 w-64 text-xs" bind:value={sidecarUrl} spellcheck={false} />
+						<Button size="sm" variant="secondary" onclick={() => connectSidecar(sidecarUrl)}>
+							Connect
+						</Button>
+					</div>
+					<pre class="rounded-md bg-muted px-3 py-2 text-[11px]">python tools/interp_ui_api.py</pre>
+				{/if}
 			</div>
-			{#if error}<p class="mt-2 text-xs text-red-500">{error}</p>{/if}
+			{#if error}<p class="text-xs text-red-500">{error}</p>{/if}
 		</div>
 	{:else}
+		{#if error}
+			<p class="rounded-md bg-red-500/10 px-3 py-1.5 text-xs text-red-500">{error}</p>
+		{/if}
 		<div class="flex min-h-0 flex-1 gap-5">
 			<!-- run list -->
 			<aside class="w-60 shrink-0 space-y-4 overflow-y-auto pr-1">
@@ -298,10 +560,10 @@
 									>
 										<div class="truncate font-medium">{r.model ?? 'unknown model'}</div>
 										<div class="mt-0.5 truncate text-[11px] text-muted-foreground">
-											{r.headline}
+											{headline(r)}
 										</div>
 										<div class="mt-0.5 text-[10px] text-muted-foreground/70">
-											L{r.layer ?? '?'} · {r.timestamp}
+											L{(r.params as { layer?: number })?.layer ?? '?'} · {r._timestamp}
 										</div>
 									</button>
 								{/each}
@@ -309,20 +571,17 @@
 						{/if}
 					</div>
 				{/each}
-				{#if resultsDir}
-					<p class="px-1 pt-1 text-[10px] break-all text-muted-foreground/60">{resultsDir}</p>
-				{/if}
 			</aside>
 
 			<!-- detail -->
 			<main class="min-w-0 flex-1 overflow-y-auto">
-				{#if loadingRun}
+				{#if loading && !selected}
 					<div class="flex h-40 items-center justify-center text-muted-foreground">
 						<Loader2 class="size-5 animate-spin" />
 					</div>
 				{:else if !selected}
 					<div class="flex h-40 items-center justify-center text-sm text-muted-foreground">
-						{runs.length ? 'Pick a run.' : 'No runs yet — run one with ./interp run exp1'}
+						{runs.length ? 'Pick a run.' : 'No runs in that source yet.'}
 					</div>
 				{:else}
 					{@const s = selected}

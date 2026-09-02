@@ -130,16 +130,19 @@ Gemma Scope `gemma-scope-2b-pt-res-canonical` width-16k SAE. See
 
 ## Viewer (webui `#/interp`)
 
-The chat webui (`tools/ui/`) has an **Interpretability** tab that renders these
-runs — cosine heatmaps for exp1, per-couplet baseline/patched/control panels for
-exp2, side-by-side chains of thought with the faithfulness verdict for exp3.
+The chat webui (`tools/ui/`) has an **Interpretability** tab (flask icon) that
+renders these runs — cosine heatmaps for exp1, per-couplet
+baseline/patched/control panels for exp2, side-by-side chains of thought with
+the faithfulness verdict for exp3.
 
-It reads the results through a tiny stdlib-only sidecar (no `pip install`, same
-pattern as the pentest tab's `pentest_ui_api.py`):
+Open the tab and click **Open results folder**, then pick this
+`interpretability/results/` directory. That's it — the browser reads the
+`results.json` files directly (File System Access API, Chrome/Edge), and the
+folder is remembered for next time. New `obench-interp run`s show up on Rescan.
 
-```bash
-python tools/interp_ui_api.py          # serves interpretability/results/ on :8087
-```
+No folder picker (Firefox), or want it headless? Two fallbacks in the same tab:
 
-Then open the webui and click the flask icon. The sidecar is read-only and
-loopback-only; it just serves the `results.json` files this CLI writes.
+- **drop** `results.json` files onto the page, or
+- **"connect to a running sidecar"** — `python tools/interp_ui_api.py` starts a
+  stdlib-only (no `pip install`), read-only, loopback server on `:8087` that
+  serves this directory; same pattern as the pentest tab's `pentest_ui_api.py`.
