@@ -1,10 +1,17 @@
 # Experiment 2: planning ahead (rhyming couplets)
 
-Run: `./interp run exp2 [--layer 12] [--top-k 32]`
+Run: `./interp run exp2 [--model <hf-id>] [--layer N] [--top-k 32]`
+
+`--model` defaults to `google/gemma-2-2b`; any `model.model.layers[i]` decoder
+works (Qwen2.5/3, Llama-3, Mistral, gemma-2). `--layer` defaults to the model's
+middle layer. Base models tend to just repeat line 1 instead of writing a
+couplet — use an instruct model (e.g. `--model Qwen/Qwen2.5-3B-Instruct`) for a
+meaningful result. The SAE feature step only runs on `google/gemma-2-2b`.
 
 ## Plan (from the build spec)
 
-1. Load gemma-2-2b (TransformerLens), hook the layer-12 residual stream.
+1. Load the model via nnsight, read the residual stream at
+   `model.model.layers[L].output[0]`.
 2. For each item in `../../data/rhyming_couplets.json`, feed
    `line1_clean + "\n"` and its length-matched `line1_corrupt + "\n"`.
 3. Cache the residual stream for both at the "planning position" (the last
@@ -53,6 +60,7 @@ surface priming than a committed plan.
   match, not a phonetic rhyme check. Expand the lists if a model's actual
   wording (a synonym, a different phrase) isn't being classified.
 - `line1_clean` / `line1_corrupt` are matched by word count, not guaranteed
-  equal token count after tokenization. `length_matched` in each per-item
-  result flags mismatches; the patch still runs (using the shorter prompt's
-  last-token index) but treat mismatched items as weaker evidence.
+  equal token count after tokenization, and different `--model`s tokenize them
+  differently. `length_matched` in each per-item result flags mismatches; the
+  patch still runs (using the shorter prompt's last-token index) but treat
+  mismatched items as weaker evidence.

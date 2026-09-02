@@ -18,16 +18,18 @@ def test_parser_builds_exp1():
 
 def test_parser_builds_exp2():
     p = cli.build_parser()
-    args = p.parse_args(["run", "exp2", "--layer", "8", "--top-k", "16"])
+    args = p.parse_args(["run", "exp2", "--layer", "8", "--top-k", "16", "--model", "Qwen/Qwen2.5-0.5B-Instruct"])
     assert args.layer == 8
     assert args.top_k == 16
+    assert args.model == "Qwen/Qwen2.5-0.5B-Instruct"
     assert args.experiment == "exp2"
 
 
 def test_parser_builds_exp3():
     p = cli.build_parser()
     args = p.parse_args(["run", "exp3"])
-    assert args.layer == 12
+    assert args.layer is None  # resolved to the model's middle layer at run time
+    assert args.model == config.EXP3_DEFAULT_MODEL
     assert args.experiment == "exp3"
 
 
@@ -38,14 +40,14 @@ def test_config_hook_matches_layer():
 
 
 def test_prompt_data_parallel():
-    data = json.loads((INTERP_ROOT / "data" / "multilingual_antonyms.json").read_text())
+    data = json.loads((INTERP_ROOT / "data" / "multilingual_antonyms.json").read_text(encoding="utf-8"))
     langs = {lang for it in data["items"] for lang in it["prompts"]}
     for it in data["items"]:
         assert set(it["prompts"]) == langs, f"{it['concept']} missing a language"
 
 
 def test_rhyming_couplets_data():
-    data = json.loads((INTERP_ROOT / "data" / "rhyming_couplets.json").read_text())
+    data = json.loads((INTERP_ROOT / "data" / "rhyming_couplets.json").read_text(encoding="utf-8"))
     assert data["items"], "no couplet items"
     for it in data["items"]:
         assert it["line1_clean"] and it["line1_corrupt"]
@@ -57,7 +59,7 @@ def test_rhyming_couplets_data():
 
 
 def test_cot_hinted_questions_data():
-    data = json.loads((INTERP_ROOT / "data" / "cot_hinted_questions.json").read_text())
+    data = json.loads((INTERP_ROOT / "data" / "cot_hinted_questions.json").read_text(encoding="utf-8"))
     templates = data["hint_templates"]
     assert data["items"], "no question items"
     for it in data["items"]:
@@ -83,7 +85,7 @@ def test_report_envelope_schema(tmp_path):
         assert key in results
     write(tmp_path, results, "# summary")
     assert (tmp_path / "results.json").exists()
-    assert (tmp_path / "summary.md").read_text() == "# summary"
+    assert (tmp_path / "summary.md").read_text(encoding="utf-8") == "# summary"
 
 
 def test_doctor_runs():

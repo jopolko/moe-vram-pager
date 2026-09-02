@@ -55,5 +55,17 @@ INSTRUCT = ModelConfig(
 )
 
 
+# exp2 / exp3 load through nnsight (see activations.py) and take a `--model`
+# <hf-id> flag, so they are not tied to gemma. These are just the defaults when
+# the flag is omitted. exp2's default matches exp1 (base gemma-2-2b) so a plain
+# `run exp2` still reproduces the intended setup; exp3 needs an instruct model.
+# Any `model.model.layers[i]` decoder works: gemma-2, Qwen2.5/3, Llama-3, Mistral.
+EXP2_DEFAULT_MODEL = "google/gemma-2-2b"
+EXP3_DEFAULT_MODEL = "google/gemma-2-2b-it"
+# Only gemma-2-2b has a Gemma Scope SAE wired into sae_lens; exp2 records SAE
+# features only when run on this exact model, and skips that step otherwise.
+SAE_MODEL = "google/gemma-2-2b"
+
+
 DEVICE = pick_device()
 DTYPE = pick_dtype(DEVICE)

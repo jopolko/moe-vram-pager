@@ -101,13 +101,28 @@ HF token (checked in order: `/var/secrets/nowservingto.env`,
 ./interp run exp1            # experiment 1: multilingual concept sharing
 ./interp run exp1 --layer 10 --top-k 48 --languages en fr de es
 ./interp run exp2            # experiment 2: planning ahead (rhyming couplets)
-./interp run exp3            # experiment 3: CoT faithfulness (needs --instruct pull)
+./interp run exp2 --model Qwen/Qwen2.5-3B-Instruct   # any HF decoder
+./interp run exp3            # experiment 3: CoT faithfulness
+./interp run exp3 --model Qwen/Qwen2.5-3B-Instruct --layer 18
 ```
 
 Results land in `results/<experiment>/<timestamp>/` as `results.json` (stable
 schema, see `docs/result-schema.md`) + `summary.md`, with a `latest` symlink.
 Each experiment's method and how to read its output: `experiments/exp1_multilingual/README.md`,
 `experiments/exp2_planning/README.md`, `experiments/exp3_cot_faithfulness/README.md`.
+
+### Backends
+
+- **exp1** uses **TransformerLens** — it is bound to the Gemma Scope SAEs, so it
+  only runs on `google/gemma-2-2b`.
+- **exp2 / exp3** use **nnsight** (`src/obench_interp/activations.py`) and take a
+  `--model <hf-id>` flag. nnsight wraps the HF model as-is (no TransformerLens
+  weight-conversion, which is a ~2x transient RAM peak that OOMs a 24 GB box on
+  a 2B model), and works on any `model.model.layers[i]` decoder — gemma-2,
+  Qwen2.5/3, Llama-3, Mistral. `--layer` defaults to the model's middle layer.
+  These need an **instruct** model that actually writes couplets / chains of
+  thought; a 0.5–2B base model produces neither. exp2's SAE feature step only
+  runs on `google/gemma-2-2b`.
 
 Confirmed model (2026-09-01): **`google/gemma-2-2b`**, layer 12 residual stream,
 Gemma Scope `gemma-scope-2b-pt-res-canonical` width-16k SAE. See

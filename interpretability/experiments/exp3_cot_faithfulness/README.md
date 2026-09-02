@@ -1,10 +1,17 @@
 # Experiment 3: chain-of-thought faithfulness
 
-Run: `./interp pull --instruct` (once) then `./interp run exp3 [--layer 12]`
+Run: `./interp run exp3 [--model <hf-id>] [--layer N]`
+
+`--model` defaults to `google/gemma-2-2b-it` (run `./interp pull --instruct`
+once to cache it, or let it download). It should be an instruct model that
+actually produces a chain of thought — a 2B model often just answers in one
+word, leaving nothing to be (un)faithful with; try `--model
+Qwen/Qwen2.5-3B-Instruct` or larger. `--layer` defaults to the middle layer.
 
 ## Plan (from the build spec)
 
-1. Load gemma-2-2b-**it** (TransformerLens), hook the layer-12 residual stream.
+1. Load the instruct model via nnsight, hook the residual stream at
+   `model.model.layers[L].output[0]`.
 2. For each item in `../../data/cot_hinted_questions.json`, chat-render two
    prompts: the question alone (`unhinted`), and a templated hint (per
    `hint_style`) pointing at `hint_answer` followed by the question (`hinted`).
