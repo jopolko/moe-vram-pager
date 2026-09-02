@@ -35,6 +35,11 @@ param(
     [string]   $Bind       = '127.0.0.1',
     [switch]   $MoeStream,
     [switch]   $NoKvQuant,
+    [switch]   $Router,        # multi-model / model-picker mode (download+load from the webUI)
+    [switch]   $NoMoeStream,   # router mode: don't pass --moe-stream
+    [string]   $ModelsDir  = (Join-Path $env:USERPROFILE '.openbench\models'),
+    [string]   $PresetIni  = (Join-Path $env:USERPROFILE '.openbench\models.ini'),
+    [int]      $ModelsMax  = 1,
     [switch]   $Pentest,
     [switch]   $Interp,
     [switch]   $Stop,
@@ -86,8 +91,7 @@ if (-not (Test-Path $Server)) {
     Die "llama-server not built: $Server`n      build it: scripts\windows\build.ps1 -InstallDeps -WithUI"
 }
 
-# --- resolve the model -----------------------------------------------------
-Step 'model'
+# --- resolve the model ---------------------------------------------------
 function Resolve-Model([string] $m) {
     if (Test-Path $m) { return @{ path = (Resolve-Path $m).Path; name = [IO.Path]::GetFileNameWithoutExtension($m) } }
     if ($m -match '^sha256-[0-9a-f]{64}$') {
@@ -124,24 +128,49 @@ function Resolve-Model([string] $m) {
     if (-not (Test-Path $blob)) { Die "model blob missing: $blob" }
     @{ path = $blob; name = ($ref -replace '.*/', '') }
 }
-$resolved = Resolve-Model $Model
-Info "$($resolved.name)"
-Info "$($resolved.path)"
 
 # --- llama-server --------------------------------------------------------
-Step "llama-server  ($Bind`:$Port)"
+Step "llama-server  ($Bind`:$Port$(if($Router){'  [router mode]'}))"
 Stop-Port $Port 'old llama-server'
 Start-Sleep 1
 
-$srvArgs = @(
-    '-m', $resolved.path, '-a', $resolved.name,
-    '-ngl', "$Ngl", '-c', "$Ctx", '-np', '1',
-    '-fa', 'on', '--ui-mcp-proxy',
-    '--host', $Bind, '--port', "$Port"
-)
+$srvArgs = @('-fa', 'on', '--ui-mcp-proxy', '--host', $Bind, '--port', "$Port")
 if (-not $NoKvQuant) { $srvArgs += @('-ctk', 'q8_0', '-ctv', 'q8_0') }
-if ($MoeStream)      { $srvArgs += '--moe-stream' }
-if ($ExtraArgs)      { $srvArgs += $ExtraArgs }
+
+if ($Router) {
+    # multi-model: the webUI's Models page can download + hot-load. router_available
+    # gates on --models-preset, so the ini must exist (the picker appends to it).
+    New-Item -ItemType Directory -Force -Path $ModelsDir | Out-Null
+    if (-not (Test-Path $PresetIni)) {
+        New-Item -ItemType Directory -Force -Path (Split-Path $PresetIni) | Out-Null
+        @('[*]', 'ctx-size  = 0', 'mmap      = 1', 'kv-unified = 0') |
+            Set-Content -Encoding ascii $PresetIni
+        Info "created $PresetIni"
+    }
+    # if -Model names a real file/blob, make it pickable in the dir
+    if ($Model -and $Model -ne 'josiefied' -and (Test-Path $Model -PathType Leaf)) {
+        $dst = Join-Path $ModelsDir ([IO.Path]::GetFileName($Model))
+        if ($dst -notlike '*.gguf') { $dst += '.gguf' }
+        if (-not (Test-Path $dst)) {
+            try { New-Item -ItemType HardLink -Path $dst -Target (Resolve-Path $Model) | Out-Null; Info "linked $(Split-Path $dst -Leaf) into models dir" }
+            catch { Copy-Item $Model $dst; Info "copied $(Split-Path $dst -Leaf) into models dir" }
+        }
+    }
+    $srvArgs += @('--models-dir', $ModelsDir, '--models-preset', $PresetIni, '--models-max', "$ModelsMax")
+    if (-not $NoMoeStream) { $srvArgs += '--moe-stream' }
+    Info "models dir: $ModelsDir"
+    Info "preset:     $PresetIni"
+    $gguf = @(Get-ChildItem $ModelsDir -Filter *.gguf -ErrorAction SilentlyContinue)
+    Info "$($gguf.Count) local GGUF$(if($gguf.Count -ne 1){'s'}) - browse/download more from the webUI Models page"
+} else {
+    Step 'model'
+    $resolved = Resolve-Model $Model
+    Info "$($resolved.name)"
+    Info "$($resolved.path)"
+    $srvArgs += @('-m', $resolved.path, '-a', $resolved.name, '-ngl', "$Ngl", '-c', "$Ctx", '-np', '1')
+    if ($MoeStream) { $srvArgs += '--moe-stream' }
+}
+if ($ExtraArgs) { $srvArgs += $ExtraArgs }
 
 $srvLog = Join-Path $LogDir ("llama-server-{0}.log" -f (Get-Date -Format yyyyMMdd-HHmmss))
 $srv = Start-Process $Server -PassThru -WindowStyle Hidden -RedirectStandardOutput $srvLog `
@@ -182,8 +211,13 @@ if ($Interp) {
 
 # --- summary ---------------------------------------------------------------
 Step 'ready'
+$modelLine = if ($Router) {
+    "router mode - pick/download models on the webUI Models page$(if(-not $NoMoeStream){' (--moe-stream on)'})"
+} else {
+    "model: $($resolved.name), ctx $Ctx$(if($MoeStream){', --moe-stream'})"
+}
 Write-Host @"
-  webUI + API      http://127.0.0.1:$Port           (model: $($resolved.name), ctx $Ctx$(if($MoeStream){', --moe-stream'}))
-$(if ($Pentest) { "  Metasploit MCP   http://127.0.0.1:8085/sse       (via the webUI's CORS proxy)`n" })$(if ($Interp)  { "  interp viewer    webUI -> flask icon -> Open results folder`n" })
+  webUI + API      http://127.0.0.1:$Port           ($modelLine)
+$(if ($Router)  { "  Models page      #/models - browse UGI-ranked derestricted MoE models, download + run`n" })$(if ($Pentest) { "  Metasploit MCP   http://127.0.0.1:8085/sse       (via the webUI's CORS proxy)`n" })$(if ($Interp)  { "  interp viewer    webUI -> flask icon -> Open results folder`n" })
   stop everything: scripts\windows\start-openbench.ps1 -Stop
 "@ -ForegroundColor Green

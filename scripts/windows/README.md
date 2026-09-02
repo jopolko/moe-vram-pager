@@ -20,6 +20,9 @@ powershell -ExecutionPolicy Bypass -File scripts\windows\start-openbench.ps1
 # a big MoE with expert streaming
 ... start-openbench.ps1 -Model C:\models\GLM-4.5-Air-Q4.gguf -MoeStream -Ctx 131072
 
+# router mode: browse + download + hot-swap models from the webUI Models page
+... start-openbench.ps1 -Router -Pentest
+
 # tear it all down
 ... start-openbench.ps1 -Stop
 ```
@@ -30,6 +33,13 @@ webUI's Metasploit MCP entry needs, `--moe-stream` only with `-MoeStream`), wait
 for `/health`, then optionally brings up the pentest MCP stack (`-Pentest`) and
 the interp results sidecar (`-Interp`). Logs land in `%USERPROFILE%\.openbench\logs\`.
 `-ExtraArgs` passes anything else straight through to `llama-server`.
+
+**`-Router`** starts multi-model mode instead: no single `-m`, but
+`--models-dir %USERPROFILE%\.openbench\models` + `--models-preset ...\models.ini`
+(created if absent - the picker appends to it), which is what makes the webUI
+Models page's **download + load** buttons work (`router_available` gates on the
+preset). `--moe-stream` is on by default here (`-NoMoeStream` to disable). The
+Models page needs the HTTPS-capable build - see **OpenSSL** below.
 
 ## Running a prebuilt binary
 
