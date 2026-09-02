@@ -44,7 +44,8 @@ def _cmd_list(_args: argparse.Namespace) -> int:
     ]
     print("phase  status        experiment")
     for n, name, cmd, cfg, ready in rows:
-        w = "weights ok" if (_model_present(cfg) and _sae_present(cfg)) else "no weights"
+        sae_ok = _sae_present(cfg) if cfg.sae_release is not None else True
+        w = "weights ok" if (_model_present(cfg) and sae_ok) else "no weights"
         state = f"{'ready' if ready else 'todo':<9} {w}"
         print(f"  {n}    {state:<22} {name}  ({cmd})")
     return 0

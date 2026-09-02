@@ -101,13 +101,14 @@ def run_all() -> list[Check]:
 
     for label, cfg in (("phase-1 base", ModelConfig()), ("phase-3 instruct", INSTRUCT)):
         m = _model_present(cfg)
-        s = _sae_present(cfg)
+        needs_sae = cfg.sae_release is not None
+        s = _sae_present(cfg) if needs_sae else True
+        sae_note = f", SAE {cfg.sae_id}={'yes' if s else 'MISSING'}" if needs_sae else " (no SAE - patching only)"
         checks.append(
             Check(
                 f"weights ({label})",
                 m and s,
-                f"{cfg.hf_name}: model={'yes' if m else 'MISSING'}, "
-                f"SAE {cfg.sae_id}={'yes' if s else 'MISSING'}"
+                f"{cfg.hf_name}: model={'yes' if m else 'MISSING'}" + sae_note
                 + ("" if (m and s) else "  -> run: obench-interp pull"),
             )
         )

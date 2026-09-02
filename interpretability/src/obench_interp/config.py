@@ -39,14 +39,19 @@ class ModelConfig:
     sae_id: str | None = "layer_12/width_16k/canonical"
 
 
-# Phase 3 (CoT faithfulness) swaps to the instruct model + its SAE set.
+# Phase 3 (CoT faithfulness) swaps to the instruct model. It is pure activation
+# patching - no SAE involved - and DeepMind never released a Gemma Scope residual
+# SAE trained on gemma-2-2b-it (sae_lens only registers the -pt- set), so there is
+# no SAE to pull or check here. If a future exp3 variant wants SAE feature
+# attribution on the instruct model, the accepted route is the base -pt- SAEs
+# applied to the instruct residual stream - set sae_release back to the pt release.
 INSTRUCT = ModelConfig(
     hf_name="google/gemma-2-2b-it",
     tl_name="gemma-2-2b-it",
     layer=12,
     hook_name="blocks.12.hook_resid_post",
-    sae_release="gemma-scope-2b-it-res-canonical",
-    sae_id="layer_12/width_16k/canonical",
+    sae_release=None,
+    sae_id=None,
 )
 
 

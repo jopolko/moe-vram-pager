@@ -42,6 +42,9 @@ def pull(include_instruct: bool = False) -> None:
             allow_patterns=["*.safetensors", "*.json", "tokenizer.model"],
             token=token,
         )
+        if not cfg.sae_release:
+            print("== no SAE for this config (activation patching only) ==")
+            continue
         # Let sae_lens resolve the canonical release -> the right average_l0
         # subdir and fetch it. Hand-written HF patterns get this wrong because
         # "canonical" is a sae_lens alias, not a real directory.
