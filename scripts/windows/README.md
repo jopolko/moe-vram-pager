@@ -5,6 +5,32 @@ distribution philosophy is **ship small**: only our own DLLs + `llama-server.exe
 are bundled. The large vendor runtimes (NVIDIA CUDA, Microsoft VC++) are **not**
 bundled - they are fetched on demand from their official sources.
 
+## One launcher for everything
+
+```powershell
+# model + webUI (default model: the ollama "josiefied" tag)
+powershell -ExecutionPolicy Bypass -File scripts\windows\start-openbench.ps1
+
+# + Metasploit MCP + the interpretability viewer sidecar
+... start-openbench.ps1 -Pentest -Interp
+
+# a different model (ollama name, .gguf path, or sha256- blob), bigger context
+... start-openbench.ps1 -Model huihui_ai/qwen3.5-abliterated:9b -Ctx 16384 -Pentest
+
+# a big MoE with expert streaming
+... start-openbench.ps1 -Model C:\models\GLM-4.5-Air-Q4.gguf -MoeStream -Ctx 131072
+
+# tear it all down
+... start-openbench.ps1 -Stop
+```
+
+`start-openbench.ps1` resolves the model, starts `llama-server` with sane flags
+(`-fa on`, `-ctk/-ctv q8_0` unless `-NoKvQuant`, **`--ui-mcp-proxy`** which the
+webUI's Metasploit MCP entry needs, `--moe-stream` only with `-MoeStream`), waits
+for `/health`, then optionally brings up the pentest MCP stack (`-Pentest`) and
+the interp results sidecar (`-Interp`). Logs land in `%USERPROFILE%\.openbench\logs\`.
+`-ExtraArgs` passes anything else straight through to `llama-server`.
+
 ## Running a prebuilt binary
 
 ```bat
