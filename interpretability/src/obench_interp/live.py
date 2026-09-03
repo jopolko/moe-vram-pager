@@ -407,27 +407,26 @@ class LiveSession:
             "layers": per_layer,
         }
 
-    def _q5_summary(self, gen_view: dict | None, prompt_view: dict | None) -> dict | None:
-        if not gen_view:
+    def _q5_summary(self, prompt_view: dict | None) -> dict | None:
+        """Q5 is read once, from the prompt-end state (the position that precedes
+        the first answer token) - the sycophancy probe was trained there and does
+        not transfer to mid-answer token positions. Not a per-token meter.
+        """
+        if not prompt_view:
             return None
-
-        def cave(v):
-            return round(v["p"].get("caved", 0.0), 3) if v and v["p"] else None
-
         per_layer = [
             {"layer": e["layer"], "p_cave": round(e["p"].get("caved", 0.0), 3)}
-            for e in gen_view["per_layer"]
+            for e in prompt_view["per_layer"]
         ]
-        p_now = cave(gen_view)
+        p = round(prompt_view["p"].get("caved", 0.0), 3) if prompt_view["p"] else None
         return {
             "probe": "sycophancy",
-            "layer": gen_view["layer"],
-            "cv_accuracy": gen_view["cv_accuracy"],
-            "base_rate": gen_view["base_rate"],
+            "layer": prompt_view["layer"],
+            "cv_accuracy": prompt_view["cv_accuracy"],
+            "base_rate": prompt_view["base_rate"],
             "threshold": P.CAVE_THRESHOLD,
-            "p_cave": p_now,
-            "p_cave_prompt": cave(prompt_view),
-            "leaning": bool(p_now is not None and p_now >= P.CAVE_THRESHOLD),
+            "p_cave": p,
+            "leaning": bool(p is not None and p >= P.CAVE_THRESHOLD),
             "layers": per_layer,
         }
 
@@ -447,6 +446,7 @@ class LiveSession:
         sae = self._get_sae()
 
         self._q5_prompt_view = None
+        q5: dict | None = None
         captured: dict[int, object] = {}
 
         def _hook(layer: int):
@@ -478,9 +478,9 @@ class LiveSession:
                 resid_np = {L: captured[L].float().cpu().numpy() for L in layers}
                 if i == 0 and "sycophancy" in self.probes:
                     self._q5_prompt_view = self.probes.score("sycophancy", resid_np)
+                    q5 = self._q5_summary(self._q5_prompt_view)
 
                 lang_view = self.probes.score("language", resid_np)
-                q5_view = self.probes.score("sycophancy", resid_np)
 
                 full = self.tokenizer.decode(gen_ids, skip_special_tokens=True)
                 delta, prev_text = full[len(prev_text):], full
@@ -496,7 +496,7 @@ class LiveSession:
                     q2=None,
                     q3=None,
                     q4=None,
-                    q5=self._q5_summary(q5_view, self._q5_prompt_view),
+                    q5=q5,
                 )
                 if finished:
                     break

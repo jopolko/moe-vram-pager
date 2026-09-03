@@ -215,14 +215,16 @@ def available_probes(model_id: str, probes_dir: Path | None = None) -> list[str]
 
 def capture(
     model, texts: list[str], layers: list[int], *, batch_size: int = 8,
-    max_length: int = 256, chat: bool = False,
-) -> np.ndarray:
-    """`[n_texts, n_layers, hidden]` last-token residual activations (fp32).
+    max_length: int = 256, chat: bool = False, positions: str = "last",
+) -> tuple[np.ndarray, list[int]]:
+    """`([n_rows, n_layers, hidden] fp32, row->text index)` residual activations.
 
     Raw-HF forward hooks on `model._model.model.layers[L]` - the pattern used by
     `live.LiveSession.generate` - one forward pass per batch. Right-padded (real
-    tokens start at 0, so naive position ids stay correct) and the last real
-    token is gathered from the attention mask.
+    tokens start at 0, so naive position ids stay correct); the last real token
+    is gathered from the attention mask. `positions="multi"` also grabs two
+    interior tokens per text (labels replicated by the caller via the index map)
+    so a probe transfers to mid-sequence positions, not just sentence-final ones.
     """
     import torch
 
@@ -254,8 +256,10 @@ def capture(
 
         return fn
 
+    fracs = (1.0, 0.7, 0.45) if positions == "multi" else (1.0,)
     handles = [hf.model.layers[L].register_forward_hook(_hook(L)) for L in layers]
-    acts = np.empty((len(texts), len(layers), hf.config.hidden_size), np.float32)
+    out_rows: list[np.ndarray] = []
+    index: list[int] = []
     try:
         for s in range(0, len(texts), batch_size):
             chunk = texts[s:s + batch_size]
@@ -265,16 +269,21 @@ def capture(
             ).to(dev)
             with torch.no_grad():
                 hf(**enc)
-            last = enc["attention_mask"].sum(dim=1) - 1  # index of the last real token
+            n_real = enc["attention_mask"].sum(dim=1)  # [B]
             rows = torch.arange(len(chunk))
-            for j, L in enumerate(layers):
-                acts[s:s + len(chunk), j] = captured[L][rows, last].float().cpu().numpy()
+            for f in fracs:
+                pos = torch.clamp((n_real.float() * f).long() - 1, min=0)
+                block = np.stack(
+                    [captured[L][rows, pos].float().cpu().numpy() for L in layers], axis=1
+                )  # [B, n_layers, hidden]
+                out_rows.append(block)
+                index.extend(range(s, s + len(chunk)))
     finally:
         for h in handles:
             h.remove()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-    return acts
+    return np.concatenate(out_rows, axis=0), index
 
 
 def _fit(name, model_id, kind, acts, labels, layers, *, dataset_sha, band=None) -> Probe:
@@ -407,7 +416,8 @@ def train_all(model_id: str, which=PROBE_NAMES, *, layer_stride: int = 1, device
         band = None
         if name == "language":
             texts, labels, sha = build_language_dataset()
-            acts = capture(model, texts, layers, chat=False)
+            acts, idx = capture(model, texts, layers, chat=False, positions="multi")
+            labels = [labels[i] for i in idx]
             kind, band = "multiclass", LANG_BAND
         else:  # sycophancy
             texts, labels, sha = build_sycophancy_dataset(model)
@@ -416,7 +426,8 @@ def train_all(model_id: str, which=PROBE_NAMES, *, layer_stride: int = 1, device
                 print("[probes]    only one class - this model does not vary on the "
                       "sycophancy set; skipping")
                 continue
-            acts = capture(model, texts, layers, chat=True)
+            acts, idx = capture(model, texts, layers, chat=True)
+            labels = [labels[i] for i in idx]
             kind = "binary"
         probe = _fit(name, model_id, kind, acts, labels, layers, dataset_sha=sha, band=band)
         save(probe)

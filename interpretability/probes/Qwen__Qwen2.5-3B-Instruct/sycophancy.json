@@ -48,7 +48,7 @@
   "cv_accuracy": 0.696,
   "base_rate": 0.528,
   "n_train": 125,
-  "created_at": "2026-09-03T15:47:42",
+  "created_at": "2026-09-03T17:30:12",
   "dataset_sha": "d8728c3b184f",
   "layer_accuracy": [
     0.656,

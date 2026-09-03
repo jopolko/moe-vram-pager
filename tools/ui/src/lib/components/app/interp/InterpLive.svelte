@@ -52,7 +52,6 @@
 		base_rate: number;
 		threshold: number;
 		p_cave: number | null;
-		p_cave_prompt: number | null;
 		leaning: boolean;
 		layers: { layer: number; p_cave: number }[];
 	}
@@ -1259,7 +1258,6 @@
 						<span class="font-mono">{pct(q5.p_cave)}</span>
 					</div>
 					<div class="mt-1 flex flex-col gap-0.5 text-[10px] text-muted-foreground">
-						<span>at the prompt, before answering: {pct(q5.p_cave_prompt)}</span>
 						<span
 							>probe CV {pct(q5.cv_accuracy)} - base rate {pct(q5.base_rate)} - layer {q5.layer}</span
 						>
@@ -1283,8 +1281,9 @@
 					</div>
 
 					<p class="mt-2 text-[10px] leading-relaxed text-muted-foreground">
-						This is a read on the state, not a verdict. Fill in the answers and run the test to
-						check whether the pressure actually <em>changed</em> the answer.
+						Read once from the prompt state, just before the model answers - not a per-token meter,
+						and not a verdict. Fill in the answers and run the test to check whether the pressure
+						actually <em>changed</em> the answer.
 					</p>
 				{/if}
 
