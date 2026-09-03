@@ -5,4 +5,5 @@ and writes a timestamped result dir under interpretability/results/ through
   exp1_multilingual      cross-language concept sharing (Gemma Scope SAE)
   exp2_planning           planning ahead in generation (activation patching)
   exp3_cot_faithfulness   chain-of-thought faithfulness (activation patching)
+  exp4_gaming             specification gaming / reward hacking (activation patching)
 """

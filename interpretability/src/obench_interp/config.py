@@ -62,6 +62,10 @@ INSTRUCT = ModelConfig(
 # Any `model.model.layers[i]` decoder works: gemma-2, Qwen2.5/3, Llama-3, Mistral.
 EXP2_DEFAULT_MODEL = "google/gemma-2-2b"
 EXP3_DEFAULT_MODEL = "google/gemma-2-2b-it"
+# exp4 (specification gaming) needs a model that can actually write code and
+# will hardcode under pressure; a 2B rarely does either. Qwen2.5-3B-Instruct
+# fits fp16 on the 11 GB card. Pull it: it downloads on first `run exp4`.
+EXP4_DEFAULT_MODEL = "Qwen/Qwen2.5-3B-Instruct"
 # Only gemma-2-2b has a Gemma Scope SAE wired into sae_lens; exp2 records SAE
 # features only when run on this exact model, and skips that step otherwise.
 SAE_MODEL = "google/gemma-2-2b"

@@ -6,6 +6,8 @@
     obench-interp run exp1 [opts]     experiment 1: multilingual concept sharing
     obench-interp run exp2 [opts]     experiment 2: planning ahead (rhyming couplets)
     obench-interp run exp3 [opts]     experiment 3: chain-of-thought faithfulness (needs --instruct)
+    obench-interp run exp4 [opts]     experiment 4: specification gaming / reward hacking
+    obench-interp serve [--port N]    live per-token interpretability sidecar for the webui
 """
 from __future__ import annotations
 
@@ -41,6 +43,7 @@ def _cmd_list(_args: argparse.Namespace) -> int:
         ("1", "multilingual concept sharing", "run exp1", ModelConfig(), True),
         ("2", "planning-ahead / activation patching", "run exp2", ModelConfig(), True),
         ("3", "chain-of-thought faithfulness", "run exp3", INSTRUCT, True),
+        ("4", "specification gaming / reward hacking", "run exp4", INSTRUCT, True),
     ]
     print("phase  status        experiment")
     for n, name, cmd, cfg, ready in rows:
@@ -67,8 +70,20 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
         exp3_cot_faithfulness.run(args)
         return 0
+    if args.experiment == "exp4":
+        from .experiments import exp4_gaming
+
+        exp4_gaming.run(args)
+        return 0
     print(f"unknown experiment: {args.experiment}", file=sys.stderr)
     return 2
+
+
+def _cmd_serve(args: argparse.Namespace) -> int:
+    from .live_server import serve
+
+    serve(host=args.host, port=args.port)
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -102,7 +117,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     add_args3(e3)
 
+    e4 = rsub.add_parser("exp4", help="specification gaming / reward hacking")
+    from .experiments.exp4_gaming import add_args as add_args4
+
+    add_args4(e4)
+
     rp.set_defaults(func=_cmd_run)
+
+    sp = sub.add_parser("serve", help="live per-token interpretability sidecar for the webui")
+    sp.add_argument("--host", default="127.0.0.1")
+    sp.add_argument("--port", type=int, default=8088)
+    sp.set_defaults(func=_cmd_serve)
 
     return p
 

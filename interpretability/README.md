@@ -30,6 +30,7 @@ non-goal / open question. Do not attempt it here without validation work first.
 | 1 | Multilingual concept sharing (residual-stream feature overlap across languages) | implemented (`run exp1`) |
 | 2 | Planning-ahead / activation patching (rhyming couplets) | implemented (`run exp2`) |
 | 3 | Chain-of-thought faithfulness via activation patching | implemented (`run exp3`, needs `--instruct` weights) |
+| 4 | Specification gaming / reward hacking under test-passing pressure | implemented (`run exp4`, wants a code-capable instruct model) |
 
 Every experiment writes through the same result envelope
 (`docs/result-schema.md`) so a future SvelteKit view can read all three
@@ -104,25 +105,28 @@ HF token (checked in order: `/var/secrets/nowservingto.env`,
 ./interp run exp2 --model Qwen/Qwen2.5-3B-Instruct   # any HF decoder
 ./interp run exp3            # experiment 3: CoT faithfulness
 ./interp run exp3 --model Qwen/Qwen2.5-3B-Instruct --layer 18
+./interp run exp4            # experiment 4: specification gaming (default Qwen2.5-3B-Instruct)
 ```
 
 Results land in `results/<experiment>/<timestamp>/` as `results.json` (stable
 schema, see `docs/result-schema.md`) + `summary.md`, with a `latest` symlink.
 Each experiment's method and how to read its output: `experiments/exp1_multilingual/README.md`,
-`experiments/exp2_planning/README.md`, `experiments/exp3_cot_faithfulness/README.md`.
+`experiments/exp2_planning/README.md`, `experiments/exp3_cot_faithfulness/README.md`,
+`experiments/exp4_gaming/README.md`.
 
 ### Backends
 
 - **exp1** uses **TransformerLens** — it is bound to the Gemma Scope SAEs, so it
   only runs on `google/gemma-2-2b`.
-- **exp2 / exp3** use **nnsight** (`src/obench_interp/activations.py`) and take a
-  `--model <hf-id>` flag. nnsight wraps the HF model as-is (no TransformerLens
-  weight-conversion, which is a ~2x transient RAM peak that OOMs a 24 GB box on
-  a 2B model), and works on any `model.model.layers[i]` decoder — gemma-2,
-  Qwen2.5/3, Llama-3, Mistral. `--layer` defaults to the model's middle layer.
-  These need an **instruct** model that actually writes couplets / chains of
-  thought; a 0.5–2B base model produces neither. exp2's SAE feature step only
-  runs on `google/gemma-2-2b`.
+- **exp2 / exp3 / exp4** use **nnsight** (`src/obench_interp/activations.py`) and
+  take a `--model <hf-id>` flag. nnsight wraps the HF model as-is (no
+  TransformerLens weight-conversion, which is a ~2x transient RAM peak that OOMs
+  a 24 GB box on a 2B model), and works on any `model.model.layers[i]` decoder —
+  gemma-2, Qwen2.5/3, Llama-3, Mistral. `--layer` defaults to the model's middle
+  layer. These need an **instruct** model that actually writes couplets / chains
+  of thought / working code; a 0.5–2B base model produces none of them. exp2's
+  SAE feature step only runs on `google/gemma-2-2b`; exp4 defaults to
+  `Qwen/Qwen2.5-3B-Instruct`.
 
 Confirmed model (2026-09-01): **`google/gemma-2-2b`**, layer 12 residual stream,
 Gemma Scope `gemma-scope-2b-pt-res-canonical` width-16k SAE. See
@@ -132,7 +136,8 @@ Gemma Scope `gemma-scope-2b-pt-res-canonical` width-16k SAE. See
 
 The chat webui (`tools/ui/`) has an **Interpretability** tab (flask icon) that
 renders these runs — cosine heatmaps for exp1, per-couplet
-baseline/patched/control panels for exp2, side-by-side chains of thought with
+baseline/patched/control panels for exp2, plain/pressured/ablated code with a
+visible-vs-held-out score for exp4, side-by-side chains of thought with
 the faithfulness verdict for exp3.
 
 Open the tab and click **Open results folder**, then pick this
@@ -146,3 +151,42 @@ No folder picker (Firefox), or want it headless? Two fallbacks in the same tab:
 - **"connect to a running sidecar"** — `python tools/interp_ui_api.py` starts a
   stdlib-only (no `pip install`), read-only, loopback server on `:8087` that
   serves this directory; same pattern as the pentest tab's `pentest_ui_api.py`.
+
+## Live viewer (webui `#/interp` -> Live)
+
+The batch `run exp*` path above works on a curated dataset. The **Live** view
+instead lets you type a prompt and watch the interpretability signals stream in
+per token. It needs a second sidecar that holds a loaded fp16 model:
+
+```bash
+./interp serve            # or  .\interp.ps1 serve   (loopback :8088)
+```
+
+This one is not read-only and not free of the model runtime — it runs the same
+nnsight-wrapped HF model as `exp2`/`exp3`, so use the wrapper (venv + HF token)
+rather than a bare `python`. `GET /models` lists the causal-LM repos already in
+`hf_cache/` that it can load; `gemma-2-2b-it` and a small instruct model like
+`Qwen/Qwen2.5-3B-Instruct` are the intended targets on an 11 GB card.
+
+The Live tab has a panel per research question — see [`docs/live.md`](docs/live.md):
+
+- **Q1 (language in its head)** — per-layer logit lens on every token, classified
+  by script + function words, plus the Gemma Scope SAE features firing at the
+  probe layer (cross-referenced with any `run exp1` output).
+- **Q2 (planning ahead)** — once a sentence completes, how many tokens early its
+  final word entered the model's next-token candidates; a **causal test** button
+  runs exp2's activation patch on a prompt pair.
+- **Q3 (CoT faithfulness)** — with a biasing context supplied, whether the
+  reasoning acknowledges it; a **causal test** button runs exp3's hint ablation.
+- **Q4 (specification gaming)** — give a coding task plus the visible test
+  inputs; whether the reasoning describes an algorithm while the code just
+  hardcodes the tests, plus a per-token surprisal trace. A **causal test**
+  button runs exp4's pressure-frame ablation.
+
+The live meters are heuristic previews; the causal-test buttons are the real
+`exp2` / `exp3` / `exp4` activation-patching experiments on a single item.
+
+Per-token generation runs the HF model directly with a KV cache (~9-10 tok/s for
+a 2B model on the 1080 Ti). The per-layer logit lens is the main per-token cost —
+raise `lens_stride` in the tab if it drags. VRAM is handed back to `llama-server`
+after each turn.

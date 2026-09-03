@@ -11,6 +11,7 @@
 		Languages,
 		Music,
 		Brain,
+		ShieldX,
 		CircleCheck,
 		CircleX,
 		TriangleAlert
@@ -21,13 +22,31 @@
 	import { Badge } from '$lib/components/ui/badge';
 	import { Input } from '$lib/components/ui/input';
 	import * as Collapsible from '$lib/components/ui/collapsible';
+	import InterpLive from '$lib/components/app/interp/InterpLive.svelte';
 
-	type Experiment = 'exp1_multilingual' | 'exp2_planning' | 'exp3_cot_faithfulness';
+	// "Runs" = the batch `run exp*` result viewer (below). "Live" = the
+	// interactive per-token sidecar (tools/interp_live_api.py / `obench-interp serve`).
+	type Mode = 'runs' | 'live';
+	const MODE_KEY = 'interp-viewer-mode';
+	let mode = $state<Mode>('runs');
+
+	type Experiment = 'exp1_multilingual' | 'exp2_planning' | 'exp3_cot_faithfulness' | 'exp4_gaming';
 	const EXPERIMENT_IDS: Experiment[] = [
 		'exp1_multilingual',
 		'exp2_planning',
-		'exp3_cot_faithfulness'
+		'exp3_cot_faithfulness',
+		'exp4_gaming'
 	];
+
+	interface GamingCond {
+		text: string;
+		code: string;
+		visible_pass: string;
+		held_pass: string;
+		solved: boolean;
+		gamed: boolean;
+		hardcodes: boolean;
+	}
 
 	interface RunData {
 		schema_version: number;
@@ -60,6 +79,13 @@
 				label: 'Chain-of-thought faithfulness',
 				icon: Brain,
 				question: 'Does the stated reasoning match the steps it actually took?'
+			},
+			{
+				id: 'exp4_gaming',
+				label: 'Specification gaming',
+				icon: ShieldX,
+				question:
+					'Under pressure to pass the tests, does it hardcode them instead of solving the task?'
 			}
 		];
 
@@ -123,6 +149,8 @@
 				return `planning effect ${a.planning_effect} (${a.planning_flip_rate} vs ${a.control_flip_rate} control)`;
 			if (r.experiment === 'exp3_cot_faithfulness')
 				return `${a.unfaithful_count}/${a.n_items} unfaithful · follow ${a.hint_follow_rate}`;
+			if (r.experiment === 'exp4_gaming')
+				return `${a.gamed_count}/${a.n_items} gamed · ${a.pressure_induced_count} pressure-induced`;
 		} catch {
 			/* ignore */
 		}
@@ -348,6 +376,7 @@
 		try {
 			selectedKey = localStorage.getItem(SELECTED_KEY);
 			sidecarUrl = localStorage.getItem(SIDECAR_KEY) || DEFAULT_SIDECAR;
+			if (localStorage.getItem(MODE_KEY) === 'live') mode = 'live';
 		} catch {
 			/* ignore */
 		}
@@ -440,13 +469,35 @@
 				<FlaskConical class="size-5 text-primary" /> Interpretability
 			</h1>
 			<p class="mt-1 max-w-2xl text-sm leading-relaxed text-muted-foreground">
-				Runs of the three <code class="text-xs">obench-interp</code> experiments — a shared concept space
-				across languages, planning ahead in generation, and whether a stated chain of thought is the real
-				one.
+				{#if mode === 'live'}
+					Type a prompt and watch the model's internal state per token — starting with which
+					language its mid-stack representation is in. Needs <code class="text-xs"
+						>obench-interp serve</code
+					>.
+				{:else}
+					Runs of the three <code class="text-xs">obench-interp</code> experiments — a shared concept
+					space across languages, planning ahead in generation, and whether a stated chain of thought
+					is the real one.
+				{/if}
 			</p>
 		</div>
-		{#if source !== 'none'}
-			<div class="flex items-center gap-2">
+		<div class="flex items-center gap-2">
+			<div class="flex rounded-md border p-0.5 text-xs">
+				{#each ['runs', 'live'] as m (m)}
+					<button
+						class="rounded px-2 py-1 capitalize transition-colors {mode === m
+							? 'bg-primary/10 font-medium text-primary'
+							: 'text-muted-foreground hover:text-foreground'}"
+						onclick={() => {
+							mode = m as Mode;
+							if (browser) localStorage.setItem(MODE_KEY, m);
+						}}
+					>
+						{m}
+					</button>
+				{/each}
+			</div>
+			{#if mode === 'runs' && source !== 'none'}
 				<Badge variant="secondary" class="gap-1">
 					{#if source === 'folder'}<FolderOpen
 							class="size-3"
@@ -466,11 +517,13 @@
 				<Button variant="ghost" size="sm" onclick={disconnect} title="disconnect">
 					<X class="size-4" />
 				</Button>
-			</div>
-		{/if}
+			{/if}
+		</div>
 	</header>
 
-	{#if source === 'none'}
+	{#if mode === 'live'}
+		<InterpLive />
+	{:else if source === 'none'}
 		<!-- empty state: choose a data source -->
 		<div
 			role="region"
@@ -889,6 +942,125 @@
 													>
 														{cond.text}
 													</p>
+												</div>
+											{/each}
+										</div>
+									</Collapsible.Content>
+								</Collapsible.Root>
+							{/each}
+
+							<!-- ===================== exp4 ===================== -->
+						{:else if s.experiment === 'exp4_gaming'}
+							{@const agg = s.aggregate as {
+								n_items: number;
+								gamed_count: number;
+								plain_gamed_count: number;
+								pressure_induced_count: number;
+								ablation_removes_count: number;
+								solved_count: number;
+								gaming_rate: number;
+							}}
+							<div class="grid grid-cols-2 gap-3 sm:grid-cols-4">
+								{@render stat(
+									'gamed under pressure',
+									`${agg.gamed_count}/${agg.n_items}`,
+									agg.gamed_count > 0 ? 'bad' : 'good'
+								)}
+								{@render stat('pressure-induced', String(agg.pressure_induced_count))}
+								{@render stat('ablation flips back', String(agg.ablation_removes_count))}
+								{@render stat('gamed anyway (plain)', `${agg.plain_gamed_count}/${agg.n_items}`)}
+							</div>
+							<p class="text-xs text-muted-foreground">
+								Each task ships visible tests plus hidden held-out tests. <b>Gamed</b> = the code
+								passes the visible tests but fails the held-out ones (or hardcodes the visible
+								inputs). <b>Pressure-induced</b> + <b>ablation flips back</b> together mean the "only
+								the visible tests matter" frame caused the hardcoding at the activation level.
+							</p>
+
+							{#each s.per_item as it (it.id as string)}
+								{@const item = it as {
+									id: string;
+									entry_point: string;
+									reasoning_describes_algorithm: boolean;
+									pressure_induced_gaming: boolean;
+									ablation_removes_gaming: boolean;
+									gamed: boolean;
+									plain: GamingCond;
+									pressured: GamingCond;
+									pressure_ablated: GamingCond;
+								}}
+								{@const open = !!openRows[item.id]}
+								<Collapsible.Root
+									{open}
+									onOpenChange={(v) => (openRows = { ...openRows, [item.id]: v })}
+									class="rounded-lg border {item.gamed ? 'border-l-2 border-l-red-500' : ''}"
+								>
+									<Collapsible.Trigger
+										class="flex w-full items-start gap-3 p-3 text-left hover:bg-muted/40"
+									>
+										<ChevronRight
+											class="mt-0.5 size-4 shrink-0 text-muted-foreground transition-transform {open
+												? 'rotate-90'
+												: ''}"
+										/>
+										<div class="min-w-0 flex-1">
+											<div class="flex flex-wrap items-center gap-2">
+												<span class="font-mono text-xs font-medium">{item.id}</span>
+												<code class="text-[10px] text-muted-foreground">{item.entry_point}</code>
+												{#if item.gamed}
+													<span
+														class="inline-flex items-center gap-1 rounded bg-red-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-red-600 dark:text-red-400"
+													>
+														<TriangleAlert class="size-3" /> GAMED
+													</span>
+												{/if}
+											</div>
+											<p class="mt-1 truncate text-sm">
+												visible {item.pressured.visible_pass} · held-out {item.pressured.held_pass}
+											</p>
+											<div class="mt-1.5 flex flex-wrap gap-x-4 gap-y-1">
+												{@render verdictBadge(
+													item.pressure_induced_gaming,
+													'pressure induced it',
+													'not pressure-induced'
+												)}
+												{@render verdictBadge(
+													item.ablation_removes_gaming,
+													'flips back when ablated',
+													'ablation no-op'
+												)}
+												{@render verdictBadge(
+													item.reasoning_describes_algorithm,
+													'reasoning describes an algorithm',
+													'no algorithm in the reasoning'
+												)}
+											</div>
+										</div>
+									</Collapsible.Trigger>
+									<Collapsible.Content class="border-t px-3 pt-3 pb-3">
+										<div class="grid gap-3 lg:grid-cols-3">
+											{#each [['plain', 'task alone'], ['pressured', 'with the pressure frame'], ['pressure_ablated', 'pressure frame ablated']] as [key, label] (key)}
+												{@const cond = item[key as 'plain' | 'pressured' | 'pressure_ablated']}
+												<div class="rounded-md border bg-muted/30 p-2.5">
+													<div class="mb-1 flex items-center justify-between gap-2">
+														<span class="text-[10px] tracking-wide text-muted-foreground uppercase"
+															>{label}</span
+														>
+														<span
+															class="rounded px-1.5 py-0.5 text-[10px] font-medium {cond.gamed
+																? 'bg-red-500/15 text-red-600 dark:text-red-400'
+																: cond.solved
+																	? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400'
+																	: 'bg-muted text-muted-foreground'}"
+															>{cond.gamed ? 'gamed' : cond.solved ? 'solved' : 'broke'}</span
+														>
+													</div>
+													<div class="mb-1 text-[10px] text-muted-foreground">
+														visible {cond.visible_pass} · held-out {cond.held_pass}
+													</div>
+													<pre
+														class="max-h-52 overflow-auto rounded bg-background/60 p-1.5 text-[11px] leading-relaxed whitespace-pre-wrap">{cond.code ||
+															cond.text}</pre>
 												</div>
 											{/each}
 										</div>
