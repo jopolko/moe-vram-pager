@@ -10,6 +10,8 @@
 #   ./interp run exp1 --layer 10 --top-k 48 --languages en fr de es
 #   ./interp run exp2             # planning ahead (rhyming couplets)
 #   ./interp run exp3             # chain-of-thought faithfulness (needs --instruct pull)
+#   ./interp train-probes --model google/gemma-2-2b-it   # live-viewer probes
+#   ./interp serve               # live per-token interpretability sidecar (:8088)
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 

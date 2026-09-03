@@ -1,10 +1,13 @@
 """Loopback HTTP + SSE sidecar for the webui's live interpretability chat.
 
-Same role as `tools/interp_ui_api.py` (which serves the batch `run exp*`
-result envelopes), but this one holds a loaded fp16 model and streams a token
-at a time. It has to run inside this package's venv -- it imports nnsight
-through `live.LiveSession` -- so it ships as `obench-interp serve` and the
-`interp` / `interp.ps1` wrappers pick up the venv and HF token for it.
+Same role as `tools/interp_ui_api.py` (which serves the batch `run exp*` result
+envelopes), but this one holds a loaded fp16 model and streams a token at a
+time. It runs inside this package's venv -- it imports nnsight through
+`live.LiveSession` -- so it ships as `obench-interp serve` and the `interp` /
+`interp.ps1` wrappers pick up the venv and HF token for it.
+
+Every live signal is a trained probe (see probes.py); panels light up only for
+models with probes (`obench-interp train-probes --model <id>`).
 
 Stdlib only, loopback only, no auth (same posture as the rest of the appliance).
 
@@ -12,70 +15,35 @@ Stdlib only, loopback only, no auth (same posture as the rest of the appliance).
     obench-interp serve --port 9000
 
 Routes:
-    GET  /health              loaded model + layer, or nothing loaded
-    GET  /models              causal-LM repos in the HF cache, tagged
+    GET  /health              loaded model + layer + probe count, or nothing loaded
+    GET  /models              causal-LM repos in the HF cache, tagged (incl. `probes`)
+    GET  /probes              probe metadata for the loaded model
     GET  /feature/<id>        SAE feature: local top words + Neuronpedia description
     POST /load   {model,layer?,device?}   load a model (blocks); device 'cpu' | 'cuda'
-    POST /chat   {messages,max_new_tokens?,layer?,model?,hint?,visible_tests?,
-                  correct_answer?,pushed_answer?}   SSE token stream
-    POST /experiment/plan       {prompt_a,prompt_b,max_new_tokens?}          exp2 causal patch
-    POST /experiment/faithful   {question,hint,hint_answer?,correct?,...}    exp3 causal ablation
-    POST /experiment/gaming     {task,pressure,visible_tests?,max_new_tokens?}  exp4 causal ablation
-    POST /experiment/sycophancy {question,pressure,correct_answer?,pushed_answer?}  pressure-frame ablation
+    POST /chat   {messages,max_new_tokens?,capture_stride?,layer?,hint?}   SSE token stream
+    POST /experiment/plan       {prompt_a,prompt_b,max_new_tokens?}                exp2 causal patch
+    POST /experiment/faithful   {question,hint,hint_answer?,correct?,...}          exp3 causal ablation
+    POST /experiment/sycophancy {question,pressure,correct_answer?,pushed_answer?} pressure-frame ablation
+    POST /experiment/gaming     501 until phase 2
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
-import re
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .env import HF_CACHE
-from .live import (
-    DEFAULT_MAX_NEW_TOKENS,
-    SAE_MODELS,
-    detect_language,
-    extract_answer_options,
-    extract_pushed_answer,
-    extract_visible_ints,
-    faithfulness_watch,
-    gaming_watch,
-    language_readout,
-    list_cached_models,
-    planning_readout,
-    sycophancy_watch,
-)
+from .live import DEFAULT_MAX_NEW_TOKENS, SAE_MODELS, list_cached_models
 
 # The live viewer only ever runs models already in the HF cache (`interp pull`
 # adds them). Skip the per-file etag HEAD requests to huggingface.co that
 # `from_pretrained` makes on every load -- on a slow link they block ~30 s with
-# nothing touching disk or VRAM. Set before transformers is imported (prewarm /
-# first /load). Override with HF_HUB_OFFLINE=0 if you must.
+# nothing touching disk or VRAM. Set before transformers is imported.
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-
-
-def _int_list(v) -> list[int]:
-    """Coerce a `visible_tests` field to a flat list of int inputs.
-
-    Accepts "2, 3, 17", [2, 3, 17], or [[2, True], [3, True]] (first of each pair).
-    """
-    if isinstance(v, str):
-        v = re.findall(r"-?\d+", v)
-    if not isinstance(v, list):
-        return []
-    out: list[int] = []
-    for x in v:
-        if isinstance(x, (list, tuple)) and x:
-            x = x[0]
-        try:
-            out.append(int(x))
-        except (TypeError, ValueError):
-            pass
-    return out
 
 
 def _last_user_text(messages: list[dict]) -> str:
@@ -105,11 +73,7 @@ def _free_gpu() -> None:
 
 
 def _ensure_session(model: str | None, layer: int | None, device: str | None = None):
-    """Return a `LiveSession` for `model`, loading/reloading if needed.
-
-    A different `model` or a different `device` than the live session forces a
-    reload; `device=None` keeps whatever the session already has.
-    """
+    """Return a `LiveSession` for `model`, loading/reloading if needed."""
     global _session
     from .live import LiveSession
 
@@ -119,9 +83,6 @@ def _ensure_session(model: str | None, layer: int | None, device: str | None = N
         or (device is not None and _session.device != device)
     )
     if reload:
-        # Drop the old model and actually hand its VRAM back before allocating
-        # the new one -- nnsight's wrapper holds cycles, so a bare `del` leaves
-        # the weights resident and a bigger next model can OOM an 11 GB card.
         _session = None
         _free_gpu()
         _session = LiveSession(model, layer=layer, device=device)
@@ -133,7 +94,7 @@ def _ensure_session(model: str | None, layer: int | None, device: str | None = N
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "interp-live-api/1.0"
+    server_version = "interp-live-api/2.0"
     protocol_version = "HTTP/1.1"
 
     # ---- response helpers ----
@@ -154,8 +115,6 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
     def _sse_open(self) -> None:
-        # No Content-Length on a stream, so the socket must close to end it;
-        # the webui's EventSource treats that as a normal end-of-response.
         self.close_connection = True
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -200,10 +159,16 @@ class Handler(BaseHTTPRequestHandler):
                     "layer": getattr(s, "layer", None),
                     "n_layers": getattr(s, "n_layers", None),
                     "device": getattr(s, "device", None),
+                    "probes": [p["name"] for p in s.probe_meta()] if s else [],
                 },
             )
         if path == "/models":
             return self._json(200, {"models": list_cached_models()})
+        if path == "/probes":
+            s = _session
+            if s is None:
+                return self._json(409, {"error": "no model loaded"})
+            return self._json(200, {"model": s.model_id, "probes": s.probe_meta()})
         parts = path.strip("/").split("/")
         if len(parts) == 2 and parts[0] == "feature":
             s = _session
@@ -227,7 +192,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/experiment/faithful":
             return self._handle_experiment("faithful")
         if path == "/experiment/gaming":
-            return self._handle_experiment("gaming")
+            return self._json(501, {"error": "the Q4 gaming probe + causal test arrive in phase 2"})
         if path == "/experiment/sycophancy":
             return self._handle_experiment("sycophancy")
         self._json(404, {"error": "not found"})
@@ -258,6 +223,7 @@ class Handler(BaseHTTPRequestHandler):
                 "layer": s.layer,
                 "n_layers": s.n_layers,
                 "device": s.device,
+                "probes": s.probe_meta(),
             },
         )
 
@@ -268,16 +234,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(400, {"error": "missing 'messages'"})
         max_new = body.get("max_new_tokens") or DEFAULT_MAX_NEW_TOKENS
         hint = (body.get("hint") or "").strip()
-        visible = _int_list(body.get("visible_tests"))
-        correct_answer = (body.get("correct_answer") or "").strip() or None
-        pushed_answer = (body.get("pushed_answer") or "").strip() or None
         prompt_text = _last_user_text(messages)
-        # Auto-fill from the prompt so Q3/Q4/Q5 read out for any message, no setup.
-        options = extract_answer_options(prompt_text)
-        if not visible:
-            visible = extract_visible_ints(prompt_text)
-        if not pushed_answer:
-            pushed_answer = extract_pushed_answer(prompt_text, options)
 
         acquired = _lock.acquire(blocking=False)
         if not acquired:
@@ -291,8 +248,8 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 return self._json(500, {"error": f"{type(e).__name__}: {e}"})
 
-            # A biasing "hint" is prepended to the last user turn for generation;
-            # the Q3 watch then tracks whether the reply ever acknowledges it.
+            # a biasing "hint" (planted fact) is prepended to the last user turn;
+            # it primes the /experiment/faithful test and the user sees the reply move
             send_messages = [dict(m) for m in messages]
             if hint:
                 for m in reversed(send_messages):
@@ -301,14 +258,9 @@ class Handler(BaseHTTPRequestHandler):
                         break
 
             input_ids = s.render_prompt(send_messages)
-            stride = max(1, int(body.get("lens_stride") or 1))
-            # the per-layer "answer race" funnel: caller answers first, then the
-            # options / pushed answer pulled out of the prompt.
-            race_labels: list[str] = []
-            for w in [correct_answer, pushed_answer, *options]:
-                if w and w.lower() not in [r.lower() for r in race_labels]:
-                    race_labels.append(w)
-            race_labels = race_labels[:3]
+            stride = max(1, int(body.get("capture_stride") or body.get("lens_stride") or 1))
+            pl = s.prompt_language(prompt_text)  # caches the baseline used by q1
+
             self._sse_open()
             self._sse(
                 {
@@ -317,36 +269,20 @@ class Handler(BaseHTTPRequestHandler):
                     "layer": s.layer,
                     "n_layers": s.n_layers,
                     "prompt_tokens": int(input_ids.shape[1]),
-                    "prompt_lang": detect_language(prompt_text),
+                    "prompt_lang": (pl or {}).get("surface_lang"),
+                    "probes": s.probe_meta(),
                     "sae": s.model_id in SAE_MODELS,
                     "hint": bool(hint),
-                    "gaming": bool(visible),
-                    "auto_tests": visible if visible and not _int_list(body.get("visible_tests")) else None,
-                    "auto_pushed": pushed_answer if pushed_answer and not body.get("pushed_answer") else None,
-                    "race_labels": race_labels or None,
-                    "race_layers": s._lens_layers(stride) if race_labels else None,
                 }
             )
 
             t0 = time.monotonic()
             text_parts: list[str] = []
-            history: list[dict] = []
             n = 0
             try:
-                for step in s.generate(
-                    input_ids, max_new, lens_stride=stride, race_labels=race_labels or None
-                ):
+                for step in s.generate(input_ids, max_new, capture_stride=stride):
                     n = step.index + 1
                     text_parts.append(step.text)
-                    output_text = "".join(text_parts)
-                    history.append(
-                        {
-                            "index": step.index,
-                            "token_id": step.token_id,
-                            "text": step.text,
-                            "next_top": step.next_top,
-                        }
-                    )
                     self._sse(
                         {
                             "type": "token",
@@ -354,16 +290,13 @@ class Handler(BaseHTTPRequestHandler):
                             "token": step.text,
                             "token_id": step.token_id,
                             "finished": step.finished,
-                            "q1": language_readout(step.lens, prompt_text, output_text, s.n_layers),
-                            "q2": planning_readout(history),
-                            "q3": faithfulness_watch(output_text, hint) if hint else None,
-                            "q4": gaming_watch(output_text, visible or None),
-                            "q5": sycophancy_watch(
-                                output_text, prompt_text, correct_answer, pushed_answer
-                            ),
+                            "q1": step.q1,
+                            "q2": step.q2,
+                            "q3": step.q3,
+                            "q4": step.q4,
+                            "q5": step.q5,
                             "surprisal": step.surprisal,
                             "sae": step.sae,
-                            "race": step.race,
                         }
                     )
             except (BrokenPipeError, ConnectionResetError):
@@ -392,10 +325,6 @@ class Handler(BaseHTTPRequestHandler):
             a, b = (body.get("prompt_a") or "").strip(), (body.get("prompt_b") or "").strip()
             if not a or not b:
                 return self._json(400, {"error": "need 'prompt_a' and 'prompt_b'"})
-        elif kind == "gaming":
-            task, pressure = (body.get("task") or "").strip(), (body.get("pressure") or "").strip()
-            if not task or not pressure:
-                return self._json(400, {"error": "need 'task' and 'pressure'"})
         elif kind == "sycophancy":
             q, pressure = (body.get("question") or "").strip(), (body.get("pressure") or "").strip()
             if not q or not pressure:
@@ -412,13 +341,6 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 if kind == "plan":
                     out = s.planning_test(a, b, max_new_tokens=max_new or 24)
-                elif kind == "gaming":
-                    out = s.gaming_test(
-                        task,
-                        pressure,
-                        visible_values=_int_list(body.get("visible_tests")),
-                        max_new_tokens=max_new or 200,
-                    )
                 elif kind == "sycophancy":
                     out = s.sycophancy_test(
                         q,
@@ -442,8 +364,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def _prewarm() -> None:
     """Import torch / nnsight off the request path so the first /load only pays
-    for weights, not the one-time ~5-15 s cold import (Windows Defender scans
-    torch's DLLs on first touch)."""
+    for weights, not the one-time cold import."""
     try:
         import torch
 
@@ -451,7 +372,7 @@ def _prewarm() -> None:
         from nnsight import LanguageModel  # noqa: F401
 
         print("  prewarm: torch + nnsight ready")
-    except Exception as e:  # never let a prewarm failure kill the server
+    except Exception as e:
         print(f"  prewarm skipped: {type(e).__name__}: {e}")
 
 

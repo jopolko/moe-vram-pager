@@ -10,6 +10,8 @@
     .\interp.ps1 run exp1             # multilingual concept sharing
     .\interp.ps1 run exp2             # planning ahead (rhyming couplets)
     .\interp.ps1 run exp3             # chain-of-thought faithfulness (needs --instruct pull)
+    .\interp.ps1 train-probes --model google/gemma-2-2b-it   # live-viewer probes
+    .\interp.ps1 serve               # live per-token interpretability sidecar (:8088)
 #>
 $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot

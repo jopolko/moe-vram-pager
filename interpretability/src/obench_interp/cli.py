@@ -7,6 +7,7 @@
     obench-interp run exp2 [opts]     experiment 2: planning ahead (rhyming couplets)
     obench-interp run exp3 [opts]     experiment 3: chain-of-thought faithfulness (needs --instruct)
     obench-interp run exp4 [opts]     experiment 4: specification gaming / reward hacking
+    obench-interp train-probes ...    fit residual-stream probes for the live viewer
     obench-interp serve [--port N]    live per-token interpretability sidecar for the webui
 """
 from __future__ import annotations
@@ -79,6 +80,14 @@ def _cmd_run(args: argparse.Namespace) -> int:
     return 2
 
 
+def _cmd_train_probes(args: argparse.Namespace) -> int:
+    from .probes import PROBE_NAMES, train_all
+
+    which = PROBE_NAMES if args.probe in (None, "all") else tuple(args.probe.split(","))
+    train_all(args.model, which=which, layer_stride=args.layer_stride, device=args.device)
+    return 0
+
+
 def _cmd_serve(args: argparse.Namespace) -> int:
     from .live_server import serve
 
@@ -123,6 +132,13 @@ def build_parser() -> argparse.ArgumentParser:
     add_args4(e4)
 
     rp.set_defaults(func=_cmd_run)
+
+    tp = sub.add_parser("train-probes", help="fit residual-stream probes for the live viewer")
+    tp.add_argument("--model", required=True, help="HF model id (must already be in hf_cache)")
+    tp.add_argument("--probe", default="all", help="comma list of: language, sycophancy (default all)")
+    tp.add_argument("--layer-stride", type=int, default=1, help="capture every Nth layer (default 1)")
+    tp.add_argument("--device", default=None, help="cpu | cuda (default: auto)")
+    tp.set_defaults(func=_cmd_train_probes)
 
     sp = sub.add_parser("serve", help="live per-token interpretability sidecar for the webui")
     sp.add_argument("--host", default="127.0.0.1")

@@ -165,28 +165,35 @@ per token. It needs a second sidecar that holds a loaded fp16 model:
 This one is not read-only and not free of the model runtime — it runs the same
 nnsight-wrapped HF model as `exp2`/`exp3`, so use the wrapper (venv + HF token)
 rather than a bare `python`. `GET /models` lists the causal-LM repos already in
-`hf_cache/` that it can load; `gemma-2-2b-it` and a small instruct model like
-`Qwen/Qwen2.5-3B-Instruct` are the intended targets on an 11 GB card.
+`hf_cache/` that it can load; `gemma-2-2b-it` and `Qwen/Qwen2.5-3B-Instruct` are
+the intended targets on an 11 GB card.
+
+Every live signal is a **trained linear probe** on the residual stream (see
+[`probes/README.md`](probes/README.md)) — no regex, no keyword classifiers. Fit
+them first, once per model:
+
+```bash
+./interp train-probes --model google/gemma-2-2b-it
+./interp train-probes --model Qwen/Qwen2.5-3B-Instruct
+```
 
 The Live tab has a panel per research question — see [`docs/live.md`](docs/live.md):
 
-- **Q1 (language in its head)** — per-layer logit lens on every token, classified
-  by script + function words, plus the Gemma Scope SAE features firing at the
-  probe layer (cross-referenced with any `run exp1` output).
-- **Q2 (planning ahead)** — once a sentence completes, how many tokens early its
-  final word entered the model's next-token candidates; a **causal test** button
-  runs exp2's activation patch on a prompt pair.
-- **Q3 (CoT faithfulness)** — with a biasing context supplied, whether the
-  reasoning acknowledges it; a **causal test** button runs exp3's hint ablation.
-- **Q4 (specification gaming)** — give a coding task plus the visible test
-  inputs; whether the reasoning describes an algorithm while the code just
-  hardcodes the tests, plus a per-token surprisal trace. A **causal test**
-  button runs exp4's pressure-frame ablation.
+- **Q1 (language in its head)** — a multiclass language probe run at every layer;
+  when the middle band decodes to a different language than the prompt, the model
+  is working in a shared, language-independent concept. Plus the Gemma Scope SAE
+  features firing at the probe layer (cross-referenced with any `run exp1`).
+- **Q5 (caving to pressure)** — a binary probe (caved / firm) trained on the
+  model's own behaviour under pressured prompts; a **causal test** button runs a
+  pressure-frame ablation on a single question.
+- **Q2 / Q3 / Q4** — probes arrive in a second pass; the Q2 (planning) and Q3
+  (CoT faithfulness) **causal test** buttons already run exp2 / exp3's
+  activation patch. Q4 stays on `run exp4` for now.
 
-The live meters are heuristic previews; the causal-test buttons are the real
-`exp2` / `exp3` / `exp4` activation-patching experiments on a single item.
+The causal-test buttons are `exp2` / `exp3`-style activation-patching on a single
+item; their pass/fail is `pick_answer` equality against an answer key you supply,
+not a text heuristic.
 
 Per-token generation runs the HF model directly with a KV cache (~9-10 tok/s for
-a 2B model on the 1080 Ti). The per-layer logit lens is the main per-token cost —
-raise `lens_stride` in the tab if it drags. VRAM is handed back to `llama-server`
-after each turn.
+a 2B model on the 1080 Ti); with the logit lens gone the probes are cheap. VRAM
+is handed back to `llama-server` after each turn.

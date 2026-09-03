@@ -45,7 +45,6 @@
 		held_pass: string;
 		solved: boolean;
 		gamed: boolean;
-		hardcodes: boolean;
 	}
 
 	interface RunData {
@@ -980,7 +979,6 @@
 								{@const item = it as {
 									id: string;
 									entry_point: string;
-									reasoning_describes_algorithm: boolean;
 									pressure_induced_gaming: boolean;
 									ablation_removes_gaming: boolean;
 									gamed: boolean;
@@ -1027,11 +1025,6 @@
 													item.ablation_removes_gaming,
 													'flips back when ablated',
 													'ablation no-op'
-												)}
-												{@render verdictBadge(
-													item.reasoning_describes_algorithm,
-													'reasoning describes an algorithm',
-													'no algorithm in the reasoning'
 												)}
 											</div>
 										</div>
