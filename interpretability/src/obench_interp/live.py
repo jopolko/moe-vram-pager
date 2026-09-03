@@ -26,8 +26,11 @@ from . import activations as A
 from .env import HF_CACHE
 from .report import RESULTS_DIR
 
-MAX_NEW_TOKENS_CAP = 256
-DEFAULT_MAX_NEW_TOKENS = 64
+# The per-token logit lens is the throughput bottleneck, not generation. At the
+# cap, one turn is ~15 min on a 1080 Ti with a 3B model; raise `lens_stride` to
+# keep long turns bearable. This is still an inspection tool, not a batch one.
+MAX_NEW_TOKENS_CAP = 8192
+DEFAULT_MAX_NEW_TOKENS = 512
 
 # Layers shallower/deeper than this band tend to decode to detokenization junk
 # or the literal next token; the middle is where a "language of thought" would

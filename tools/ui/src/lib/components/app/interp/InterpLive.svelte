@@ -164,8 +164,8 @@
 
 	let prompt = $state('');
 	let biasing = $state('');
-	let maxNewTokens = $state(48);
-	let lensStride = $state(2);
+	let maxNewTokens = $state(512);
+	let lensStride = $state(4);
 	let generating = $state(false);
 
 	let messages = $state<ChatMessage[]>([]);
@@ -670,15 +670,15 @@
 					max tokens
 					<Input
 						type="number"
-						class="h-6 w-16 text-xs"
+						class="h-6 w-20 text-xs"
 						bind:value={maxNewTokens}
 						min={1}
-						max={256}
+						max={8192}
 					/>
 				</label>
 				<label class="flex items-center gap-1">
 					lens stride
-					<Input type="number" class="h-6 w-14 text-xs" bind:value={lensStride} min={1} max={8} />
+					<Input type="number" class="h-6 w-14 text-xs" bind:value={lensStride} min={1} max={16} />
 				</label>
 				{#if generating}<span>{tokenCount} tok...</span>{/if}
 				{#if tokPerSec}<span>{tokPerSec} tok/s</span>{/if}
