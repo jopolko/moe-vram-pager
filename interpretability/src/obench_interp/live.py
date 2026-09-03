@@ -388,22 +388,29 @@ class LiveSession:
             for e in gen_view["per_layer"]
         ]
         band = [pl["lang"] for pl in per_layer if lo <= pl["layer"] <= hi]
-        internal = Counter(band).most_common(1)[0][0] if band else None
-        conf = round(band.count(internal) / len(band), 2) if band else 0.0
+        top2 = Counter(band).most_common(2)
+        internal = top2[0][0] if band else None
+        conf = round(top2[0][1] / len(band), 2) if band else 0.0
+        tie = len(top2) > 1 and top2[0][1] == top2[1][1]
         # deepest captured layer ~ the language actually being emitted
         surface = per_layer[-1]["lang"] if per_layer else None
         prompt_lang = None
         if prompt_view and prompt_view["p"]:
             prompt_lang = max(prompt_view["p"], key=prompt_view["p"].get)
+        # only call it a shared concept space on a clear mid-band majority for a
+        # language the prompt is not in - a coin-flip plurality is not evidence
+        shared = bool(
+            internal and prompt_lang and internal != prompt_lang and conf >= 0.6 and not tie
+        )
         return {
             "probe": "language",
             "layer": gen_view["layer"],
             "cv_accuracy": gen_view["cv_accuracy"],
             "prompt_lang": prompt_lang,
-            "internal_lang": internal,
+            "internal_lang": None if tie else internal,
             "internal_confidence": conf,
             "surface_lang": surface,
-            "shared_concept_space": bool(internal and prompt_lang and internal != prompt_lang),
+            "shared_concept_space": shared,
             "layers": per_layer,
         }
 
