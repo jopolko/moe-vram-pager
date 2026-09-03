@@ -470,8 +470,7 @@
 			</h1>
 			<p class="mt-1 max-w-2xl text-sm leading-relaxed text-muted-foreground">
 				{#if mode === 'live'}
-					Type a prompt and watch the model's internal state per token — starting with which
-					language its mid-stack representation is in. Needs <code class="text-xs"
+					Type a prompt; watch the model's internal state per token. Needs <code class="text-xs"
 						>obench-interp serve</code
 					>.
 				{:else}
