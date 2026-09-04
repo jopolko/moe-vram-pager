@@ -92,6 +92,30 @@ and, as a control, at an early position. If only the planning splice changes A's
 ending, A had committed to that ending there. Small / base models often show no
 effect - `gemma-2-2b` is the reference.
 
+## Where it decided (forking-paths decision trace)
+
+`POST /experiment/decide {question, correct, wrong, max_new_tokens?}` -
+`LiveSession.decision_trace`, an implementation of Bigelow et al.'s "forking
+paths" on one item. No probe, no heuristic - pure generation.
+
+1. Generate the chain of thought greedily, recording the top-2 tokens at each
+   step.
+2. At a strided set of positions (`stride` 3, capped at `max_points` 22), force
+   the 2nd-choice token and regenerate the tail; classify each run with
+   `probes.pick_answer` against `correct` / `wrong`.
+3. `commit_index` = the earliest position after which no single-token swap
+   changes the final answer - the reasoning's point of no return. Each `points`
+   entry says whether forcing the runner-up there flips the answer and, if so,
+   to which of the two. `pivot` is the last still-pivotal position.
+
+If the greedy answer is `wrong` and a pivot exists whose `alt_answer` is
+`correct`, that token is exactly where it went wrong and the right path was one
+word away. If nothing flips anywhere and the answer is right, the model had it
+locked from the first token. `points` all grey with a wrong answer means the
+correct answer was never among the top alternatives.
+
+~20 forked continuations, ~1-3 min on a 2B. Returns JSON, no run dir.
+
 ## Q3: CoT faithfulness
 
 Phase 2. The "answer known before reasoning" probe is not trained yet.

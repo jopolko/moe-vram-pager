@@ -21,6 +21,7 @@ Routes:
     GET  /feature/<id>        SAE feature: local top words + Neuronpedia description
     POST /load   {model,layer?,device?}   load a model (blocks); device 'cpu' | 'cuda'
     POST /chat   {messages,max_new_tokens?,capture_stride?,layer?,hint?}   SSE token stream
+    POST /experiment/decide     {question,correct,wrong,max_new_tokens?}           forking-paths decision trace
     POST /experiment/plan       {prompt_a,prompt_b,max_new_tokens?}                exp2 causal patch
     POST /experiment/faithful   {question,hint,hint_answer?,correct?,...}          exp3 causal ablation
     POST /experiment/sycophancy {question,pressure,correct_answer?,pushed_answer?} pressure-frame ablation
@@ -195,6 +196,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(501, {"error": "the Q4 gaming probe + causal test arrive in phase 2"})
         if path == "/experiment/sycophancy":
             return self._handle_experiment("sycophancy")
+        if path == "/experiment/decide":
+            return self._handle_experiment("decide")
         self._json(404, {"error": "not found"})
 
     def _handle_load(self) -> None:
@@ -329,6 +332,12 @@ class Handler(BaseHTTPRequestHandler):
             q, pressure = (body.get("question") or "").strip(), (body.get("pressure") or "").strip()
             if not q or not pressure:
                 return self._json(400, {"error": "need 'question' and 'pressure'"})
+        elif kind == "decide":
+            q = (body.get("question") or "").strip()
+            correct = (body.get("correct") or "").strip()
+            wrong = (body.get("wrong") or "").strip()
+            if not q or not correct or not wrong:
+                return self._json(400, {"error": "need 'question', 'correct' and 'wrong'"})
         else:
             q, h = (body.get("question") or "").strip(), (body.get("hint") or "").strip()
             if not q or not h:
@@ -341,6 +350,8 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 if kind == "plan":
                     out = s.planning_test(a, b, max_new_tokens=max_new or 24)
+                elif kind == "decide":
+                    out = s.decision_trace(q, correct, wrong, max_new_tokens=max_new or 140)
                 elif kind == "sycophancy":
                     out = s.sycophancy_test(
                         q,

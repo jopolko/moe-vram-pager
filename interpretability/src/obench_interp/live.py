@@ -537,6 +537,136 @@ class LiveSession:
         view = self.probes.score("sycophancy", self._capture_last(ids))
         return round(view["p"].get("caved", 0.0), 3) if view and view["p"] else None
 
+    # ----------------------------------------------------------------------- #
+    # Decision trace: "forking paths" (Bigelow et al. 2024). Generate the      #
+    # chain of thought once, then at each token position force the model's     #
+    # 2nd-choice token and regenerate the tail. The position after which no    #
+    # single-token swap changes the final answer is where the answer was       #
+    # committed - the reasoning's point of no return. Pure generation, no      #
+    # probe, no heuristic: `pick_answer` maps each run to one of two supplied  #
+    # answer strings.                                                          #
+    # ----------------------------------------------------------------------- #
+    def _greedy(self, input_ids, n: int) -> list[int]:
+        """Greedy-decode `n` tokens from `input_ids` with a KV cache (raw HF)."""
+        import torch
+
+        hf = self.model._model
+        hf.eval()
+        out: list[int] = []
+        past = None
+        cur = input_ids
+        with torch.no_grad():
+            for _ in range(max(1, n)):
+                o = hf(input_ids=cur, past_key_values=past, use_cache=True)
+                past = o.past_key_values
+                nid = int(o.logits[0, -1].argmax())
+                out.append(nid)
+                if nid in self._eos_ids:
+                    break
+                cur = torch.tensor([[nid]], device=input_ids.device)
+        return out
+
+    def _greedy_with_alts(self, input_ids, n: int) -> list[tuple]:
+        """Greedy-decode, returning `(chosen_id, chosen_p, alt_id, alt_p)` per step."""
+        import torch
+
+        hf = self.model._model
+        hf.eval()
+        steps: list[tuple] = []
+        past = None
+        cur = input_ids
+        with torch.no_grad():
+            for _ in range(max(1, n)):
+                o = hf(input_ids=cur, past_key_values=past, use_cache=True)
+                past = o.past_key_values
+                p = torch.softmax(o.logits[0, -1].float(), dim=-1)
+                tv, ti = p.topk(2)
+                cid = int(ti[0])
+                steps.append((cid, float(tv[0]), int(ti[1]), float(tv[1])))
+                if cid in self._eos_ids:
+                    break
+                cur = torch.tensor([[cid]], device=input_ids.device)
+        return steps
+
+    def decision_trace(
+        self,
+        question: str,
+        correct: str,
+        wrong: str,
+        *,
+        max_new_tokens: int = 140,
+        stride: int = 3,
+        max_points: int = 22,
+        tail_tokens: int = 72,
+    ) -> dict:
+        """Where in the chain of thought did the answer get decided, and was it
+        decided right or wrong?
+
+        1. Generate the CoT greedily, recording the top-2 tokens at each step.
+        2. At a strided set of positions, force the 2nd-choice token and
+           regenerate the tail; classify each run's answer with `pick_answer`.
+        3. The commit point is the earliest position after which no swap changes
+           the answer. If the greedy answer is `wrong`, that is where it went
+           wrong - and the point's `alt_answer` says whether the right path was
+           one token away.
+        """
+        import torch
+
+        ids = self._encode_user(question)
+        prompt = ids[0].tolist()
+        steps = self._greedy_with_alts(ids, max_new_tokens)
+        gen_ids = [s[0] for s in steps]
+        full = self.tokenizer.decode(gen_ids, skip_special_tokens=True)
+        greedy_answer = pick_answer(full, correct, wrong)
+
+        n = len(steps)
+        positions = list(range(0, max(1, n - 1), max(1, stride)))[:max_points]
+        points: list[dict] = []
+        for i in positions:
+            alt_id = steps[i][2]
+            forced = torch.tensor([prompt + gen_ids[:i] + [alt_id]], device=ids.device)
+            tail = self._greedy(forced, tail_tokens)
+            alt_text = self.tokenizer.decode(gen_ids[:i] + [alt_id] + tail, skip_special_tokens=True)
+            alt_answer = pick_answer(alt_text, correct, wrong)
+            points.append(
+                {
+                    "index": i,
+                    "token": self.tokenizer.decode([steps[i][0]]),
+                    "token_p": round(steps[i][1], 3),
+                    "alt_token": self.tokenizer.decode([alt_id]),
+                    "alt_p": round(steps[i][3], 3),
+                    "alt_answer": alt_answer,
+                    # forcing the runner-up here lands on a different final answer
+                    "flips": bool(alt_answer and alt_answer != greedy_answer),
+                }
+            )
+
+        commit_index = None
+        for k, pt in enumerate(points):
+            if not any(p["flips"] for p in points[k:]):
+                commit_index = pt["index"]
+                break
+
+        commit_point = next((p for p in points if p["index"] == commit_index), None)
+        # the last still-pivotal position before the answer locked in
+        pivot_point = next((p for p in reversed(points) if p["flips"]), None)
+
+        return {
+            "question": question,
+            "correct": correct,
+            "wrong": wrong,
+            "cot": full,
+            "tokens": [self.tokenizer.decode([s[0]]) for s in steps],
+            "greedy_answer": greedy_answer,
+            "is_correct": greedy_answer == correct,
+            "n_tokens": n,
+            "commit_index": commit_index,
+            "commit_token": (commit_point or {}).get("token"),
+            "pivot_index": (pivot_point or {}).get("index"),
+            "pivot": pivot_point,
+            "points": points,
+        }
+
     def planning_test(self, prompt_a: str, prompt_b: str, *, max_new_tokens: int = 24) -> dict:
         """exp2's causal patch: generate from A three ways -- baseline, with B's
         residual spliced in at the last-prompt-token ("planning") position, and

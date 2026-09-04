@@ -10,7 +10,8 @@
 		ShieldX,
 		Handshake,
 		ChevronRight,
-		TriangleAlert
+		TriangleAlert,
+		GitFork
 	} from '@lucide/svelte';
 	import { browser } from '$app/environment';
 	import { Button } from '$lib/components/ui/button';
@@ -77,6 +78,30 @@
 	}
 	type ChatMessage = { role: 'user' | 'assistant'; content: string };
 
+	interface DecidePoint {
+		index: number;
+		token: string;
+		token_p: number;
+		alt_token: string;
+		alt_p: number;
+		alt_answer: string;
+		flips: boolean;
+	}
+	interface DecideResult {
+		question: string;
+		correct: string;
+		wrong: string;
+		cot: string;
+		tokens: string[];
+		greedy_answer: string;
+		is_correct: boolean;
+		n_tokens: number;
+		commit_index: number | null;
+		commit_token: string | null;
+		pivot_index: number | null;
+		pivot: DecidePoint | null;
+		points: DecidePoint[];
+	}
 	interface PlanResult {
 		plan_position: number;
 		early_position: number;
@@ -193,6 +218,13 @@
 	let tokenCount = $state(0);
 	let hoverLayer = $state<number | null>(null);
 	let hoverTok = $state<number | null>(null);
+
+	// decision trace (forking paths)
+	let decideQ = $state('');
+	let decideCorrect = $state('');
+	let decideWrong = $state('');
+	let decideRunning = $state(false);
+	let decideResult = $state<DecideResult | null>(null);
 
 	// causal tests
 	let planA = $state('');
@@ -539,6 +571,32 @@
 			(r) => (sycResult = r as SycResult),
 			(b) => (sycRunning = b)
 		);
+	const runDecide = () =>
+		runExperiment(
+			'/experiment/decide',
+			{
+				question: (decideQ || lastQuestion).trim(),
+				correct: decideCorrect.trim(),
+				wrong: decideWrong.trim()
+			},
+			(r) => (decideResult = r as DecideResult),
+			(b) => (decideRunning = b)
+		);
+
+	// character offset of each generated token, for highlighting spans in the CoT
+	const decideTokenSpans = $derived.by(() => {
+		const t = decideResult?.tokens;
+		if (!t) return [];
+		let pos = 0;
+		return t.map((tok) => {
+			const start = pos;
+			pos += tok.length;
+			return { start, end: pos, tok };
+		});
+	});
+	const decidePointByIndex = $derived(
+		Object.fromEntries((decideResult?.points ?? []).map((p) => [p.index, p]))
+	);
 
 	function onPromptKey(e: KeyboardEvent) {
 		if (e.key === 'Enter' && !e.shiftKey) {
@@ -1058,6 +1116,143 @@
 		<aside
 			class="sticky top-2 flex max-h-[calc(100svh-1rem)] w-[24rem] shrink-0 flex-col gap-3 overflow-y-auto pr-1"
 		>
+			<!-- ============ Decision trace (forking paths) ============ -->
+			<div class="rounded-lg border-2 border-primary/40 p-4">
+				<h3 class="flex items-center gap-1.5 text-sm font-semibold">
+					<GitFork class="size-4 text-primary" /> Where it decided
+				</h3>
+				<p class="mt-1 text-[11px] leading-relaxed text-muted-foreground">
+					Generates the reasoning once, then re-runs it forcing the 2nd-choice word at each step.
+					The point after which no single swap changes the final answer is where the answer locked
+					in - and this shows whether it locked onto the right one or the wrong one.
+				</p>
+
+				<div class="mt-2 space-y-1.5">
+					<Input
+						class="h-7 text-xs"
+						placeholder={lastQuestion
+							? 'question (blank = your last message)'
+							: 'question with a clear answer'}
+						bind:value={decideQ}
+						disabled={decideRunning}
+					/>
+					<div class="flex gap-1.5">
+						<Input
+							class="h-7 text-xs"
+							placeholder="correct answer"
+							bind:value={decideCorrect}
+							disabled={decideRunning}
+						/>
+						<Input
+							class="h-7 text-xs"
+							placeholder="wrong answer it might give"
+							bind:value={decideWrong}
+							disabled={decideRunning}
+						/>
+					</div>
+					<Button
+						size="sm"
+						class="h-7 w-full"
+						onclick={runDecide}
+						disabled={decideRunning ||
+							!loadedModel ||
+							!decideCorrect.trim() ||
+							!decideWrong.trim() ||
+							!(decideQ || lastQuestion).trim()}
+					>
+						{#if decideRunning}<Loader2 class="mr-1 size-3.5 animate-spin" /> mapping the reasoning… (~1–3
+							min){:else}Map the decision{/if}
+					</Button>
+				</div>
+
+				{#if decideResult}
+					{@const d = decideResult}
+					{@const noFork = d.points.every((p) => !p.flips)}
+					<div
+						class="mt-2 rounded px-2 py-1.5 text-xs leading-relaxed font-medium {d.is_correct
+							? 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
+							: 'bg-red-500/15 text-red-600 dark:text-red-400'}"
+					>
+						{#if !d.greedy_answer}
+							Couldn't read the model's answer as "{d.correct}" or "{d.wrong}" — check the wording
+							of the two answers.
+						{:else if d.is_correct && noFork}
+							Got <b>"{d.greedy_answer}"</b> — and it had this locked from the first token. Every alternative
+							reasoning path still lands there; it wasn't working it out, it knew it.
+						{:else if d.is_correct}
+							Got <b>"{d.greedy_answer}"</b> (correct). Locked in at token
+							<b>{d.commit_index}</b>{d.commit_token ? ` ("${d.commit_token.trim()}")` : ''}; before
+							that, forcing its 2nd-choice word would have derailed it.
+						{:else if d.pivot}
+							<TriangleAlert class="mr-1 inline size-3.5" /> Got <b>"{d.greedy_answer}"</b>, should
+							be
+							<b>"{d.correct}"</b>. It went wrong around token <b>{d.pivot.index}</b>: it wrote
+							<span class="font-mono">{d.pivot.token.trim()}</span> ({pct(d.pivot.token_p)}) over
+							<span class="font-mono">{d.pivot.alt_token.trim()}</span> ({pct(d.pivot.alt_p)}), and
+							forcing that word there yields <b>"{d.pivot.alt_answer}"</b>. Point of no return.
+						{:else}
+							Got <b>"{d.greedy_answer}"</b>, should be <b>"{d.correct}"</b> — and no single word
+							swap recovers it{d.commit_index != null
+								? ` (committed by token ${d.commit_index})`
+								: ''}. The model can't get here from its top alternatives.
+						{/if}
+					</div>
+
+					{#if d.tokens?.length}
+						<div
+							class="mt-1.5 max-h-52 overflow-y-auto rounded border bg-muted/30 p-2 text-xs leading-relaxed whitespace-pre-wrap"
+						>
+							{#each decideTokenSpans as sp, i (i)}
+								{@const pt = decidePointByIndex[i]}
+								{#if i === d.commit_index}
+									<mark
+										class="rounded bg-primary/25 px-0.5 font-semibold ring-1 ring-primary"
+										title="the answer was committed here">{sp.tok}</mark
+									>
+								{:else if pt?.flips}
+									<span
+										class="rounded {pt.alt_answer === d.correct
+											? 'bg-emerald-400/25'
+											: 'bg-amber-400/25'} px-0.5"
+										title={`forcing "${pt.alt_token.trim()}" here → "${pt.alt_answer}"`}
+										>{sp.tok}</span
+									>
+								{:else}{sp.tok}{/if}
+							{/each}
+						</div>
+					{/if}
+
+					{#if d.points.length}
+						<div class="mt-1.5 flex gap-0.5" title="one cell per checked token position">
+							{#each d.points as p (p.index)}
+								<div
+									class="h-4 flex-1 rounded-sm {p.flips
+										? p.alt_answer === d.correct
+											? 'bg-emerald-500/60'
+											: 'bg-red-500/50'
+										: 'bg-foreground/10'}"
+									title={`token ${p.index} "${p.token.trim()}": 2nd choice "${p.alt_token.trim()}" → ${p.alt_answer || 'no change'}`}
+								></div>
+							{/each}
+						</div>
+						<p class="mt-1 text-[10px] leading-relaxed text-muted-foreground">
+							Each cell is a checked position. <span class="text-emerald-600 dark:text-emerald-400"
+								>green</span
+							>
+							= forcing the 2nd-choice word there gives the right answer;
+							<span class="text-red-600 dark:text-red-400">red</span> = the wrong one; grey = the answer
+							no longer changes. The colour→grey edge is where it committed.
+						</p>
+					{/if}
+				{:else}
+					<p class="mt-2 text-[10px] leading-relaxed text-muted-foreground">
+						Best on a question with two clear answers where the model might slip - order of
+						operations, a tricky yes/no, a counting question ("how many r's in strawberry", correct
+						3 / wrong 2). Runs ~20 forked continuations, so it takes a minute or two.
+					</p>
+				{/if}
+			</div>
+
 			<!-- ============ Q1 language ============ -->
 			<div class="rounded-lg border p-4">
 				<h3 class="flex items-center gap-1.5 text-sm font-semibold">
