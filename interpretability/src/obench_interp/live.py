@@ -588,6 +588,177 @@ class LiveSession:
                 cur = torch.tensor([[cid]], device=input_ids.device)
         return steps
 
+    def _sample(self, input_ids, n: int, *, temp: float = 0.8, top_p: float = 0.95) -> list[int]:
+        """One temperature + nucleus sampled continuation (raw HF, KV cache)."""
+        import torch
+
+        hf = self.model._model
+        hf.eval()
+        out: list[int] = []
+        past = None
+        cur = input_ids
+        with torch.no_grad():
+            for _ in range(max(1, n)):
+                o = hf(input_ids=cur, past_key_values=past, use_cache=True)
+                past = o.past_key_values
+                probs = torch.softmax(o.logits[0, -1].float() / max(temp, 1e-3), dim=-1)
+                sp, si = torch.sort(probs, descending=True)
+                keep = torch.cumsum(sp, dim=-1) <= top_p
+                keep[0] = True
+                sp = torch.where(keep, sp, torch.zeros_like(sp))
+                nid = int(si[torch.multinomial(sp / sp.sum(), 1)])
+                out.append(nid)
+                if nid in self._eos_ids:
+                    break
+                cur = torch.tensor([[nid]], device=input_ids.device)
+        return out
+
+    def _answer_token_confidence(self, steps: list[tuple], answer: str) -> float | None:
+        """The greedy probability on the token that first spells `answer` - how
+        confident the surface text *looked*, as opposed to the outcome."""
+        target = answer.strip().lower()
+        if not target:
+            return None
+        for cid, cp, _a, _b in reversed(steps):
+            t = self.tokenizer.decode([cid]).strip().lower()
+            if t and (target.startswith(t) or t.startswith(target)):
+                return round(cp, 3)
+        return None
+
+    def trust_answer(
+        self,
+        question: str,
+        correct: str,
+        other: str,
+        *,
+        n_samples: int = 12,
+        max_new_tokens: int = 80,
+        temp: float = 0.8,
+    ) -> dict:
+        """How much to trust one answer: does the surface confidence match how
+        often the model's own reasoning actually lands there?
+
+        - `token_confidence`: greedy probability on the answer token.
+        - `outcome_confidence`: fraction of `n_samples` resampled reasoning runs
+          that reach the same answer (`pick_answer` vs `correct` / `other`).
+        - `overconfidence_gap`: the first minus the second. A wide gap = the model
+          states the answer like it is sure while its reasoning is a coin flip.
+        - `commit_fraction`: how far through the chain of thought the answer
+          stopped being changeable by a single-token swap (low = decided early,
+          the rest of the CoT is post-hoc).
+        """
+        import torch
+
+        ids = self._encode_user(question)
+        prompt = ids[0].tolist()
+        cue = self.tokenizer(" Final answer:", add_special_tokens=False).input_ids
+
+        def force_answer(cot_ids: list[int]) -> tuple[str, float | None]:
+            """Append 'Final answer:' after a reasoning run, greedy-decode a few
+            tokens, and read a clean answer + its confidence."""
+            base = prompt + cot_ids + cue
+            hf = self.model._model
+            with torch.no_grad():
+                o = hf(input_ids=torch.tensor([base], device=ids.device), use_cache=True)
+            past = o.past_key_values
+            first = o.logits[0, -1].float()
+            fid = int(first.argmax())
+            fp = float(torch.softmax(first, dim=-1)[fid])
+            tail = [fid]
+            cur = torch.tensor([[fid]], device=ids.device)
+            with torch.no_grad():
+                for _ in range(7):
+                    if tail[-1] in self._eos_ids:
+                        break
+                    o = hf(input_ids=cur, past_key_values=past, use_cache=True)
+                    past = o.past_key_values
+                    nid = int(o.logits[0, -1].argmax())
+                    tail.append(nid)
+                    cur = torch.tensor([[nid]], device=ids.device)
+            txt = self.tokenizer.decode(tail, skip_special_tokens=True)
+            ans = pick_answer(txt, correct, other)
+            return ans, (round(fp, 3) if ans else None)
+
+        steps = self._greedy_with_alts(ids, max_new_tokens)
+        gen_ids = [s[0] for s in steps]
+        cot = self.tokenizer.decode(gen_ids, skip_special_tokens=True)
+        stated, token_conf = force_answer(gen_ids)
+        if not stated:  # fall back to reading the reasoning text itself
+            stated = pick_answer(cot, correct, other)
+            token_conf = self._answer_token_confidence(steps, stated) if stated else None
+
+        tally: Counter = Counter()
+        for _ in range(max(1, n_samples)):
+            roll_ids = self._sample(ids, max_new_tokens, temp=temp)
+            ans, _c = force_answer(roll_ids)
+            if not ans:
+                ans = pick_answer(
+                    self.tokenizer.decode(roll_ids, skip_special_tokens=True), correct, other
+                )
+            tally[ans or "unclear"] += 1
+        total = sum(tally.values())
+        outcome_conf = round(tally.get(stated, 0) / total, 3) if (stated and total) else None
+        p_correct = round(tally.get(correct, 0) / total, 3) if total else 0.0
+
+        n = len(steps)
+        last_flip = None
+        for frac in (0.2, 0.5, 0.8):
+            i = int(n * frac)
+            if i >= n - 1:
+                continue
+            ft = torch.tensor([prompt + gen_ids[:i] + [steps[i][2]]], device=ids.device)
+            a, _c = force_answer(gen_ids[:i] + [steps[i][2]] + self._greedy(ft, 48))
+            if a and a != stated:
+                last_flip = i
+        commit_fraction = round(last_flip / n, 2) if (last_flip is not None and n) else 0.0
+
+        gap = (
+            round(token_conf - outcome_conf, 3)
+            if (token_conf is not None and outcome_conf is not None)
+            else None
+        )
+        is_correct = stated == correct if stated else None
+        answer_fixed_early = last_flip is None
+        oc = outcome_conf if outcome_conf is not None else 0.5
+
+        if not stated:
+            verdict = "unreadable"
+        elif is_correct:
+            if oc >= 0.8:
+                verdict = "solid"
+            elif oc < 0.55:
+                verdict = "shaky"  # right, but its own reasoning is a coin flip
+            elif answer_fixed_early and n >= 26:
+                verdict = "decided_early"  # long CoT, answer fixed before any of it
+            else:
+                verdict = "unclear"
+        else:  # wrong
+            if oc >= 0.7:
+                verdict = "confidently_wrong"  # consistently reaches the wrong answer
+            elif gap is not None and gap >= 0.25:
+                verdict = "overconfident"  # sounded sure, wrong, and inconsistent
+            else:
+                verdict = "shaky"
+
+        return {
+            "question": question,
+            "correct": correct,
+            "other": other,
+            "cot": cot,
+            "n_tokens": n,
+            "n_samples": total,
+            "stated_answer": stated,
+            "token_confidence": token_conf,
+            "outcome_confidence": outcome_conf,
+            "overconfidence_gap": gap,
+            "p_correct": p_correct,
+            "commit_fraction": commit_fraction,
+            "answer_fixed_early": answer_fixed_early,
+            "is_correct": is_correct,
+            "tally": dict(tally),
+            "verdict": verdict,
+        }
+
     def decision_trace(
         self,
         question: str,

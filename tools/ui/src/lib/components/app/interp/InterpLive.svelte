@@ -11,7 +11,7 @@
 		Handshake,
 		ChevronRight,
 		TriangleAlert,
-		GitFork
+		Gauge
 	} from '@lucide/svelte';
 	import { browser } from '$app/environment';
 	import { Button } from '$lib/components/ui/button';
@@ -78,29 +78,30 @@
 	}
 	type ChatMessage = { role: 'user' | 'assistant'; content: string };
 
-	interface DecidePoint {
-		index: number;
-		token: string;
-		token_p: number;
-		alt_token: string;
-		alt_p: number;
-		alt_answer: string;
-		flips: boolean;
-	}
-	interface DecideResult {
+	type TrustVerdict =
+		| 'solid'
+		| 'shaky'
+		| 'confidently_wrong'
+		| 'overconfident'
+		| 'decided_early'
+		| 'unclear'
+		| 'unreadable';
+	interface TrustResult {
 		question: string;
 		correct: string;
-		wrong: string;
+		other: string;
 		cot: string;
-		tokens: string[];
-		greedy_answer: string;
-		is_correct: boolean;
 		n_tokens: number;
-		commit_index: number | null;
-		commit_token: string | null;
-		pivot_index: number | null;
-		pivot: DecidePoint | null;
-		points: DecidePoint[];
+		n_samples: number;
+		stated_answer: string;
+		token_confidence: number | null;
+		outcome_confidence: number | null;
+		overconfidence_gap: number | null;
+		p_correct: number;
+		commit_fraction: number;
+		is_correct: boolean | null;
+		tally: Record<string, number>;
+		verdict: TrustVerdict;
 	}
 	interface PlanResult {
 		plan_position: number;
@@ -219,12 +220,15 @@
 	let hoverLayer = $state<number | null>(null);
 	let hoverTok = $state<number | null>(null);
 
-	// decision trace (forking paths)
-	let decideQ = $state('');
-	let decideCorrect = $state('');
-	let decideWrong = $state('');
-	let decideRunning = $state(false);
-	let decideResult = $state<DecideResult | null>(null);
+	// reliability report: run trust_answer over a bank of known-answer questions
+	let trustBank = $state<{ id: string; question: string; correct: string; other: string }[]>([]);
+	let trustN = $state(5);
+	let trustRunning = $state(false);
+	let trustProgress = $state({ done: 0, total: 0 });
+	let trustOwnOpen = $state(false);
+	let trustQ = $state('');
+	let trustCorrect = $state('');
+	let trustOther = $state('');
 
 	// causal tests
 	let planA = $state('');
@@ -571,31 +575,151 @@
 			(r) => (sycResult = r as SycResult),
 			(b) => (sycRunning = b)
 		);
-	const runDecide = () =>
-		runExperiment(
-			'/experiment/decide',
-			{
-				question: (decideQ || lastQuestion).trim(),
-				correct: decideCorrect.trim(),
-				wrong: decideWrong.trim()
-			},
-			(r) => (decideResult = r as DecideResult),
-			(b) => (decideRunning = b)
-		);
+	const VERDICT_LABEL: Record<TrustVerdict, string> = {
+		solid: 'solid',
+		shaky: 'guessing',
+		overconfident: 'overconfident',
+		confidently_wrong: 'confidently wrong',
+		decided_early: 'for show',
+		unclear: 'unclear',
+		unreadable: 'unreadable'
+	};
 
-	// character offset of each generated token, for highlighting spans in the CoT
-	const decideTokenSpans = $derived.by(() => {
-		const t = decideResult?.tokens;
-		if (!t) return [];
-		let pos = 0;
-		return t.map((tok) => {
-			const start = pos;
-			pos += tok.length;
-			return { start, end: pos, tok };
-		});
+	interface TrustRow {
+		ts: number;
+		model: string;
+		q: string;
+		stated: string;
+		token_conf: number | null;
+		outcome_conf: number | null;
+		correct: boolean | null;
+		verdict: TrustVerdict;
+	}
+	const TRUST_KEY = 'interp-trust-log';
+	let trustLog = $state<TrustRow[]>([]);
+	$effect(() => {
+		if (!browser) return;
+		try {
+			trustLog = JSON.parse(localStorage.getItem(TRUST_KEY) || '[]');
+		} catch {
+			/* ignore */
+		}
+		fetch(`${sidecarUrl}/trust-bank`, { cache: 'no-store' })
+			.then((r) => r.json())
+			.then((d) => (trustBank = d.items ?? []))
+			.catch(() => {});
 	});
-	const decidePointByIndex = $derived(
-		Object.fromEntries((decideResult?.points ?? []).map((p) => [p.index, p]))
+	function saveTrustLog() {
+		if (!browser) return;
+		try {
+			localStorage.setItem(TRUST_KEY, JSON.stringify(trustLog.slice(0, 60)));
+		} catch {
+			/* ignore */
+		}
+	}
+	function clearTrust() {
+		trustLog = [];
+		saveTrustLog();
+	}
+
+	async function runOneTrust(q: string, correct: string, other: string) {
+		try {
+			const res = await fetch(`${sidecarUrl}/experiment/trust`, {
+				method: 'POST',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({ question: q, correct, other, n_samples: 12 })
+			});
+			const d = await res.json();
+			if (!res.ok) throw new Error(d.error || `HTTP ${res.status}`);
+			const r = d.result as TrustResult;
+			trustLog = [
+				{
+					ts: Date.now(),
+					model: loadedModel,
+					q: q.slice(0, 70),
+					stated: r.stated_answer,
+					token_conf: r.token_confidence,
+					outcome_conf: r.outcome_confidence,
+					correct: r.is_correct,
+					verdict: r.verdict
+				},
+				...trustLog
+			];
+			saveTrustLog();
+		} catch (e) {
+			error = e instanceof Error ? e.message : String(e);
+		}
+	}
+
+	async function runReliability() {
+		if (trustRunning || !loadedModel) return;
+		let batch: { question: string; correct: string; other: string }[];
+		if (trustOwnOpen && trustCorrect.trim() && trustOther.trim()) {
+			batch = [
+				{
+					question: (trustQ || lastQuestion).trim(),
+					correct: trustCorrect.trim(),
+					other: trustOther.trim()
+				}
+			];
+		} else {
+			batch = [...trustBank]
+				.sort(() => Math.random() - 0.5)
+				.slice(0, trustN)
+				.map((b) => ({ question: b.question, correct: b.correct, other: b.other }));
+		}
+		if (!batch.length) return;
+		trustRunning = true;
+		trustProgress = { done: 0, total: batch.length };
+		error = '';
+		for (const item of batch) {
+			await runOneTrust(item.question, item.correct, item.other);
+			trustProgress = { done: trustProgress.done + 1, total: batch.length };
+		}
+		trustRunning = false;
+	}
+
+	// the report, derived from this model's rows in the log
+	const report = $derived.by(() => {
+		const rows = trustLog.filter((r) => r.model === loadedModel);
+		const n = rows.length;
+		if (!n) return null;
+		const graded = rows.filter((r) => r.correct != null);
+		const count = (f: (r: TrustRow) => boolean) => graded.filter(f).length;
+		const cwrong = count((r) => r.verdict === 'confidently_wrong');
+		const guessing = count((r) => r.verdict === 'shaky' || r.verdict === 'overconfident');
+		const forShow = count((r) => r.verdict === 'decided_early');
+		const sure = graded.filter((r) => (r.token_conf ?? 0) >= 0.75 || r.verdict === 'solid');
+		const sureRight = sure.filter((r) => r.correct).length;
+		const g = graded.length || 1;
+		const score = Math.max(
+			0,
+			Math.round(100 - 42 * (cwrong / g) - 22 * (guessing / g) - 14 * (forShow / g))
+		);
+		const grade =
+			score >= 88 ? 'A' : score >= 78 ? 'B' : score >= 68 ? 'C' : score >= 55 ? 'D' : 'F';
+		return {
+			n,
+			graded: graded.length,
+			score,
+			grade,
+			cwrong,
+			guessing,
+			forShow,
+			sureRight,
+			sureTotal: sure.length,
+			right: graded.filter((r) => r.correct).length,
+			rows
+		};
+	});
+	const scoreHex = $derived(
+		!report
+			? '#64748b'
+			: report.score >= 78
+				? '#10b981'
+				: report.score >= 60
+					? '#eab308'
+					: '#ef4444'
 	);
 
 	function onPromptKey(e: KeyboardEvent) {
@@ -1116,139 +1240,171 @@
 		<aside
 			class="sticky top-2 flex max-h-[calc(100svh-1rem)] w-[24rem] shrink-0 flex-col gap-3 overflow-y-auto pr-1"
 		>
-			<!-- ============ Decision trace (forking paths) ============ -->
+			<!-- ============ Reliability report ============ -->
 			<div class="rounded-lg border-2 border-primary/40 p-4">
 				<h3 class="flex items-center gap-1.5 text-sm font-semibold">
-					<GitFork class="size-4 text-primary" /> Where it decided
+					<Gauge class="size-4 text-primary" /> Reliability report
 				</h3>
 				<p class="mt-1 text-[11px] leading-relaxed text-muted-foreground">
-					Generates the reasoning once, then re-runs it forcing the 2nd-choice word at each step.
-					The point after which no single swap changes the final answer is where the answer locked
-					in - and this shows whether it locked onto the right one or the wrong one.
+					How often you can trust this model's answers. For each question it generates the
+					reasoning, re-rolls it ~12 times, forces a final answer, and checks whether the model is
+					as sure as it sounds. Like a credit history - it builds up as you run more checks.
 				</p>
 
-				<div class="mt-2 space-y-1.5">
-					<Input
-						class="h-7 text-xs"
-						placeholder={lastQuestion
-							? 'question (blank = your last message)'
-							: 'question with a clear answer'}
-						bind:value={decideQ}
-						disabled={decideRunning}
-					/>
-					<div class="flex gap-1.5">
-						<Input
-							class="h-7 text-xs"
-							placeholder="correct answer"
-							bind:value={decideCorrect}
-							disabled={decideRunning}
-						/>
-						<Input
-							class="h-7 text-xs"
-							placeholder="wrong answer it might give"
-							bind:value={decideWrong}
-							disabled={decideRunning}
-						/>
-					</div>
+				<div class="mt-2 flex items-center gap-1.5">
+					<select
+						class="h-7 rounded-md border bg-background px-2 text-xs"
+						bind:value={trustN}
+						disabled={trustRunning}
+					>
+						{#each [1, 3, 5, 10, 20] as k (k)}<option value={k}
+								>{k} question{k > 1 ? 's' : ''}</option
+							>{/each}
+					</select>
 					<Button
 						size="sm"
-						class="h-7 w-full"
-						onclick={runDecide}
-						disabled={decideRunning ||
-							!loadedModel ||
-							!decideCorrect.trim() ||
-							!decideWrong.trim() ||
-							!(decideQ || lastQuestion).trim()}
+						class="h-7 flex-1"
+						onclick={runReliability}
+						disabled={trustRunning || !loadedModel || (!trustBank.length && !trustOwnOpen)}
 					>
-						{#if decideRunning}<Loader2 class="mr-1 size-3.5 animate-spin" /> mapping the reasoning… (~1–3
-							min){:else}Map the decision{/if}
+						{#if trustRunning}<Loader2 class="mr-1 size-3.5 animate-spin" />
+							{trustProgress.done}/{trustProgress.total}…{:else}Run check (~40s each){/if}
 					</Button>
 				</div>
 
-				{#if decideResult}
-					{@const d = decideResult}
-					{@const noFork = d.points.every((p) => !p.flips)}
-					<div
-						class="mt-2 rounded px-2 py-1.5 text-xs leading-relaxed font-medium {d.is_correct
-							? 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
-							: 'bg-red-500/15 text-red-600 dark:text-red-400'}"
+				<Collapsible.Root class="mt-1.5" bind:open={trustOwnOpen}>
+					<Collapsible.Trigger
+						class="flex w-full items-center gap-1 text-[11px] font-medium text-primary"
 					>
-						{#if !d.greedy_answer}
-							Couldn't read the model's answer as "{d.correct}" or "{d.wrong}" — check the wording
-							of the two answers.
-						{:else if d.is_correct && noFork}
-							Got <b>"{d.greedy_answer}"</b> — and it had this locked from the first token. Every alternative
-							reasoning path still lands there; it wasn't working it out, it knew it.
-						{:else if d.is_correct}
-							Got <b>"{d.greedy_answer}"</b> (correct). Locked in at token
-							<b>{d.commit_index}</b>{d.commit_token ? ` ("${d.commit_token.trim()}")` : ''}; before
-							that, forcing its 2nd-choice word would have derailed it.
-						{:else if d.pivot}
-							<TriangleAlert class="mr-1 inline size-3.5" /> Got <b>"{d.greedy_answer}"</b>, should
-							be
-							<b>"{d.correct}"</b>. It went wrong around token <b>{d.pivot.index}</b>: it wrote
-							<span class="font-mono">{d.pivot.token.trim()}</span> ({pct(d.pivot.token_p)}) over
-							<span class="font-mono">{d.pivot.alt_token.trim()}</span> ({pct(d.pivot.alt_p)}), and
-							forcing that word there yields <b>"{d.pivot.alt_answer}"</b>. Point of no return.
-						{:else}
-							Got <b>"{d.greedy_answer}"</b>, should be <b>"{d.correct}"</b> — and no single word
-							swap recovers it{d.commit_index != null
-								? ` (committed by token ${d.commit_index})`
-								: ''}. The model can't get here from its top alternatives.
-						{/if}
+						<ChevronRight class="size-3.5" /> check my own question instead
+					</Collapsible.Trigger>
+					<Collapsible.Content class="mt-1.5 space-y-1.5">
+						<Input
+							class="h-7 text-xs"
+							placeholder={lastQuestion ? 'question (blank = last message)' : 'question'}
+							bind:value={trustQ}
+							disabled={trustRunning}
+						/>
+						<div class="flex gap-1.5">
+							<Input
+								class="h-7 text-xs"
+								placeholder="correct answer"
+								bind:value={trustCorrect}
+								disabled={trustRunning}
+							/>
+							<Input
+								class="h-7 text-xs"
+								placeholder="the other likely answer"
+								bind:value={trustOther}
+								disabled={trustRunning}
+							/>
+						</div>
+						<p class="text-[10px] text-muted-foreground">
+							With this open, "Run check" checks just this one question.
+						</p>
+					</Collapsible.Content>
+				</Collapsible.Root>
+
+				{#if trustRunning}
+					<div class="mt-2 h-1.5 overflow-hidden rounded-full bg-foreground/10">
+						<div
+							class="h-full rounded-full bg-primary transition-all"
+							style="width: {trustProgress.total
+								? (trustProgress.done / trustProgress.total) * 100
+								: 0}%"
+						></div>
+					</div>
+				{/if}
+
+				{#if report}
+					{@const r = report}
+					<div class="mt-3">
+						<div class="flex items-baseline justify-between">
+							<span class="text-3xl font-bold tabular-nums" style="color:{scoreHex}"
+								>{r.score}<span class="text-sm font-normal text-muted-foreground">/100</span></span
+							>
+							<span class="text-[11px] text-muted-foreground"
+								>grade {r.grade} · {r.graded} check{r.graded === 1 ? '' : 's'} · {r.right}/{r.graded}
+								right</span
+							>
+						</div>
+						<div class="mt-1 h-2 overflow-hidden rounded-full bg-foreground/10">
+							<div class="h-full rounded-full" style="width:{r.score}%;background:{scoreHex}"></div>
+						</div>
 					</div>
 
-					{#if d.tokens?.length}
-						<div
-							class="mt-1.5 max-h-52 overflow-y-auto rounded border bg-muted/30 p-2 text-xs leading-relaxed whitespace-pre-wrap"
-						>
-							{#each decideTokenSpans as sp, i (i)}
-								{@const pt = decidePointByIndex[i]}
-								{#if i === d.commit_index}
-									<mark
-										class="rounded bg-primary/25 px-0.5 font-semibold ring-1 ring-primary"
-										title="the answer was committed here">{sp.tok}</mark
-									>
-								{:else if pt?.flips}
-									<span
-										class="rounded {pt.alt_answer === d.correct
-											? 'bg-emerald-400/25'
-											: 'bg-amber-400/25'} px-0.5"
-										title={`forcing "${pt.alt_token.trim()}" here → "${pt.alt_answer}"`}
-										>{sp.tok}</span
-									>
-								{:else}{sp.tok}{/if}
-							{/each}
-						</div>
-					{/if}
-
-					{#if d.points.length}
-						<div class="mt-1.5 flex gap-0.5" title="one cell per checked token position">
-							{#each d.points as p (p.index)}
-								<div
-									class="h-4 flex-1 rounded-sm {p.flips
-										? p.alt_answer === d.correct
-											? 'bg-emerald-500/60'
-											: 'bg-red-500/50'
-										: 'bg-foreground/10'}"
-									title={`token ${p.index} "${p.token.trim()}": 2nd choice "${p.alt_token.trim()}" → ${p.alt_answer || 'no change'}`}
-								></div>
-							{/each}
-						</div>
-						<p class="mt-1 text-[10px] leading-relaxed text-muted-foreground">
-							Each cell is a checked position. <span class="text-emerald-600 dark:text-emerald-400"
-								>green</span
+					{#snippet statline(
+						label: string,
+						k: number,
+						total: number,
+						tone: 'good' | 'warn' | 'bad'
+					)}
+						<div class="flex items-center justify-between gap-2 text-[11px]">
+							<span
+								class={tone === 'bad' && k > 0
+									? 'font-medium text-red-600 dark:text-red-400'
+									: 'text-muted-foreground'}
 							>
-							= forcing the 2nd-choice word there gives the right answer;
-							<span class="text-red-600 dark:text-red-400">red</span> = the wrong one; grey = the answer
-							no longer changes. The colour→grey edge is where it committed.
-						</p>
-					{/if}
+								{#if tone === 'bad' && k > 0}<TriangleAlert
+										class="mr-0.5 inline size-3"
+									/>{/if}{label}
+							</span>
+							<span class="tabular-nums {k > 0 && tone !== 'good' ? 'font-semibold' : ''}"
+								>{k} of {total}</span
+							>
+						</div>
+					{/snippet}
+
+					<div class="mt-2 space-y-1 border-t pt-2">
+						{@render statline('Right when it acted sure', r.sureRight, r.sureTotal, 'good')}
+						{@render statline('Just guessing — coin-flip reasoning', r.guessing, r.graded, 'warn')}
+						{@render statline('Confidently WRONG', r.cwrong, r.graded, 'bad')}
+						{@render statline('Reasoning was just for show', r.forShow, r.graded, 'warn')}
+					</div>
+
+					<div class="mt-2 border-t pt-1.5">
+						<div class="flex items-center justify-between">
+							<span class="text-[10px] tracking-wide text-muted-foreground uppercase"
+								>track record</span
+							>
+							<button
+								class="text-[10px] text-muted-foreground underline-offset-2 hover:underline"
+								onclick={clearTrust}>clear</button
+							>
+						</div>
+						<div class="mt-1 max-h-44 space-y-0.5 overflow-y-auto">
+							{#each r.rows as row (row.ts)}
+								<div class="flex items-center gap-1.5 text-[10px]" title={row.q}>
+									<span
+										class="w-3 shrink-0 text-center {row.correct
+											? 'text-emerald-600 dark:text-emerald-400'
+											: row.correct === false
+												? 'text-red-600 dark:text-red-400'
+												: 'text-muted-foreground'}"
+										>{row.correct ? '✓' : row.correct === false ? '✗' : '·'}</span
+									>
+									<span class="min-w-0 flex-1 truncate">{row.q}</span>
+									<span class="shrink-0 tabular-nums text-muted-foreground"
+										>{pct(row.token_conf)}→{pct(row.outcome_conf)}</span
+									>
+									<span
+										class="shrink-0 rounded px-1 {row.verdict === 'confidently_wrong'
+											? 'bg-red-500/15 text-red-600 dark:text-red-400'
+											: row.verdict === 'solid'
+												? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300'
+												: row.verdict === 'unclear' || row.verdict === 'unreadable'
+													? 'bg-muted text-muted-foreground'
+													: 'bg-amber-500/15 text-amber-700 dark:text-amber-300'}"
+										>{VERDICT_LABEL[row.verdict]}</span
+									>
+								</div>
+							{/each}
+						</div>
+					</div>
 				{:else}
 					<p class="mt-2 text-[10px] leading-relaxed text-muted-foreground">
-						Best on a question with two clear answers where the model might slip - order of
-						operations, a tricky yes/no, a counting question ("how many r's in strawberry", correct
-						3 / wrong 2). Runs ~20 forked continuations, so it takes a minute or two.
+						No checks yet. "sounded → actually" in each row is how sure the answer looked versus how
+						often the model's own re-rolled reasoning agrees with it. A big drop = it's bluffing.
 					</p>
 				{/if}
 			</div>

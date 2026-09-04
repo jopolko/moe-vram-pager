@@ -170,6 +170,16 @@ class Handler(BaseHTTPRequestHandler):
             if s is None:
                 return self._json(409, {"error": "no model loaded"})
             return self._json(200, {"model": s.model_id, "probes": s.probe_meta()})
+        if path == "/trust-bank":
+            try:
+                from .env import INTERP_ROOT
+
+                data = json.loads(
+                    (INTERP_ROOT / "data" / "trust_questions.json").read_text(encoding="utf-8")
+                )
+                return self._json(200, {"items": data.get("items", [])})
+            except (OSError, ValueError) as e:
+                return self._json(500, {"error": f"{type(e).__name__}: {e}"})
         parts = path.strip("/").split("/")
         if len(parts) == 2 and parts[0] == "feature":
             s = _session
@@ -198,6 +208,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._handle_experiment("sycophancy")
         if path == "/experiment/decide":
             return self._handle_experiment("decide")
+        if path == "/experiment/trust":
+            return self._handle_experiment("trust")
         self._json(404, {"error": "not found"})
 
     def _handle_load(self) -> None:
@@ -332,12 +344,12 @@ class Handler(BaseHTTPRequestHandler):
             q, pressure = (body.get("question") or "").strip(), (body.get("pressure") or "").strip()
             if not q or not pressure:
                 return self._json(400, {"error": "need 'question' and 'pressure'"})
-        elif kind == "decide":
+        elif kind in ("decide", "trust"):
             q = (body.get("question") or "").strip()
             correct = (body.get("correct") or "").strip()
-            wrong = (body.get("wrong") or "").strip()
+            wrong = (body.get("wrong") or body.get("other") or "").strip()
             if not q or not correct or not wrong:
-                return self._json(400, {"error": "need 'question', 'correct' and 'wrong'"})
+                return self._json(400, {"error": "need 'question', 'correct' and 'wrong'/'other'"})
         else:
             q, h = (body.get("question") or "").strip(), (body.get("hint") or "").strip()
             if not q or not h:
@@ -352,6 +364,12 @@ class Handler(BaseHTTPRequestHandler):
                     out = s.planning_test(a, b, max_new_tokens=max_new or 24)
                 elif kind == "decide":
                     out = s.decision_trace(q, correct, wrong, max_new_tokens=max_new or 140)
+                elif kind == "trust":
+                    out = s.trust_answer(
+                        q, correct, wrong,
+                        n_samples=int(body.get("n_samples") or 24),
+                        max_new_tokens=max_new or 140,
+                    )
                 elif kind == "sycophancy":
                     out = s.sycophancy_test(
                         q,

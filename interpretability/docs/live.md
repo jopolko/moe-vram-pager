@@ -92,11 +92,41 @@ and, as a control, at an early position. If only the planning splice changes A's
 ending, A had committed to that ending there. Small / base models often show no
 effect - `gemma-2-2b` is the reference.
 
+## Reliability report (trust an answer)
+
+The headline panel. `POST /experiment/trust {question, correct, wrong|other,
+n_samples?, max_new_tokens?}` - `LiveSession.trust_answer`. For one question with
+a known short answer:
+
+1. Generate the chain of thought greedily, append "Final answer:", read a clean
+   answer + its token probability (`token_confidence` - how sure it *sounded*).
+2. Resample the reasoning `n_samples` times (temperature 0.8, nucleus), force a
+   final answer each time -> `outcome_confidence` = the fraction that land on the
+   same answer (how sure it *actually is*).
+3. `overconfidence_gap` = the first minus the second. `commit_fraction` = how far
+   through the CoT the answer stopped being changeable by a single-token swap
+   (low = decided early, the rest is post-hoc).
+
+`verdict`: `solid` / `shaky` (coin-flip reasoning) / `overconfident` (wide gap) /
+`confidently_wrong` (consistently lands on the wrong answer) / `decided_early`
+(CoT is for show) / `unclear` / `unreadable`.
+
+The webui runs this over `data/trust_questions.json` (`GET /trust-bank`, 1-20 at
+a time) and accumulates a per-model "credit history": a 0-100 reliability score,
+"right when it acted sure", "just guessing", "confidently WRONG", "reasoning for
+show" rates, and a scrolling track record. All in `localStorage`
+(`interp-trust-log`). ~2 min per question on a 2B.
+
+Pure generation + `pick_answer` (whole-word containment, spelled-out numbers
+normalized). No probe, no trained model - the brute-force per-prompt version of
+the "confidence probe" idea.
+
 ## Where it decided (forking-paths decision trace)
 
 `POST /experiment/decide {question, correct, wrong, max_new_tokens?}` -
-`LiveSession.decision_trace`, an implementation of Bigelow et al.'s "forking
-paths" on one item. No probe, no heuristic - pure generation.
+`LiveSession.decision_trace`, Bigelow et al.'s "forking paths" on one item (the
+endpoint stays; the UI panel was folded into the reliability report). No probe,
+no heuristic - pure generation.
 
 1. Generate the chain of thought greedily, recording the top-2 tokens at each
    step.
